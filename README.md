@@ -10,8 +10,7 @@ I hope that I can create a spiritual successor by using this tool, then hosting
 the result on github pages.
 
 # Features implemented
-1. [ ] Syntax highlighting somehow without javascript! Or if it's too hard, use
-   javascript at first :(
+1. [ ] Syntax highlighting somehow without javascript!
 2. [ ] Navigate to Class on Class Usage
     1. [ ] Variable
     2. [ ] Method return type
@@ -38,7 +37,6 @@ javascript. Maybe an intermediate page with the list of options?)
     1. [ ] just write the contents vanilla
     2. [ ] add line numbers
     3. [ ] copy and paste should work on the code
-    4. [ ] syntax highlighting
 3. [ ] Add anchor links for all the line numbers
 4. [ ] Preprocess all files extracting line numbers of all Classes. Keep them in
    a map
@@ -48,3 +46,5 @@ javascript. Maybe an intermediate page with the list of options?)
 6. [ ] While writing the source files, check if we're at the position of a Class
    Type Reference, and add a link to the line number
     - step 5 and 6 should be combined to work file by file
+    - by adding the links, we should achieve a poor version of syntax
+      highlighting
