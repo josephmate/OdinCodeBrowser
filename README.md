@@ -34,9 +34,10 @@ javascript. Maybe an intermediate page with the list of options?)
 1. [x] Experiment with javaparser see if it will work.
     - It was really easy to visit method names and get their line numbers
 2. [ ] Convert the files to html with line numbers
-    1. [ ] just write the contents vanilla
-    2. [ ] add line numbers
-    3. [ ] copy and paste should work on the code
+    1. [x] just write the contents vanilla
+    2. [ ] respect the new lines and spacing
+    3. [ ] add line numbers
+    4. [ ] copy and paste should work on the code
 3. [ ] Add anchor links for all the line numbers
 4. [ ] Preprocess all files extracting line numbers of all Classes. Keep them in
    a map
