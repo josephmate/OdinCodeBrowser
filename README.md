@@ -35,7 +35,7 @@ javascript. Maybe an intermediate page with the list of options?)
     - It was really easy to visit method names and get their line numbers
 2. [ ] Convert the files to html with line numbers
     1. [x] just write the contents vanilla
-    2. [ ] respect the new lines and spacing
+    2. [x] respect the new lines and spacing
     3. [ ] add line numbers
     4. [ ] copy and paste should work on the code
 3. [ ] Add anchor links for all the line numbers

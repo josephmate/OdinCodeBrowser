@@ -1,3 +1,5 @@
+import org.apache.commons.text.StringEscapeUtils;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -45,6 +47,22 @@ public class Main {
         String code = Files.readString(path);
         Path destinationPath = Paths.get(destinationStr);
         destinationPath.toFile().getParentFile().mkdirs();
-        Files.writeString(destinationPath, code);
+        Files.writeString(
+                destinationPath,
+                """
+                <html>
+                    <head>
+                        <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
+                    </head>
+                <body>
+                <pre class="code">    
+                """
+                + StringEscapeUtils.escapeHtml4(code)
+                + """
+                </pre>
+                </body>
+                </html>
+                """
+        );
     }
 }
