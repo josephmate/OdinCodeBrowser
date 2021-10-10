@@ -61,6 +61,10 @@ javascript. Maybe an intermediate page with the list of options?)
           usecase
     4. [x] add line numbers
     5. [x] copy and paste should work on the code
+        - just tried to paste into a text editor and it inserts so many extra
+          new lines! :(
+        - this is good enough for now. we can improve upon it later after enough
+          navigation is complete
 3. [ ] Add anchor links for all the line numbers
 4. [ ] Preprocess all files extracting line numbers of all Classes. Keep them in
    a map
