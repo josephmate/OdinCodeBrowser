@@ -48,21 +48,69 @@ public class Main {
         Path destinationPath = Paths.get(destinationStr);
         destinationPath.toFile().getParentFile().mkdirs();
         Files.writeString(
-                destinationPath,
+            destinationPath,
+            codeToHtml(code)
+        );
+    }
+
+    private static final String HEADER =
+        """
+        <html>
+            <head>
+                <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
+            </head>
+        <body>
+        <table>
+        """;
+    private static final String FOOTER =
+        """
+        </table>
+        </body>
+        </html>
+        """;
+
+    private static String codeToHtml(String code) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(HEADER);
+
+        int lineNumber = 1;
+        Iterable<String> lines = () -> code.lines().iterator();
+        for (String line : lines) {
+            sb.append(codeLineToHtml(lineNumber, line));
+            lineNumber++;
+        }
+
+        sb.append(FOOTER);
+        return sb.toString();
+    }
+
+    /***
+     * <pre>
+     * <table>
+     *     <tr>
+     *         <td><a href="#" data-linenum="1"></a></td>
+     *         <td>First line</td>
+     *     </tr>
+     * </table>
+     *     <tr>
+     *         <td><a href="#" data-linenum="2"></a></td>
+     *         <td>Second line</td>
+     *     </tr>
+     * </table>
+     * </pre>
+     * @param line
+     * @return
+     */
+    private static String codeLineToHtml(int lineNumber, String line) {
+        return String.format(
                 """
-                <html>
-                    <head>
-                        <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
-                    </head>
-                <body>
-                <pre class="code">    
-                """
-                + StringEscapeUtils.escapeHtml4(code)
-                + """
-                </pre>
-                </body>
-                </html>
-                """
+                <tr>
+                <td><a class="linenum-cell" data-linenum="%s" href="#"></a></td>
+                <td><pre>%s</pre></td>
+                </tr>
+                """,
+                lineNumber,
+                StringEscapeUtils.escapeHtml4(line)
         );
     }
 }
