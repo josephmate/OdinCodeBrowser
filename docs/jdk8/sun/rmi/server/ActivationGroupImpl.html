@@ -3,507 +3,2007 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 1997, 2012, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package sun.rmi.server;
-
-import java.io.IOException;
-import java.lang.reflect.Constructor;
-import java.lang.reflect.InvocationTargetException;
-import java.net.ServerSocket;
-import java.rmi.MarshalledObject;
-import java.rmi.NoSuchObjectException;
-import java.rmi.Remote;
-import java.rmi.RemoteException;
-import java.rmi.activation.Activatable;
-import java.rmi.activation.ActivationDesc;
-import java.rmi.activation.ActivationException;
-import java.rmi.activation.ActivationGroup;
-import java.rmi.activation.ActivationGroupID;
-import java.rmi.activation.ActivationID;
-import java.rmi.activation.UnknownObjectException;
-import java.rmi.server.RMIClassLoader;
-import java.rmi.server.RMIServerSocketFactory;
-import java.rmi.server.RMISocketFactory;
-import java.rmi.server.UnicastRemoteObject;
-import java.security.AccessController;
-import java.security.PrivilegedActionException;
-import java.security.PrivilegedExceptionAction;
-import java.util.ArrayList;
-import java.util.Hashtable;
-import java.util.List;
-import sun.rmi.registry.RegistryImpl;
-
-/**
- * The default activation group implementation.
- *
- * @author      Ann Wollrath
- * @since       1.2
- * @see         java.rmi.activation.ActivationGroup
- */
-public class ActivationGroupImpl extends ActivationGroup {
-
-    // use serialVersionUID from JDK 1.2.2 for interoperability
-    private static final long serialVersionUID = 5758693559430427303L;
-
-    /** maps persistent IDs to activated remote objects */
-    private final Hashtable&lt;ActivationID,ActiveEntry&gt; active =
-        new Hashtable&lt;&gt;();
-    private boolean groupInactive = false;
-    private final ActivationGroupID groupID;
-    private final List&lt;ActivationID&gt; lockedIDs = new ArrayList&lt;&gt;();
-
-    /**
-     * Creates a default activation group implementation.
-     *
-     * @param id the group's identifier
-     * @param data ignored
-     */
-    public ActivationGroupImpl(ActivationGroupID id, MarshalledObject&lt;?&gt; data)
-        throws RemoteException
-    {
-        super(id);
-        groupID = id;
-
-        /*
-         * Unexport activation group impl and attempt to export it on
-         * an unshared anonymous port.  See 4692286.
-         */
-        unexportObject(this, true);
-        RMIServerSocketFactory ssf = new ServerSocketFactoryImpl();
-        UnicastRemoteObject.exportObject(this, 0, null, ssf);
-
-        if (System.getSecurityManager() == null) {
-            try {
-                // Provide a default security manager.
-                System.setSecurityManager(new SecurityManager());
-
-            } catch (Exception e) {
-                throw new RemoteException(&quot;unable to set security manager&quot;, e);
-            }
-        }
-    }
-
-    /**
-     * Trivial server socket factory used to export the activation group
-     * impl on an unshared port.
-     */
-    private static class ServerSocketFactoryImpl
-        implements RMIServerSocketFactory
-    {
-        public ServerSocket createServerSocket(int port) throws IOException
-        {
-            RMISocketFactory sf = RMISocketFactory.getSocketFactory();
-            if (sf == null) {
-                sf = RMISocketFactory.getDefaultSocketFactory();
-            }
-            return sf.createServerSocket(port);
-        }
-    }
-
-    /*
-     * Obtains a lock on the ActivationID id before returning. Allows only one
-     * thread at a time to hold a lock on a particular id.  If the lock for id
-     * is in use, all requests for an equivalent (in the Object.equals sense)
-     * id will wait for the id to be notified and use the supplied id as the
-     * next lock. The caller of &quot;acquireLock&quot; must execute the &quot;releaseLock&quot;
-     * method&quot; to release the lock and &quot;notifyAll&quot; waiters for the id lock
-     * obtained from this method.  The typical usage pattern is as follows:
-     *
-     * try {
-     *    acquireLock(id);
-     *    // do stuff pertaining to id...
-     * } finally {
-     *    releaseLock(id);
-     *    checkInactiveGroup();
-     * }
-     */
-    private void acquireLock(ActivationID id) {
-
-        ActivationID waitForID;
-
-        for (;;) {
-
-            synchronized (lockedIDs) {
-                int index = lockedIDs.indexOf(id);
-                if (index &lt; 0) {
-                    lockedIDs.add(id);
-                    return;
-                } else {
-                    waitForID = lockedIDs.get(index);
-                }
-            }
-
-            synchronized (waitForID) {
-                synchronized (lockedIDs) {
-                    int index = lockedIDs.indexOf(waitForID);
-                    if (index &lt; 0) continue;
-                    ActivationID actualID = lockedIDs.get(index);
-                    if (actualID != waitForID)
-                        /*
-                         * don't wait on an id that won't be notified.
-                         */
-                        continue;
-                }
-
-                try {
-                    waitForID.wait();
-                } catch (InterruptedException ignore) {
-                }
-            }
-        }
-
-    }
-
-    /*
-     * Releases the id lock obtained via the &quot;acquireLock&quot; method and then
-     * notifies all threads waiting on the lock.
-     */
-    private void releaseLock(ActivationID id) {
-        synchronized (lockedIDs) {
-            id = lockedIDs.remove(lockedIDs.indexOf(id));
-        }
-
-        synchronized (id) {
-            id.notifyAll();
-        }
-    }
-
-    /**
-     * Creates a new instance of an activatable remote object. The
-     * &lt;code&gt;Activator&lt;/code&gt; calls this method to create an activatable
-     * object in this group. This method should be idempotent; a call to
-     * activate an already active object should return the previously
-     * activated object.
-     *
-     * Note: this method assumes that the Activator will only invoke
-     * newInstance for the same object in a serial fashion (i.e.,
-     * the activator will not allow the group to see concurrent requests
-     * to activate the same object.
-     *
-     * @param id the object's activation identifier
-     * @param desc the object's activation descriptor
-     * @return a marshalled object containing the activated object's stub
-     */
-    public MarshalledObject&lt;? extends Remote&gt;
-                                      newInstance(final ActivationID id,
-                                                  final ActivationDesc desc)
-        throws ActivationException, RemoteException
-    {
-        RegistryImpl.checkAccess(&quot;ActivationInstantiator.newInstance&quot;);
-
-        if (!groupID.equals(desc.getGroupID()))
-            throw new ActivationException(&quot;newInstance in wrong group&quot;);
-
-        try {
-            acquireLock(id);
-            synchronized (this) {
-                if (groupInactive == true)
-                    throw new InactiveGroupException(&quot;group is inactive&quot;);
-            }
-
-            ActiveEntry entry = active.get(id);
-            if (entry != null)
-                return entry.mobj;
-
-            String className = desc.getClassName();
-
-            final Class&lt;? extends Remote&gt; cl =
-                RMIClassLoader.loadClass(desc.getLocation(), className)
-                .asSubclass(Remote.class);
-            Remote impl = null;
-
-            final Thread t = Thread.currentThread();
-            final ClassLoader savedCcl = t.getContextClassLoader();
-            ClassLoader objcl = cl.getClassLoader();
-            final ClassLoader ccl = covers(objcl, savedCcl) ? objcl : savedCcl;
-
-            /*
-             * Fix for 4164971: allow non-public activatable class
-             * and/or constructor, create the activatable object in a
-             * privileged block
-             */
-            try {
-                /*
-                 * The code below is in a doPrivileged block to
-                 * protect against user code which code might have set
-                 * a global socket factory (in which case application
-                 * code would be on the stack).
-                 */
-                impl = AccessController.doPrivileged(
-                      new PrivilegedExceptionAction&lt;Remote&gt;() {
-                      public Remote run() throws InstantiationException,
-                          NoSuchMethodException, IllegalAccessException,
-                          InvocationTargetException
-                      {
-                          Constructor&lt;? extends Remote&gt; constructor =
-                              cl.getDeclaredConstructor(
-                                  ActivationID.class, MarshalledObject.class);
-                          constructor.setAccessible(true);
-                          try {
-                              /*
-                               * Fix for 4289544: make sure to set the
-                               * context class loader to be the class
-                               * loader of the impl class before
-                               * constructing that class.
-                               */
-                              t.setContextClassLoader(ccl);
-                              return constructor.newInstance(id,
-                                                             desc.getData());
-                          } finally {
-                              t.setContextClassLoader(savedCcl);
-                          }
-                      }
-                  });
-            } catch (PrivilegedActionException pae) {
-                Throwable e = pae.getException();
-
-                // narrow the exception's type and rethrow it
-                if (e instanceof InstantiationException) {
-                    throw (InstantiationException) e;
-                } else if (e instanceof NoSuchMethodException) {
-                    throw (NoSuchMethodException) e;
-                } else if (e instanceof IllegalAccessException) {
-                    throw (IllegalAccessException) e;
-                } else if (e instanceof InvocationTargetException) {
-                    throw (InvocationTargetException) e;
-                } else if (e instanceof RuntimeException) {
-                    throw (RuntimeException) e;
-                } else if (e instanceof Error) {
-                    throw (Error) e;
-                }
-            }
-
-            entry = new ActiveEntry(impl);
-            active.put(id, entry);
-            return entry.mobj;
-
-        } catch (NoSuchMethodException | NoSuchMethodError e) {
-            /* user forgot to provide activatable constructor?
-             * or code recompiled and user forgot to provide
-             *  activatable constructor?
-             */
-            throw new ActivationException
-                (&quot;Activatable object must provide an activation&quot;+
-                 &quot; constructor&quot;, e );
-
-        } catch (InvocationTargetException e) {
-            throw new ActivationException(&quot;exception in object constructor&quot;,
-                                          e.getTargetException());
-
-        } catch (Exception e) {
-            throw new ActivationException(&quot;unable to activate object&quot;, e);
-        } finally {
-            releaseLock(id);
-            checkInactiveGroup();
-        }
-    }
-
-
-   /**
-    * The group's &lt;code&gt;inactiveObject&lt;/code&gt; method is called
-    * indirectly via a call to the &lt;code&gt;Activatable.inactive&lt;/code&gt;
-    * method. A remote object implementation must call
-    * &lt;code&gt;Activatable&lt;/code&gt;'s &lt;code&gt;inactive&lt;/code&gt; method when
-    * that object deactivates (the object deems that it is no longer
-    * active). If the object does not call
-    * &lt;code&gt;Activatable.inactive&lt;/code&gt; when it deactivates, the
-    * object will never be garbage collected since the group keeps
-    * strong references to the objects it creates. &lt;p&gt;
-    *
-    * The group's &lt;code&gt;inactiveObject&lt;/code&gt; method
-    * unexports the remote object from the RMI runtime so that the
-    * object can no longer receive incoming RMI calls. This call will
-    * only succeed if the object has no pending/executing calls. If
-    * the object does have pending/executing RMI calls, then false
-    * will be returned.
-    *
-    * If the object has no pending/executing calls, the object is
-    * removed from the RMI runtime and the group informs its
-    * &lt;code&gt;ActivationMonitor&lt;/code&gt; (via the monitor's
-    * &lt;code&gt;inactiveObject&lt;/code&gt; method) that the remote object is
-    * not currently active so that the remote object will be
-    * re-activated by the activator upon a subsequent activation
-    * request.
-    *
-    * @param id the object's activation identifier
-    * @returns true if the operation succeeds (the operation will
-    * succeed if the object in currently known to be active and is
-    * either already unexported or is currently exported and has no
-    * pending/executing calls); false is returned if the object has
-    * pending/executing calls in which case it cannot be deactivated
-    * @exception UnknownObjectException if object is unknown (may already
-    * be inactive)
-    * @exception RemoteException if call informing monitor fails
-    */
-    public boolean inactiveObject(ActivationID id)
-        throws ActivationException, UnknownObjectException, RemoteException
-    {
-
-        try {
-            acquireLock(id);
-            synchronized (this) {
-                if (groupInactive == true)
-                    throw new ActivationException(&quot;group is inactive&quot;);
-            }
-
-            ActiveEntry entry = active.get(id);
-            if (entry == null) {
-                // REMIND: should this be silent?
-                throw new UnknownObjectException(&quot;object not active&quot;);
-            }
-
-            try {
-                if (Activatable.unexportObject(entry.impl, false) == false)
-                    return false;
-            } catch (NoSuchObjectException allowUnexportedObjects) {
-            }
-
-            try {
-                super.inactiveObject(id);
-            } catch (UnknownObjectException allowUnregisteredObjects) {
-            }
-
-            active.remove(id);
-
-        } finally {
-            releaseLock(id);
-            checkInactiveGroup();
-        }
-
-        return true;
-    }
-
-    /*
-     * Determines if the group has become inactive and
-     * marks it as such.
-     */
-    private void checkInactiveGroup() {
-        boolean groupMarkedInactive = false;
-        synchronized (this) {
-            if (active.size() == 0 &amp;&amp; lockedIDs.size() == 0 &amp;&amp;
-                groupInactive == false)
-            {
-                groupInactive = true;
-                groupMarkedInactive = true;
-            }
-        }
-
-        if (groupMarkedInactive) {
-            try {
-                super.inactiveGroup();
-            } catch (Exception ignoreDeactivateFailure) {
-            }
-
-            try {
-                UnicastRemoteObject.unexportObject(this, true);
-            } catch (NoSuchObjectException allowUnexportedGroup) {
-            }
-        }
-    }
-
-    /**
-     * The group's &lt;code&gt;activeObject&lt;/code&gt; method is called when an
-     * object is exported (either by &lt;code&gt;Activatable&lt;/code&gt; object
-     * construction or an explicit call to
-     * &lt;code&gt;Activatable.exportObject&lt;/code&gt;. The group must inform its
-     * &lt;code&gt;ActivationMonitor&lt;/code&gt; that the object is active (via
-     * the monitor's &lt;code&gt;activeObject&lt;/code&gt; method) if the group
-     * hasn't already done so.
-     *
-     * @param id the object's identifier
-     * @param obj the remote object implementation
-     * @exception UnknownObjectException if object is not registered
-     * @exception RemoteException if call informing monitor fails
-     */
-    public void activeObject(ActivationID id, Remote impl)
-        throws ActivationException, UnknownObjectException, RemoteException
-    {
-
-        try {
-            acquireLock(id);
-            synchronized (this) {
-                if (groupInactive == true)
-                    throw new ActivationException(&quot;group is inactive&quot;);
-            }
-            if (!active.contains(id)) {
-                ActiveEntry entry = new ActiveEntry(impl);
-                active.put(id, entry);
-                // created new entry, so inform monitor of active object
-                try {
-                    super.activeObject(id, entry.mobj);
-                } catch (RemoteException e) {
-                    // daemon can still find it by calling newInstance
-                }
-            }
-        } finally {
-            releaseLock(id);
-            checkInactiveGroup();
-        }
-    }
-
-    /**
-     * Entry in table for active object.
-     */
-    private static class ActiveEntry {
-        Remote impl;
-        MarshalledObject&lt;Remote&gt; mobj;
-
-        ActiveEntry(Remote impl) throws ActivationException {
-            this.impl =  impl;
-            try {
-                this.mobj = new MarshalledObject&lt;Remote&gt;(impl);
-            } catch (IOException e) {
-                throw new
-                    ActivationException(&quot;failed to marshal remote object&quot;, e);
-            }
-        }
-    }
-
-    /**
-     * Returns true if the first argument is either equal to, or is a
-     * descendant of, the second argument.  Null is treated as the root of
-     * the tree.
-     */
-    private static boolean covers(ClassLoader sub, ClassLoader sup) {
-        if (sup == null) {
-            return true;
-        } else if (sub == null) {
-            return false;
-        }
-        do {
-            if (sub == sup) {
-                return true;
-            }
-            sub = sub.getParent();
-        } while (sub != null);
-        return false;
-    }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 1997, 2012, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package sun.rmi.server;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.io.IOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.lang.reflect.Constructor;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.lang.reflect.InvocationTargetException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.net.ServerSocket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.rmi.MarshalledObject;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.rmi.NoSuchObjectException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.rmi.Remote;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import java.rmi.RemoteException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.rmi.activation.Activatable;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import java.rmi.activation.ActivationDesc;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import java.rmi.activation.ActivationException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import java.rmi.activation.ActivationGroup;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre>import java.rmi.activation.ActivationGroupID;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre>import java.rmi.activation.ActivationID;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>import java.rmi.activation.UnknownObjectException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>import java.rmi.server.RMIClassLoader;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre>import java.rmi.server.RMIServerSocketFactory;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre>import java.rmi.server.RMISocketFactory;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>import java.rmi.server.UnicastRemoteObject;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre>import java.security.AccessController;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre>import java.security.PrivilegedActionException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre>import java.security.PrivilegedExceptionAction;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre>import java.util.ArrayList;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>import java.util.Hashtable;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre>import java.util.List;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre>import sun.rmi.registry.RegistryImpl;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre> * The default activation group implementation.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre> * @author      Ann Wollrath</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre> * @since       1.2</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre> * @see         java.rmi.activation.ActivationGroup</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre>public class ActivationGroupImpl extends ActivationGroup {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>    // use serialVersionUID from JDK 1.2.2 for interoperability</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>    private static final long serialVersionUID = 5758693559430427303L;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>    /** maps persistent IDs to activated remote objects */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>    private final Hashtable&lt;ActivationID,ActiveEntry&gt; active =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>        new Hashtable&lt;&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>    private boolean groupInactive = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>    private final ActivationGroupID groupID;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>    private final List&lt;ActivationID&gt; lockedIDs = new ArrayList&lt;&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>     * Creates a default activation group implementation.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>     * @param id the group's identifier</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>     * @param data ignored</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>    public ActivationGroupImpl(ActivationGroupID id, MarshalledObject&lt;?&gt; data)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>        throws RemoteException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>        super(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>        groupID = id;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>         * Unexport activation group impl and attempt to export it on</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>         * an unshared anonymous port.  See 4692286.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>        unexportObject(this, true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>        RMIServerSocketFactory ssf = new ServerSocketFactoryImpl();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>        UnicastRemoteObject.exportObject(this, 0, null, ssf);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>        if (System.getSecurityManager() == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>                // Provide a default security manager.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>                System.setSecurityManager(new SecurityManager());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>            } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>                throw new RemoteException(&quot;unable to set security manager&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>     * Trivial server socket factory used to export the activation group</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>     * impl on an unshared port.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>    private static class ServerSocketFactoryImpl</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>        implements RMIServerSocketFactory</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>        public ServerSocket createServerSocket(int port) throws IOException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>        {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>            RMISocketFactory sf = RMISocketFactory.getSocketFactory();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>            if (sf == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>                sf = RMISocketFactory.getDefaultSocketFactory();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>            return sf.createServerSocket(port);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>     * Obtains a lock on the ActivationID id before returning. Allows only one</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>     * thread at a time to hold a lock on a particular id.  If the lock for id</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>     * is in use, all requests for an equivalent (in the Object.equals sense)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>     * id will wait for the id to be notified and use the supplied id as the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>     * next lock. The caller of &quot;acquireLock&quot; must execute the &quot;releaseLock&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>     * method&quot; to release the lock and &quot;notifyAll&quot; waiters for the id lock</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>     * obtained from this method.  The typical usage pattern is as follows:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>     * try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>     *    acquireLock(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>     *    // do stuff pertaining to id...</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>     * } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>     *    releaseLock(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>     *    checkInactiveGroup();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>     * }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>    private void acquireLock(ActivationID id) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>        ActivationID waitForID;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>        for (;;) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>            synchronized (lockedIDs) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>                int index = lockedIDs.indexOf(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>                if (index &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>                    lockedIDs.add(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>                    return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>                    waitForID = lockedIDs.get(index);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>            synchronized (waitForID) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>                synchronized (lockedIDs) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>                    int index = lockedIDs.indexOf(waitForID);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>                    if (index &lt; 0) continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>                    ActivationID actualID = lockedIDs.get(index);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>                    if (actualID != waitForID)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>                        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>                         * don't wait on an id that won't be notified.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>                         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>                        continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>                    waitForID.wait();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>                } catch (InterruptedException ignore) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>     * Releases the id lock obtained via the &quot;acquireLock&quot; method and then</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>     * notifies all threads waiting on the lock.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>    private void releaseLock(ActivationID id) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>        synchronized (lockedIDs) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>            id = lockedIDs.remove(lockedIDs.indexOf(id));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>        synchronized (id) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>            id.notifyAll();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>     * Creates a new instance of an activatable remote object. The</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>     * &lt;code&gt;Activator&lt;/code&gt; calls this method to create an activatable</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>     * object in this group. This method should be idempotent; a call to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>     * activate an already active object should return the previously</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>     * activated object.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>     * Note: this method assumes that the Activator will only invoke</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>     * newInstance for the same object in a serial fashion (i.e.,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>     * the activator will not allow the group to see concurrent requests</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>     * to activate the same object.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>     * @param id the object's activation identifier</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>     * @param desc the object's activation descriptor</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>     * @return a marshalled object containing the activated object's stub</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>    public MarshalledObject&lt;? extends Remote&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>                                      newInstance(final ActivationID id,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>                                                  final ActivationDesc desc)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>        throws ActivationException, RemoteException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>        RegistryImpl.checkAccess(&quot;ActivationInstantiator.newInstance&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>        if (!groupID.equals(desc.getGroupID()))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>            throw new ActivationException(&quot;newInstance in wrong group&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>            acquireLock(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>            synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>                if (groupInactive == true)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>                    throw new InactiveGroupException(&quot;group is inactive&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>            ActiveEntry entry = active.get(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>            if (entry != null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>                return entry.mobj;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>            String className = desc.getClassName();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>            final Class&lt;? extends Remote&gt; cl =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>                RMIClassLoader.loadClass(desc.getLocation(), className)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>                .asSubclass(Remote.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>            Remote impl = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>            final Thread t = Thread.currentThread();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>            final ClassLoader savedCcl = t.getContextClassLoader();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>            ClassLoader objcl = cl.getClassLoader();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>            final ClassLoader ccl = covers(objcl, savedCcl) ? objcl : savedCcl;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>            /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>             * Fix for 4164971: allow non-public activatable class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>             * and/or constructor, create the activatable object in a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>             * privileged block</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>             */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>                /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>                 * The code below is in a doPrivileged block to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>                 * protect against user code which code might have set</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>                 * a global socket factory (in which case application</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>                 * code would be on the stack).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>                 */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>                impl = AccessController.doPrivileged(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>                      new PrivilegedExceptionAction&lt;Remote&gt;() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>                      public Remote run() throws InstantiationException,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>                          NoSuchMethodException, IllegalAccessException,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>                          InvocationTargetException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>                      {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>                          Constructor&lt;? extends Remote&gt; constructor =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>                              cl.getDeclaredConstructor(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>                                  ActivationID.class, MarshalledObject.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>                          constructor.setAccessible(true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>                          try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>                              /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>                               * Fix for 4289544: make sure to set the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>                               * context class loader to be the class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>                               * loader of the impl class before</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>                               * constructing that class.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>                               */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>                              t.setContextClassLoader(ccl);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>                              return constructor.newInstance(id,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>                                                             desc.getData());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>                          } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>                              t.setContextClassLoader(savedCcl);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>                          }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>                      }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>                  });</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>            } catch (PrivilegedActionException pae) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>                Throwable e = pae.getException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>                // narrow the exception's type and rethrow it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>                if (e instanceof InstantiationException) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>                    throw (InstantiationException) e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>                } else if (e instanceof NoSuchMethodException) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>                    throw (NoSuchMethodException) e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>                } else if (e instanceof IllegalAccessException) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>                    throw (IllegalAccessException) e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>                } else if (e instanceof InvocationTargetException) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>                    throw (InvocationTargetException) e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>                } else if (e instanceof RuntimeException) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>                    throw (RuntimeException) e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>                } else if (e instanceof Error) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>                    throw (Error) e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>            entry = new ActiveEntry(impl);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>            active.put(id, entry);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>            return entry.mobj;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>        } catch (NoSuchMethodException | NoSuchMethodError e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>            /* user forgot to provide activatable constructor?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>             * or code recompiled and user forgot to provide</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>             *  activatable constructor?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>             */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>            throw new ActivationException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>                (&quot;Activatable object must provide an activation&quot;+</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>                 &quot; constructor&quot;, e );</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>        } catch (InvocationTargetException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>            throw new ActivationException(&quot;exception in object constructor&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>                                          e.getTargetException());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>            throw new ActivationException(&quot;unable to activate object&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>        } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>            releaseLock(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>            checkInactiveGroup();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>   /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>    * The group's &lt;code&gt;inactiveObject&lt;/code&gt; method is called</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>    * indirectly via a call to the &lt;code&gt;Activatable.inactive&lt;/code&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>    * method. A remote object implementation must call</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>    * &lt;code&gt;Activatable&lt;/code&gt;'s &lt;code&gt;inactive&lt;/code&gt; method when</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>    * that object deactivates (the object deems that it is no longer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>    * active). If the object does not call</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>    * &lt;code&gt;Activatable.inactive&lt;/code&gt; when it deactivates, the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>    * object will never be garbage collected since the group keeps</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>    * strong references to the objects it creates. &lt;p&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>    *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>    * The group's &lt;code&gt;inactiveObject&lt;/code&gt; method</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>    * unexports the remote object from the RMI runtime so that the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>    * object can no longer receive incoming RMI calls. This call will</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>    * only succeed if the object has no pending/executing calls. If</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>    * the object does have pending/executing RMI calls, then false</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>    * will be returned.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>    *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>    * If the object has no pending/executing calls, the object is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>    * removed from the RMI runtime and the group informs its</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>    * &lt;code&gt;ActivationMonitor&lt;/code&gt; (via the monitor's</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>    * &lt;code&gt;inactiveObject&lt;/code&gt; method) that the remote object is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>    * not currently active so that the remote object will be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>    * re-activated by the activator upon a subsequent activation</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>    * request.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>    *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>    * @param id the object's activation identifier</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>    * @returns true if the operation succeeds (the operation will</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>    * succeed if the object in currently known to be active and is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>    * either already unexported or is currently exported and has no</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>    * pending/executing calls); false is returned if the object has</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>    * pending/executing calls in which case it cannot be deactivated</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>    * @exception UnknownObjectException if object is unknown (may already</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>    * be inactive)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>    * @exception RemoteException if call informing monitor fails</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>    */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>    public boolean inactiveObject(ActivationID id)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>        throws ActivationException, UnknownObjectException, RemoteException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>            acquireLock(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>            synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>                if (groupInactive == true)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>                    throw new ActivationException(&quot;group is inactive&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>            ActiveEntry entry = active.get(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>            if (entry == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>                // REMIND: should this be silent?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>                throw new UnknownObjectException(&quot;object not active&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>                if (Activatable.unexportObject(entry.impl, false) == false)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>                    return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>            } catch (NoSuchObjectException allowUnexportedObjects) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>                super.inactiveObject(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>            } catch (UnknownObjectException allowUnregisteredObjects) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>            active.remove(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>        } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>            releaseLock(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>            checkInactiveGroup();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>        return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>     * Determines if the group has become inactive and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>     * marks it as such.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>    private void checkInactiveGroup() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>        boolean groupMarkedInactive = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>        synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>            if (active.size() == 0 &amp;&amp; lockedIDs.size() == 0 &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>                groupInactive == false)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>            {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>                groupInactive = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>                groupMarkedInactive = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>        if (groupMarkedInactive) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>                super.inactiveGroup();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>            } catch (Exception ignoreDeactivateFailure) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>                UnicastRemoteObject.unexportObject(this, true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>            } catch (NoSuchObjectException allowUnexportedGroup) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>     * The group's &lt;code&gt;activeObject&lt;/code&gt; method is called when an</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>     * object is exported (either by &lt;code&gt;Activatable&lt;/code&gt; object</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>     * construction or an explicit call to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>     * &lt;code&gt;Activatable.exportObject&lt;/code&gt;. The group must inform its</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>     * &lt;code&gt;ActivationMonitor&lt;/code&gt; that the object is active (via</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>     * the monitor's &lt;code&gt;activeObject&lt;/code&gt; method) if the group</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>     * hasn't already done so.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>     * @param id the object's identifier</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>     * @param obj the remote object implementation</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>     * @exception UnknownObjectException if object is not registered</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>     * @exception RemoteException if call informing monitor fails</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>    public void activeObject(ActivationID id, Remote impl)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>        throws ActivationException, UnknownObjectException, RemoteException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>            acquireLock(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>            synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>                if (groupInactive == true)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>                    throw new ActivationException(&quot;group is inactive&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>            if (!active.contains(id)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>                ActiveEntry entry = new ActiveEntry(impl);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>                active.put(id, entry);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>                // created new entry, so inform monitor of active object</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>                    super.activeObject(id, entry.mobj);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>                } catch (RemoteException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>                    // daemon can still find it by calling newInstance</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>        } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>            releaseLock(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>            checkInactiveGroup();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>     * Entry in table for active object.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>    private static class ActiveEntry {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>        Remote impl;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>        MarshalledObject&lt;Remote&gt; mobj;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>        ActiveEntry(Remote impl) throws ActivationException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>            this.impl =  impl;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>                this.mobj = new MarshalledObject&lt;Remote&gt;(impl);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>            } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>                throw new</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>                    ActivationException(&quot;failed to marshal remote object&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>     * Returns true if the first argument is either equal to, or is a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>     * descendant of, the second argument.  Null is treated as the root of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>     * the tree.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>    private static boolean covers(ClassLoader sub, ClassLoader sup) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>        if (sup == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>            return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>        } else if (sub == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>            return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>        do {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>            if (sub == sup) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>                return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>            sub = sub.getParent();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>        } while (sub != null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>        return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

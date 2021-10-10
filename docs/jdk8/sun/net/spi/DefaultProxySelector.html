@@ -3,365 +3,1439 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2003, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package sun.net.spi;
-
-import java.net.InetSocketAddress;
-import java.net.Proxy;
-import java.net.ProxySelector;
-import java.net.SocketAddress;
-import java.net.URI;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.StringTokenizer;
-import java.io.IOException;
-import sun.misc.RegexpPool;
-import java.security.AccessController;
-import java.security.PrivilegedAction;
-import sun.net.NetProperties;
-import sun.net.SocksProxy;
-
-/**
- * Supports proxy settings using system properties This proxy selector
- * provides backward compatibility with the old http protocol handler
- * as far as how proxy is set
- *
- * Most of the implementation copied from the old http protocol handler
- *
- * Supports http/https/ftp.proxyHost, http/https/ftp.proxyPort,
- * proxyHost, proxyPort, and http/https/ftp.nonProxyHost, and socks.
- * NOTE: need to do gopher as well
- */
-public class DefaultProxySelector extends ProxySelector {
-
-    /**
-     * This is where we define all the valid System Properties we have to
-     * support for each given protocol.
-     * The format of this 2 dimensional array is :
-     * - 1 row per protocol (http, ftp, ...)
-     * - 1st element of each row is the protocol name
-     * - subsequent elements are prefixes for Host &amp; Port properties
-     *   listed in order of priority.
-     * Example:
-     * {&quot;ftp&quot;, &quot;ftp.proxy&quot;, &quot;ftpProxy&quot;, &quot;proxy&quot;, &quot;socksProxy&quot;},
-     * means for FTP we try in that oder:
-     *          + ftp.proxyHost &amp; ftp.proxyPort
-     *          + ftpProxyHost &amp; ftpProxyPort
-     *          + proxyHost &amp; proxyPort
-     *          + socksProxyHost &amp; socksProxyPort
-     *
-     * Note that the socksProxy should *always* be the last on the list
-     */
-    final static String[][] props = {
-        /*
-         * protocol, Property prefix 1, Property prefix 2, ...
-         */
-        {&quot;http&quot;, &quot;http.proxy&quot;, &quot;proxy&quot;, &quot;socksProxy&quot;},
-        {&quot;https&quot;, &quot;https.proxy&quot;, &quot;proxy&quot;, &quot;socksProxy&quot;},
-        {&quot;ftp&quot;, &quot;ftp.proxy&quot;, &quot;ftpProxy&quot;, &quot;proxy&quot;, &quot;socksProxy&quot;},
-        {&quot;gopher&quot;, &quot;gopherProxy&quot;, &quot;socksProxy&quot;},
-        {&quot;socket&quot;, &quot;socksProxy&quot;}
-    };
-
-    private static final String SOCKS_PROXY_VERSION = &quot;socksProxyVersion&quot;;
-
-    private static boolean hasSystemProxies = false;
-
-    static {
-        final String key = &quot;java.net.useSystemProxies&quot;;
-        Boolean b = AccessController.doPrivileged(
-            new PrivilegedAction&lt;Boolean&gt;() {
-                public Boolean run() {
-                    return NetProperties.getBoolean(key);
-                }});
-        if (b != null &amp;&amp; b.booleanValue()) {
-            java.security.AccessController.doPrivileged(
-                new java.security.PrivilegedAction&lt;Void&gt;() {
-                    public Void run() {
-                        System.loadLibrary(&quot;net&quot;);
-                        return null;
-                    }
-                });
-            hasSystemProxies = init();
-        }
-    }
-
-    /**
-     * How to deal with &quot;non proxy hosts&quot;:
-     * since we do have to generate a RegexpPool we don't want to do that if
-     * it's not necessary. Therefore we do cache the result, on a per-protocol
-     * basis, and change it only when the &quot;source&quot;, i.e. the system property,
-     * did change.
-     */
-
-    static class NonProxyInfo {
-        // Default value for nonProxyHosts, this provides backward compatibility
-        // by excluding localhost and its litteral notations.
-        static final String defStringVal = &quot;localhost|127.*|[::1]|0.0.0.0|[::0]&quot;;
-
-        String hostsSource;
-        RegexpPool hostsPool;
-        final String property;
-        final String defaultVal;
-        static NonProxyInfo ftpNonProxyInfo = new NonProxyInfo(&quot;ftp.nonProxyHosts&quot;, null, null, defStringVal);
-        static NonProxyInfo httpNonProxyInfo = new NonProxyInfo(&quot;http.nonProxyHosts&quot;, null, null, defStringVal);
-        static NonProxyInfo socksNonProxyInfo = new NonProxyInfo(&quot;socksNonProxyHosts&quot;, null, null, defStringVal);
-
-        NonProxyInfo(String p, String s, RegexpPool pool, String d) {
-            property = p;
-            hostsSource = s;
-            hostsPool = pool;
-            defaultVal = d;
-        }
-    }
-
-
-    /**
-     * select() method. Where all the hard work is done.
-     * Build a list of proxies depending on URI.
-     * Since we're only providing compatibility with the system properties
-     * from previous releases (see list above), that list will always
-     * contain 1 single proxy, default being NO_PROXY.
-     */
-    public java.util.List&lt;Proxy&gt; select(URI uri) {
-        if (uri == null) {
-            throw new IllegalArgumentException(&quot;URI can't be null.&quot;);
-        }
-        String protocol = uri.getScheme();
-        String host = uri.getHost();
-
-        if (host == null) {
-            // This is a hack to ensure backward compatibility in two
-            // cases: 1. hostnames contain non-ascii characters,
-            // internationalized domain names. in which case, URI will
-            // return null, see BugID 4957669; 2. Some hostnames can
-            // contain '_' chars even though it's not supposed to be
-            // legal, in which case URI will return null for getHost,
-            // but not for getAuthority() See BugID 4913253
-            String auth = uri.getAuthority();
-            if (auth != null) {
-                int i;
-                i = auth.indexOf('@');
-                if (i &gt;= 0) {
-                    auth = auth.substring(i+1);
-                }
-                i = auth.lastIndexOf(':');
-                if (i &gt;= 0) {
-                    auth = auth.substring(0,i);
-                }
-                host = auth;
-            }
-        }
-
-        if (protocol == null || host == null) {
-            throw new IllegalArgumentException(&quot;protocol = &quot;+protocol+&quot; host = &quot;+host);
-        }
-        List&lt;Proxy&gt; proxyl = new ArrayList&lt;Proxy&gt;(1);
-
-        NonProxyInfo pinfo = null;
-
-        if (&quot;http&quot;.equalsIgnoreCase(protocol)) {
-            pinfo = NonProxyInfo.httpNonProxyInfo;
-        } else if (&quot;https&quot;.equalsIgnoreCase(protocol)) {
-            // HTTPS uses the same property as HTTP, for backward
-            // compatibility
-            pinfo = NonProxyInfo.httpNonProxyInfo;
-        } else if (&quot;ftp&quot;.equalsIgnoreCase(protocol)) {
-            pinfo = NonProxyInfo.ftpNonProxyInfo;
-        } else if (&quot;socket&quot;.equalsIgnoreCase(protocol)) {
-            pinfo = NonProxyInfo.socksNonProxyInfo;
-        }
-
-        /**
-         * Let's check the System properties for that protocol
-         */
-        final String proto = protocol;
-        final NonProxyInfo nprop = pinfo;
-        final String urlhost = host.toLowerCase();
-
-        /**
-         * This is one big doPrivileged call, but we're trying to optimize
-         * the code as much as possible. Since we're checking quite a few
-         * System properties it does help having only 1 call to doPrivileged.
-         * Be mindful what you do in here though!
-         */
-        Proxy p = AccessController.doPrivileged(
-            new PrivilegedAction&lt;Proxy&gt;() {
-                public Proxy run() {
-                    int i, j;
-                    String phost =  null;
-                    int pport = 0;
-                    String nphosts =  null;
-                    InetSocketAddress saddr = null;
-
-                    // Then let's walk the list of protocols in our array
-                    for (i=0; i&lt;props.length; i++) {
-                        if (props[i][0].equalsIgnoreCase(proto)) {
-                            for (j = 1; j &lt; props[i].length; j++) {
-                                /* System.getProp() will give us an empty
-                                 * String, &quot;&quot; for a defined but &quot;empty&quot;
-                                 * property.
-                                 */
-                                phost =  NetProperties.get(props[i][j]+&quot;Host&quot;);
-                                if (phost != null &amp;&amp; phost.length() != 0)
-                                    break;
-                            }
-                            if (phost == null || phost.length() == 0) {
-                                /**
-                                 * No system property defined for that
-                                 * protocol. Let's check System Proxy
-                                 * settings (Gnome &amp; Windows) if we were
-                                 * instructed to.
-                                 */
-                                if (hasSystemProxies) {
-                                    String sproto;
-                                    if (proto.equalsIgnoreCase(&quot;socket&quot;))
-                                        sproto = &quot;socks&quot;;
-                                    else
-                                        sproto = proto;
-                                    Proxy sproxy = getSystemProxy(sproto, urlhost);
-                                    if (sproxy != null) {
-                                        return sproxy;
-                                    }
-                                }
-                                return Proxy.NO_PROXY;
-                            }
-                            // If a Proxy Host is defined for that protocol
-                            // Let's get the NonProxyHosts property
-                            if (nprop != null) {
-                                nphosts = NetProperties.get(nprop.property);
-                                synchronized (nprop) {
-                                    if (nphosts == null) {
-                                        if (nprop.defaultVal != null) {
-                                            nphosts = nprop.defaultVal;
-                                        } else {
-                                            nprop.hostsSource = null;
-                                            nprop.hostsPool = null;
-                                        }
-                                    } else if (nphosts.length() != 0) {
-                                        // add the required default patterns
-                                        // but only if property no set. If it
-                                        // is empty, leave empty.
-                                        nphosts += &quot;|&quot; + NonProxyInfo
-                                                         .defStringVal;
-                                    }
-                                    if (nphosts != null) {
-                                        if (!nphosts.equals(nprop.hostsSource)) {
-                                            RegexpPool pool = new RegexpPool();
-                                            StringTokenizer st = new StringTokenizer(nphosts, &quot;|&quot;, false);
-                                            try {
-                                                while (st.hasMoreTokens()) {
-                                                    pool.add(st.nextToken().toLowerCase(), Boolean.TRUE);
-                                                }
-                                            } catch (sun.misc.REException ex) {
-                                            }
-                                            nprop.hostsPool = pool;
-                                            nprop.hostsSource = nphosts;
-                                        }
-                                    }
-                                    if (nprop.hostsPool != null &amp;&amp;
-                                        nprop.hostsPool.match(urlhost) != null) {
-                                        return Proxy.NO_PROXY;
-                                    }
-                                }
-                            }
-                            // We got a host, let's check for port
-
-                            pport = NetProperties.getInteger(props[i][j]+&quot;Port&quot;, 0).intValue();
-                            if (pport == 0 &amp;&amp; j &lt; (props[i].length - 1)) {
-                                // Can't find a port with same prefix as Host
-                                // AND it's not a SOCKS proxy
-                                // Let's try the other prefixes for that proto
-                                for (int k = 1; k &lt; (props[i].length - 1); k++) {
-                                    if ((k != j) &amp;&amp; (pport == 0))
-                                        pport = NetProperties.getInteger(props[i][k]+&quot;Port&quot;, 0).intValue();
-                                }
-                            }
-
-                            // Still couldn't find a port, let's use default
-                            if (pport == 0) {
-                                if (j == (props[i].length - 1)) // SOCKS
-                                    pport = defaultPort(&quot;socket&quot;);
-                                else
-                                    pport = defaultPort(proto);
-                            }
-                            // We did find a proxy definition.
-                            // Let's create the address, but don't resolve it
-                            // as this will be done at connection time
-                            saddr = InetSocketAddress.createUnresolved(phost, pport);
-                            // Socks is *always* the last on the list.
-                            if (j == (props[i].length - 1)) {
-                                int version = NetProperties.getInteger(SOCKS_PROXY_VERSION, 5).intValue();
-                                return SocksProxy.create(saddr, version);
-                            } else {
-                                return new Proxy(Proxy.Type.HTTP, saddr);
-                            }
-                        }
-                    }
-                    return Proxy.NO_PROXY;
-                }});
-
-        proxyl.add(p);
-
-        /*
-         * If no specific property was set for that URI, we should be
-         * returning an iterator to an empty List.
-         */
-        return proxyl;
-    }
-
-    public void connectFailed(URI uri, SocketAddress sa, IOException ioe) {
-        if (uri == null || sa == null || ioe == null) {
-            throw new IllegalArgumentException(&quot;Arguments can't be null.&quot;);
-        }
-        // ignored
-    }
-
-
-    private int defaultPort(String protocol) {
-        if (&quot;http&quot;.equalsIgnoreCase(protocol)) {
-            return 80;
-        } else if (&quot;https&quot;.equalsIgnoreCase(protocol)) {
-            return 443;
-        } else if (&quot;ftp&quot;.equalsIgnoreCase(protocol)) {
-            return 80;
-        } else if (&quot;socket&quot;.equalsIgnoreCase(protocol)) {
-            return 1080;
-        } else if (&quot;gopher&quot;.equalsIgnoreCase(protocol)) {
-            return 80;
-        } else {
-            return -1;
-        }
-    }
-
-    private native static boolean init();
-    private synchronized native Proxy getSystemProxy(String protocol, String host);
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2003, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package sun.net.spi;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.net.InetSocketAddress;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.net.Proxy;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.net.ProxySelector;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.net.SocketAddress;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.net.URI;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.util.ArrayList;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.util.List;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import java.util.StringTokenizer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.io.IOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import sun.misc.RegexpPool;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import java.security.AccessController;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import java.security.PrivilegedAction;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre>import sun.net.NetProperties;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre>import sun.net.SocksProxy;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre> * Supports proxy settings using system properties This proxy selector</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre> * provides backward compatibility with the old http protocol handler</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre> * as far as how proxy is set</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre> * Most of the implementation copied from the old http protocol handler</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre> * Supports http/https/ftp.proxyHost, http/https/ftp.proxyPort,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre> * proxyHost, proxyPort, and http/https/ftp.nonProxyHost, and socks.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre> * NOTE: need to do gopher as well</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre>public class DefaultProxySelector extends ProxySelector {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>     * This is where we define all the valid System Properties we have to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>     * support for each given protocol.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre>     * The format of this 2 dimensional array is :</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>     * - 1 row per protocol (http, ftp, ...)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>     * - 1st element of each row is the protocol name</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre>     * - subsequent elements are prefixes for Host &amp; Port properties</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>     *   listed in order of priority.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>     * Example:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>     * {&quot;ftp&quot;, &quot;ftp.proxy&quot;, &quot;ftpProxy&quot;, &quot;proxy&quot;, &quot;socksProxy&quot;},</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>     * means for FTP we try in that oder:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>     *          + ftp.proxyHost &amp; ftp.proxyPort</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>     *          + ftpProxyHost &amp; ftpProxyPort</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>     *          + proxyHost &amp; proxyPort</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>     *          + socksProxyHost &amp; socksProxyPort</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>     * Note that the socksProxy should *always* be the last on the list</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>    final static String[][] props = {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>         * protocol, Property prefix 1, Property prefix 2, ...</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>        {&quot;http&quot;, &quot;http.proxy&quot;, &quot;proxy&quot;, &quot;socksProxy&quot;},</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>        {&quot;https&quot;, &quot;https.proxy&quot;, &quot;proxy&quot;, &quot;socksProxy&quot;},</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>        {&quot;ftp&quot;, &quot;ftp.proxy&quot;, &quot;ftpProxy&quot;, &quot;proxy&quot;, &quot;socksProxy&quot;},</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>        {&quot;gopher&quot;, &quot;gopherProxy&quot;, &quot;socksProxy&quot;},</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>        {&quot;socket&quot;, &quot;socksProxy&quot;}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>    };</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>    private static final String SOCKS_PROXY_VERSION = &quot;socksProxyVersion&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>    private static boolean hasSystemProxies = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>    static {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>        final String key = &quot;java.net.useSystemProxies&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>        Boolean b = AccessController.doPrivileged(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>            new PrivilegedAction&lt;Boolean&gt;() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>                public Boolean run() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>                    return NetProperties.getBoolean(key);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>                }});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>        if (b != null &amp;&amp; b.booleanValue()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>            java.security.AccessController.doPrivileged(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>                new java.security.PrivilegedAction&lt;Void&gt;() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>                    public Void run() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>                        System.loadLibrary(&quot;net&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>                        return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>                });</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>            hasSystemProxies = init();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>     * How to deal with &quot;non proxy hosts&quot;:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>     * since we do have to generate a RegexpPool we don't want to do that if</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>     * it's not necessary. Therefore we do cache the result, on a per-protocol</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>     * basis, and change it only when the &quot;source&quot;, i.e. the system property,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>     * did change.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>    static class NonProxyInfo {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>        // Default value for nonProxyHosts, this provides backward compatibility</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>        // by excluding localhost and its litteral notations.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>        static final String defStringVal = &quot;localhost|127.*|[::1]|0.0.0.0|[::0]&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>        String hostsSource;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>        RegexpPool hostsPool;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>        final String property;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>        final String defaultVal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>        static NonProxyInfo ftpNonProxyInfo = new NonProxyInfo(&quot;ftp.nonProxyHosts&quot;, null, null, defStringVal);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>        static NonProxyInfo httpNonProxyInfo = new NonProxyInfo(&quot;http.nonProxyHosts&quot;, null, null, defStringVal);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>        static NonProxyInfo socksNonProxyInfo = new NonProxyInfo(&quot;socksNonProxyHosts&quot;, null, null, defStringVal);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>        NonProxyInfo(String p, String s, RegexpPool pool, String d) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>            property = p;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>            hostsSource = s;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>            hostsPool = pool;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>            defaultVal = d;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>     * select() method. Where all the hard work is done.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>     * Build a list of proxies depending on URI.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>     * Since we're only providing compatibility with the system properties</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>     * from previous releases (see list above), that list will always</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>     * contain 1 single proxy, default being NO_PROXY.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>    public java.util.List&lt;Proxy&gt; select(URI uri) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>        if (uri == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>            throw new IllegalArgumentException(&quot;URI can't be null.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>        String protocol = uri.getScheme();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>        String host = uri.getHost();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>        if (host == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>            // This is a hack to ensure backward compatibility in two</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>            // cases: 1. hostnames contain non-ascii characters,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>            // internationalized domain names. in which case, URI will</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>            // return null, see BugID 4957669; 2. Some hostnames can</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>            // contain '_' chars even though it's not supposed to be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>            // legal, in which case URI will return null for getHost,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>            // but not for getAuthority() See BugID 4913253</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>            String auth = uri.getAuthority();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>            if (auth != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>                int i;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>                i = auth.indexOf('@');</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>                if (i &gt;= 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>                    auth = auth.substring(i+1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>                i = auth.lastIndexOf(':');</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>                if (i &gt;= 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>                    auth = auth.substring(0,i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>                host = auth;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>        if (protocol == null || host == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>            throw new IllegalArgumentException(&quot;protocol = &quot;+protocol+&quot; host = &quot;+host);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>        List&lt;Proxy&gt; proxyl = new ArrayList&lt;Proxy&gt;(1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>        NonProxyInfo pinfo = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>        if (&quot;http&quot;.equalsIgnoreCase(protocol)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>            pinfo = NonProxyInfo.httpNonProxyInfo;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>        } else if (&quot;https&quot;.equalsIgnoreCase(protocol)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>            // HTTPS uses the same property as HTTP, for backward</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>            // compatibility</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>            pinfo = NonProxyInfo.httpNonProxyInfo;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>        } else if (&quot;ftp&quot;.equalsIgnoreCase(protocol)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>            pinfo = NonProxyInfo.ftpNonProxyInfo;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>        } else if (&quot;socket&quot;.equalsIgnoreCase(protocol)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>            pinfo = NonProxyInfo.socksNonProxyInfo;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>         * Let's check the System properties for that protocol</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>        final String proto = protocol;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>        final NonProxyInfo nprop = pinfo;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>        final String urlhost = host.toLowerCase();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>         * This is one big doPrivileged call, but we're trying to optimize</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>         * the code as much as possible. Since we're checking quite a few</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>         * System properties it does help having only 1 call to doPrivileged.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>         * Be mindful what you do in here though!</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>        Proxy p = AccessController.doPrivileged(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>            new PrivilegedAction&lt;Proxy&gt;() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>                public Proxy run() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>                    int i, j;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>                    String phost =  null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>                    int pport = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>                    String nphosts =  null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>                    InetSocketAddress saddr = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>                    // Then let's walk the list of protocols in our array</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>                    for (i=0; i&lt;props.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>                        if (props[i][0].equalsIgnoreCase(proto)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>                            for (j = 1; j &lt; props[i].length; j++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>                                /* System.getProp() will give us an empty</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>                                 * String, &quot;&quot; for a defined but &quot;empty&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>                                 * property.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>                                 */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>                                phost =  NetProperties.get(props[i][j]+&quot;Host&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>                                if (phost != null &amp;&amp; phost.length() != 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>                                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>                            if (phost == null || phost.length() == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>                                /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>                                 * No system property defined for that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>                                 * protocol. Let's check System Proxy</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>                                 * settings (Gnome &amp; Windows) if we were</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>                                 * instructed to.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>                                 */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>                                if (hasSystemProxies) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>                                    String sproto;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>                                    if (proto.equalsIgnoreCase(&quot;socket&quot;))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>                                        sproto = &quot;socks&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>                                    else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>                                        sproto = proto;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>                                    Proxy sproxy = getSystemProxy(sproto, urlhost);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>                                    if (sproxy != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>                                        return sproxy;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>                                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>                                return Proxy.NO_PROXY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>                            // If a Proxy Host is defined for that protocol</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>                            // Let's get the NonProxyHosts property</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>                            if (nprop != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>                                nphosts = NetProperties.get(nprop.property);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>                                synchronized (nprop) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>                                    if (nphosts == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>                                        if (nprop.defaultVal != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>                                            nphosts = nprop.defaultVal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>                                        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>                                            nprop.hostsSource = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>                                            nprop.hostsPool = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>                                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>                                    } else if (nphosts.length() != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>                                        // add the required default patterns</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>                                        // but only if property no set. If it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>                                        // is empty, leave empty.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>                                        nphosts += &quot;|&quot; + NonProxyInfo</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>                                                         .defStringVal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>                                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>                                    if (nphosts != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>                                        if (!nphosts.equals(nprop.hostsSource)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>                                            RegexpPool pool = new RegexpPool();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>                                            StringTokenizer st = new StringTokenizer(nphosts, &quot;|&quot;, false);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>                                            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>                                                while (st.hasMoreTokens()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>                                                    pool.add(st.nextToken().toLowerCase(), Boolean.TRUE);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>                                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>                                            } catch (sun.misc.REException ex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>                                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>                                            nprop.hostsPool = pool;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>                                            nprop.hostsSource = nphosts;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>                                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>                                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>                                    if (nprop.hostsPool != null &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>                                        nprop.hostsPool.match(urlhost) != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>                                        return Proxy.NO_PROXY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>                                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>                            // We got a host, let's check for port</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>                            pport = NetProperties.getInteger(props[i][j]+&quot;Port&quot;, 0).intValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>                            if (pport == 0 &amp;&amp; j &lt; (props[i].length - 1)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>                                // Can't find a port with same prefix as Host</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>                                // AND it's not a SOCKS proxy</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>                                // Let's try the other prefixes for that proto</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>                                for (int k = 1; k &lt; (props[i].length - 1); k++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>                                    if ((k != j) &amp;&amp; (pport == 0))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>                                        pport = NetProperties.getInteger(props[i][k]+&quot;Port&quot;, 0).intValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>                            // Still couldn't find a port, let's use default</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>                            if (pport == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>                                if (j == (props[i].length - 1)) // SOCKS</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>                                    pport = defaultPort(&quot;socket&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>                                else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>                                    pport = defaultPort(proto);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>                            // We did find a proxy definition.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>                            // Let's create the address, but don't resolve it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>                            // as this will be done at connection time</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>                            saddr = InetSocketAddress.createUnresolved(phost, pport);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>                            // Socks is *always* the last on the list.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>                            if (j == (props[i].length - 1)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>                                int version = NetProperties.getInteger(SOCKS_PROXY_VERSION, 5).intValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>                                return SocksProxy.create(saddr, version);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>                            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>                                return new Proxy(Proxy.Type.HTTP, saddr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>                    return Proxy.NO_PROXY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>                }});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>        proxyl.add(p);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>         * If no specific property was set for that URI, we should be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>         * returning an iterator to an empty List.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>        return proxyl;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>    public void connectFailed(URI uri, SocketAddress sa, IOException ioe) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>        if (uri == null || sa == null || ioe == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>            throw new IllegalArgumentException(&quot;Arguments can't be null.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>        // ignored</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>    private int defaultPort(String protocol) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>        if (&quot;http&quot;.equalsIgnoreCase(protocol)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>            return 80;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>        } else if (&quot;https&quot;.equalsIgnoreCase(protocol)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>            return 443;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>        } else if (&quot;ftp&quot;.equalsIgnoreCase(protocol)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>            return 80;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>        } else if (&quot;socket&quot;.equalsIgnoreCase(protocol)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>            return 1080;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>        } else if (&quot;gopher&quot;.equalsIgnoreCase(protocol)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>            return 80;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>            return -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>    private native static boolean init();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>    private synchronized native Proxy getSystemProxy(String protocol, String host);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

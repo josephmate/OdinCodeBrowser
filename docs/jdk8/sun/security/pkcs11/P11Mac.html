@@ -3,276 +3,1083 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2003, 2012, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package sun.security.pkcs11;
-
-import java.util.*;
-import java.nio.ByteBuffer;
-
-import java.security.*;
-import java.security.spec.AlgorithmParameterSpec;
-
-import javax.crypto.MacSpi;
-
-import sun.nio.ch.DirectBuffer;
-
-import sun.security.pkcs11.wrapper.*;
-import static sun.security.pkcs11.wrapper.PKCS11Constants.*;
-
-/**
- * MAC implementation class. This class currently supports HMAC using
- * MD5, SHA-1, SHA-224, SHA-256, SHA-384, and SHA-512 and the SSL3 MAC
- * using MD5 and SHA-1.
- *
- * Note that unlike other classes (e.g. Signature), this does not
- * composite various operations if the token only supports part of the
- * required functionality. The MAC implementations in SunJCE already
- * do exactly that by implementing an MAC on top of MessageDigests. We
- * could not do any better than they.
- *
- * @author  Andreas Sterbenz
- * @since   1.5
- */
-final class P11Mac extends MacSpi {
-
-    /* unitialized, all fields except session have arbitrary values */
-    private final static int S_UNINIT   = 1;
-
-    /* session initialized, no data processed yet */
-    private final static int S_RESET    = 2;
-
-    /* session initialized, data processed */
-    private final static int S_UPDATE   = 3;
-
-    /* transitional state after doFinal() before we go to S_UNINIT */
-    private final static int S_DOFINAL  = 4;
-
-    // token instance
-    private final Token token;
-
-    // algorithm name
-    private final String algorithm;
-
-    // mechanism id
-    private final long mechanism;
-
-    // mechanism object
-    private final CK_MECHANISM ckMechanism;
-
-    // length of the MAC in bytes
-    private final int macLength;
-
-    // key instance used, if operation active
-    private P11Key p11Key;
-
-    // associated session, if any
-    private Session session;
-
-    // state, one of S_* above
-    private int state;
-
-    // one byte buffer for the update(byte) method, initialized on demand
-    private byte[] oneByte;
-
-    P11Mac(Token token, String algorithm, long mechanism)
-            throws PKCS11Exception {
-        super();
-        this.token = token;
-        this.algorithm = algorithm;
-        this.mechanism = mechanism;
-        Long params = null;
-        switch ((int)mechanism) {
-        case (int)CKM_MD5_HMAC:
-            macLength = 16;
-            break;
-        case (int)CKM_SHA_1_HMAC:
-            macLength = 20;
-            break;
-        case (int)CKM_SHA224_HMAC:
-            macLength = 28;
-            break;
-        case (int)CKM_SHA256_HMAC:
-            macLength = 32;
-            break;
-        case (int)CKM_SHA384_HMAC:
-            macLength = 48;
-            break;
-        case (int)CKM_SHA512_HMAC:
-            macLength = 64;
-            break;
-        case (int)CKM_SSL3_MD5_MAC:
-            macLength = 16;
-            params = Long.valueOf(16);
-            break;
-        case (int)CKM_SSL3_SHA1_MAC:
-            macLength = 20;
-            params = Long.valueOf(20);
-            break;
-        default:
-            throw new ProviderException(&quot;Unknown mechanism: &quot; + mechanism);
-        }
-        ckMechanism = new CK_MECHANISM(mechanism, params);
-        state = S_UNINIT;
-        initialize();
-    }
-
-    private void ensureInitialized() throws PKCS11Exception {
-        token.ensureValid();
-        if (state == S_UNINIT) {
-            initialize();
-        }
-    }
-
-    private void cancelOperation() {
-        token.ensureValid();
-        if (state == S_UNINIT) {
-            return;
-        }
-        state = S_UNINIT;
-        if ((session == null) || (token.explicitCancel == false)) {
-            return;
-        }
-        try {
-            token.p11.C_SignFinal(session.id(), 0);
-        } catch (PKCS11Exception e) {
-            throw new ProviderException(&quot;Cancel failed&quot;, e);
-        }
-    }
-
-    private void initialize() throws PKCS11Exception {
-        if (state == S_RESET) {
-            return;
-        }
-        if (session == null) {
-            session = token.getOpSession();
-        }
-        if (p11Key != null) {
-            token.p11.C_SignInit
-                (session.id(), ckMechanism, p11Key.keyID);
-            state = S_RESET;
-        } else {
-            state = S_UNINIT;
-        }
-    }
-
-    // see JCE spec
-    protected int engineGetMacLength() {
-        return macLength;
-    }
-
-    // see JCE spec
-    protected void engineReset() {
-        // the framework insists on calling reset() after doFinal(),
-        // but we prefer to take care of reinitialization ourselves
-        if (state == S_DOFINAL) {
-            state = S_UNINIT;
-            return;
-        }
-        cancelOperation();
-        try {
-            initialize();
-        } catch (PKCS11Exception e) {
-            throw new ProviderException(&quot;reset() failed, &quot;, e);
-        }
-    }
-
-    // see JCE spec
-    protected void engineInit(Key key, AlgorithmParameterSpec params)
-            throws InvalidKeyException, InvalidAlgorithmParameterException {
-        if (params != null) {
-            throw new InvalidAlgorithmParameterException
-                (&quot;Parameters not supported&quot;);
-        }
-        cancelOperation();
-        p11Key = P11SecretKeyFactory.convertKey(token, key, algorithm);
-        try {
-            initialize();
-        } catch (PKCS11Exception e) {
-            throw new InvalidKeyException(&quot;init() failed&quot;, e);
-        }
-    }
-
-    // see JCE spec
-    protected byte[] engineDoFinal() {
-        try {
-            ensureInitialized();
-            byte[] mac = token.p11.C_SignFinal(session.id(), 0);
-            state = S_DOFINAL;
-            return mac;
-        } catch (PKCS11Exception e) {
-            throw new ProviderException(&quot;doFinal() failed&quot;, e);
-        } finally {
-            session = token.releaseSession(session);
-        }
-    }
-
-    // see JCE spec
-    protected void engineUpdate(byte input) {
-        if (oneByte == null) {
-           oneByte = new byte[1];
-        }
-        oneByte[0] = input;
-        engineUpdate(oneByte, 0, 1);
-    }
-
-    // see JCE spec
-    protected void engineUpdate(byte[] b, int ofs, int len) {
-        try {
-            ensureInitialized();
-            token.p11.C_SignUpdate(session.id(), 0, b, ofs, len);
-            state = S_UPDATE;
-        } catch (PKCS11Exception e) {
-            throw new ProviderException(&quot;update() failed&quot;, e);
-        }
-    }
-
-    // see JCE spec
-    protected void engineUpdate(ByteBuffer byteBuffer) {
-        try {
-            ensureInitialized();
-            int len = byteBuffer.remaining();
-            if (len &lt;= 0) {
-                return;
-            }
-            if (byteBuffer instanceof DirectBuffer == false) {
-                super.engineUpdate(byteBuffer);
-                return;
-            }
-            long addr = ((DirectBuffer)byteBuffer).address();
-            int ofs = byteBuffer.position();
-            token.p11.C_SignUpdate(session.id(), addr + ofs, null, 0, len);
-            byteBuffer.position(ofs + len);
-            state = S_UPDATE;
-        } catch (PKCS11Exception e) {
-            throw new ProviderException(&quot;update() failed&quot;, e);
-        }
-    }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2003, 2012, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package sun.security.pkcs11;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.util.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.nio.ByteBuffer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.security.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.security.spec.AlgorithmParameterSpec;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import javax.crypto.MacSpi;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import sun.nio.ch.DirectBuffer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import sun.security.pkcs11.wrapper.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import static sun.security.pkcs11.wrapper.PKCS11Constants.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre> * MAC implementation class. This class currently supports HMAC using</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre> * MD5, SHA-1, SHA-224, SHA-256, SHA-384, and SHA-512 and the SSL3 MAC</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre> * using MD5 and SHA-1.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre> * Note that unlike other classes (e.g. Signature), this does not</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre> * composite various operations if the token only supports part of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre> * required functionality. The MAC implementations in SunJCE already</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre> * do exactly that by implementing an MAC on top of MessageDigests. We</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre> * could not do any better than they.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre> * @author  Andreas Sterbenz</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre> * @since   1.5</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>final class P11Mac extends MacSpi {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>    /* unitialized, all fields except session have arbitrary values */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>    private final static int S_UNINIT   = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>    /* session initialized, no data processed yet */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>    private final static int S_RESET    = 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>    /* session initialized, data processed */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>    private final static int S_UPDATE   = 3;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>    /* transitional state after doFinal() before we go to S_UNINIT */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>    private final static int S_DOFINAL  = 4;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>    // token instance</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>    private final Token token;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>    // algorithm name</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>    private final String algorithm;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>    // mechanism id</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>    private final long mechanism;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>    // mechanism object</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>    private final CK_MECHANISM ckMechanism;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>    // length of the MAC in bytes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>    private final int macLength;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>    // key instance used, if operation active</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>    private P11Key p11Key;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>    // associated session, if any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>    private Session session;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>    // state, one of S_* above</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>    private int state;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>    // one byte buffer for the update(byte) method, initialized on demand</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>    private byte[] oneByte;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>    P11Mac(Token token, String algorithm, long mechanism)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>            throws PKCS11Exception {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>        super();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>        this.token = token;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>        this.algorithm = algorithm;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>        this.mechanism = mechanism;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>        Long params = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>        switch ((int)mechanism) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>        case (int)CKM_MD5_HMAC:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>            macLength = 16;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>        case (int)CKM_SHA_1_HMAC:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>            macLength = 20;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>        case (int)CKM_SHA224_HMAC:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>            macLength = 28;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>        case (int)CKM_SHA256_HMAC:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>            macLength = 32;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>        case (int)CKM_SHA384_HMAC:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>            macLength = 48;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>        case (int)CKM_SHA512_HMAC:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>            macLength = 64;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>        case (int)CKM_SSL3_MD5_MAC:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>            macLength = 16;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>            params = Long.valueOf(16);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>        case (int)CKM_SSL3_SHA1_MAC:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>            macLength = 20;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>            params = Long.valueOf(20);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>        default:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>            throw new ProviderException(&quot;Unknown mechanism: &quot; + mechanism);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>        ckMechanism = new CK_MECHANISM(mechanism, params);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>        state = S_UNINIT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>        initialize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>    private void ensureInitialized() throws PKCS11Exception {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>        token.ensureValid();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>        if (state == S_UNINIT) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>            initialize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>    private void cancelOperation() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>        token.ensureValid();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>        if (state == S_UNINIT) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>        state = S_UNINIT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>        if ((session == null) || (token.explicitCancel == false)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>            token.p11.C_SignFinal(session.id(), 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>        } catch (PKCS11Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>            throw new ProviderException(&quot;Cancel failed&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>    private void initialize() throws PKCS11Exception {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>        if (state == S_RESET) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>        if (session == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>            session = token.getOpSession();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>        if (p11Key != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>            token.p11.C_SignInit</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>                (session.id(), ckMechanism, p11Key.keyID);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>            state = S_RESET;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>            state = S_UNINIT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>    // see JCE spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>    protected int engineGetMacLength() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>        return macLength;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>    // see JCE spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>    protected void engineReset() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>        // the framework insists on calling reset() after doFinal(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>        // but we prefer to take care of reinitialization ourselves</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>        if (state == S_DOFINAL) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>            state = S_UNINIT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>        cancelOperation();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>            initialize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>        } catch (PKCS11Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>            throw new ProviderException(&quot;reset() failed, &quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>    // see JCE spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>    protected void engineInit(Key key, AlgorithmParameterSpec params)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>            throws InvalidKeyException, InvalidAlgorithmParameterException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>        if (params != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>            throw new InvalidAlgorithmParameterException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>                (&quot;Parameters not supported&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>        cancelOperation();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>        p11Key = P11SecretKeyFactory.convertKey(token, key, algorithm);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>            initialize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>        } catch (PKCS11Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>            throw new InvalidKeyException(&quot;init() failed&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>    // see JCE spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>    protected byte[] engineDoFinal() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>            ensureInitialized();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>            byte[] mac = token.p11.C_SignFinal(session.id(), 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>            state = S_DOFINAL;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>            return mac;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>        } catch (PKCS11Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>            throw new ProviderException(&quot;doFinal() failed&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>        } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>            session = token.releaseSession(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>    // see JCE spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>    protected void engineUpdate(byte input) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>        if (oneByte == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>           oneByte = new byte[1];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>        oneByte[0] = input;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>        engineUpdate(oneByte, 0, 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>    // see JCE spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>    protected void engineUpdate(byte[] b, int ofs, int len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>            ensureInitialized();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>            token.p11.C_SignUpdate(session.id(), 0, b, ofs, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>            state = S_UPDATE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>        } catch (PKCS11Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>            throw new ProviderException(&quot;update() failed&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>    // see JCE spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>    protected void engineUpdate(ByteBuffer byteBuffer) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>            ensureInitialized();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>            int len = byteBuffer.remaining();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>            if (len &lt;= 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>            if (byteBuffer instanceof DirectBuffer == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>                super.engineUpdate(byteBuffer);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>            long addr = ((DirectBuffer)byteBuffer).address();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>            int ofs = byteBuffer.position();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>            token.p11.C_SignUpdate(session.id(), addr + ofs, null, 0, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>            byteBuffer.position(ofs + len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>            state = S_UPDATE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>        } catch (PKCS11Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>            throw new ProviderException(&quot;update() failed&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

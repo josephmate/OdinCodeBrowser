@@ -3,292 +3,1147 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2003, 2011, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package sun.security.pkcs11;
-
-import java.util.*;
-
-import java.security.ProviderException;
-
-import sun.security.util.Debug;
-
-import sun.security.pkcs11.wrapper.*;
-import static sun.security.pkcs11.wrapper.PKCS11Constants.*;
-
-/**
- * Session manager. There is one session manager object per PKCS#11
- * provider. It allows code to checkout a session, release it
- * back to the pool, or force it to be closed.
- *
- * The session manager pools sessions to minimize the number of
- * C_OpenSession() and C_CloseSession() that have to be made. It
- * maintains two pools: one for &quot;object&quot; sessions and one for
- * &quot;operation&quot; sessions.
- *
- * The reason for this separation is how PKCS#11 deals with session objects.
- * It defines that when a session is closed, all objects created within
- * that session are destroyed. In other words, we may never close a session
- * while a Key created it in is still in use. We would like to keep the
- * number of such sessions low. Note that we occasionally want to explicitly
- * close a session, see P11Signature.
- *
- * NOTE that sessions obtained from this class SHOULD be returned using
- * either releaseSession() or closeSession() using a finally block when
- * not needed anymore. Otherwise, they will be left for cleanup via the
- * PhantomReference mechanism when GC kicks in, but it's best not to rely
- * on that since GC may not run timely enough since the native PKCS11 library
- * is also consuming memory.
- *
- * Note that sessions are automatically closed when they are not used for a
- * period of time, see Session.
- *
- * @author  Andreas Sterbenz
- * @since   1.5
- */
-final class SessionManager {
-
-    private final static int DEFAULT_MAX_SESSIONS = 32;
-
-    private final static Debug debug = Debug.getInstance(&quot;pkcs11&quot;);
-
-    // token instance
-    private final Token token;
-
-    // maximum number of sessions to open with this token
-    private final int maxSessions;
-
-    // total number of active sessions
-    private int activeSessions;
-
-    // pool of available object sessions
-    private final Pool objSessions;
-
-    // pool of available operation sessions
-    private final Pool opSessions;
-
-    // maximum number of active sessions during this invocation, for debugging
-    private int maxActiveSessions;
-
-    // flags to use in the C_OpenSession() call
-    private final long openSessionFlags;
-
-    SessionManager(Token token) {
-        long n;
-        if (token.isWriteProtected()) {
-            openSessionFlags = CKF_SERIAL_SESSION;
-            n = token.tokenInfo.ulMaxSessionCount;
-        } else {
-            openSessionFlags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
-            n = token.tokenInfo.ulMaxRwSessionCount;
-        }
-        if (n == CK_EFFECTIVELY_INFINITE) {
-            n = Integer.MAX_VALUE;
-        } else if ((n == CK_UNAVAILABLE_INFORMATION) || (n &lt; 0)) {
-            // choose an arbitrary concrete value
-            n = DEFAULT_MAX_SESSIONS;
-        }
-        maxSessions = (int)Math.min(n, Integer.MAX_VALUE);
-        this.token = token;
-        this.objSessions = new Pool(this);
-        this.opSessions = new Pool(this);
-    }
-
-    // returns whether only a fairly low number of sessions are
-    // supported by this token.
-    boolean lowMaxSessions() {
-        return (maxSessions &lt;= DEFAULT_MAX_SESSIONS);
-    }
-
-    synchronized Session getObjSession() throws PKCS11Exception {
-        Session session = objSessions.poll();
-        if (session != null) {
-            return ensureValid(session);
-        }
-        session = opSessions.poll();
-        if (session != null) {
-            return ensureValid(session);
-        }
-        session = openSession();
-        return ensureValid(session);
-    }
-
-    synchronized Session getOpSession() throws PKCS11Exception {
-        Session session = opSessions.poll();
-        if (session != null) {
-            return ensureValid(session);
-        }
-        // create a new session rather than re-using an obj session
-        // that avoids potential expensive cancels() for Signatures &amp; RSACipher
-        if (maxSessions == Integer.MAX_VALUE ||
-                activeSessions &lt; maxSessions) {
-            session = openSession();
-            return ensureValid(session);
-        }
-        session = objSessions.poll();
-        if (session != null) {
-            return ensureValid(session);
-        }
-        throw new ProviderException(&quot;Could not obtain session&quot;);
-    }
-
-    private Session ensureValid(Session session) {
-        session.id();
-        return session;
-    }
-
-    synchronized Session killSession(Session session) {
-        if ((session == null) || (token.isValid() == false)) {
-            return null;
-        }
-        if (debug != null) {
-            String location = new Exception().getStackTrace()[2].toString();
-            System.out.println(&quot;Killing session (&quot; + location + &quot;) active: &quot;
-                + activeSessions);
-        }
-        closeSession(session);
-        return null;
-    }
-
-    synchronized Session releaseSession(Session session) {
-        if ((session == null) || (token.isValid() == false)) {
-            return null;
-        }
-
-        if (session.hasObjects()) {
-            objSessions.release(session);
-        } else {
-            opSessions.release(session);
-        }
-        return null;
-    }
-
-    synchronized void demoteObjSession(Session session) {
-        if (token.isValid() == false) {
-            return;
-        }
-        if (debug != null) {
-            System.out.println(&quot;Demoting session, active: &quot; +
-                activeSessions);
-        }
-        boolean present = objSessions.remove(session);
-        if (present == false) {
-            // session is currently in use
-            // will be added to correct pool on release, nothing to do now
-            return;
-        }
-        opSessions.release(session);
-    }
-
-    private Session openSession() throws PKCS11Exception {
-        if ((maxSessions != Integer.MAX_VALUE) &amp;&amp;
-                (activeSessions &gt;= maxSessions)) {
-            throw new ProviderException(&quot;No more sessions available&quot;);
-        }
-        long id = token.p11.C_OpenSession
-                    (token.provider.slotID, openSessionFlags, null, null);
-        Session session = new Session(token, id);
-        activeSessions++;
-        if (debug != null) {
-            if (activeSessions &gt; maxActiveSessions) {
-                maxActiveSessions = activeSessions;
-                if (maxActiveSessions % 10 == 0) {
-                    System.out.println(&quot;Open sessions: &quot; + maxActiveSessions);
-                }
-            }
-        }
-        return session;
-    }
-
-    private void closeSession(Session session) {
-        session.close();
-        activeSessions--;
-    }
-
-    private static final class Pool {
-
-        private final SessionManager mgr;
-
-        private final List&lt;Session&gt; pool;
-
-        Pool(SessionManager mgr) {
-            this.mgr = mgr;
-            pool = new ArrayList&lt;Session&gt;();
-        }
-
-        boolean remove(Session session) {
-            return pool.remove(session);
-        }
-
-        Session poll() {
-            int n = pool.size();
-            if (n == 0) {
-                return null;
-            }
-            Session session = pool.remove(n - 1);
-            return session;
-        }
-
-        void release(Session session) {
-            pool.add(session);
-            // if there are idle sessions, close them
-            if (session.hasObjects()) {
-                return;
-            }
-            int n = pool.size();
-            if (n &lt; 5) {
-                return;
-            }
-            Session oldestSession = pool.get(0);
-            long time = System.currentTimeMillis();
-            if (session.isLive(time) &amp;&amp; oldestSession.isLive(time)) {
-                return;
-            }
-            Collections.sort(pool);
-            int i = 0;
-            while (i &lt; n - 1) { // always keep at least 1 session open
-                oldestSession = pool.get(i);
-                if (oldestSession.isLive(time)) {
-                    break;
-                }
-                i++;
-                mgr.closeSession(oldestSession);
-            }
-            if (debug != null) {
-                System.out.println(&quot;Closing &quot; + i + &quot; idle sessions, active: &quot;
-                        + mgr.activeSessions);
-            }
-            List&lt;Session&gt; subList = pool.subList(0, i);
-            subList.clear();
-        }
-
-    }
-
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2003, 2011, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package sun.security.pkcs11;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.util.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.security.ProviderException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import sun.security.util.Debug;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import sun.security.pkcs11.wrapper.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import static sun.security.pkcs11.wrapper.PKCS11Constants.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre> * Session manager. There is one session manager object per PKCS#11</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre> * provider. It allows code to checkout a session, release it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre> * back to the pool, or force it to be closed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre> * The session manager pools sessions to minimize the number of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre> * C_OpenSession() and C_CloseSession() that have to be made. It</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre> * maintains two pools: one for &quot;object&quot; sessions and one for</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre> * &quot;operation&quot; sessions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre> * The reason for this separation is how PKCS#11 deals with session objects.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre> * It defines that when a session is closed, all objects created within</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre> * that session are destroyed. In other words, we may never close a session</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre> * while a Key created it in is still in use. We would like to keep the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre> * number of such sessions low. Note that we occasionally want to explicitly</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre> * close a session, see P11Signature.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre> * NOTE that sessions obtained from this class SHOULD be returned using</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre> * either releaseSession() or closeSession() using a finally block when</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre> * not needed anymore. Otherwise, they will be left for cleanup via the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre> * PhantomReference mechanism when GC kicks in, but it's best not to rely</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre> * on that since GC may not run timely enough since the native PKCS11 library</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre> * is also consuming memory.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre> * Note that sessions are automatically closed when they are not used for a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre> * period of time, see Session.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre> * @author  Andreas Sterbenz</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre> * @since   1.5</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>final class SessionManager {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>    private final static int DEFAULT_MAX_SESSIONS = 32;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>    private final static Debug debug = Debug.getInstance(&quot;pkcs11&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>    // token instance</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>    private final Token token;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>    // maximum number of sessions to open with this token</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>    private final int maxSessions;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>    // total number of active sessions</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>    private int activeSessions;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>    // pool of available object sessions</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>    private final Pool objSessions;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>    // pool of available operation sessions</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>    private final Pool opSessions;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>    // maximum number of active sessions during this invocation, for debugging</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>    private int maxActiveSessions;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>    // flags to use in the C_OpenSession() call</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>    private final long openSessionFlags;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>    SessionManager(Token token) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>        long n;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>        if (token.isWriteProtected()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>            openSessionFlags = CKF_SERIAL_SESSION;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>            n = token.tokenInfo.ulMaxSessionCount;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>            openSessionFlags = CKF_SERIAL_SESSION | CKF_RW_SESSION;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>            n = token.tokenInfo.ulMaxRwSessionCount;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>        if (n == CK_EFFECTIVELY_INFINITE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>            n = Integer.MAX_VALUE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>        } else if ((n == CK_UNAVAILABLE_INFORMATION) || (n &lt; 0)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>            // choose an arbitrary concrete value</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>            n = DEFAULT_MAX_SESSIONS;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>        maxSessions = (int)Math.min(n, Integer.MAX_VALUE);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>        this.token = token;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>        this.objSessions = new Pool(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>        this.opSessions = new Pool(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>    // returns whether only a fairly low number of sessions are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>    // supported by this token.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>    boolean lowMaxSessions() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>        return (maxSessions &lt;= DEFAULT_MAX_SESSIONS);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>    synchronized Session getObjSession() throws PKCS11Exception {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>        Session session = objSessions.poll();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>        if (session != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>            return ensureValid(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>        session = opSessions.poll();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>        if (session != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>            return ensureValid(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>        session = openSession();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>        return ensureValid(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>    synchronized Session getOpSession() throws PKCS11Exception {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>        Session session = opSessions.poll();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>        if (session != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>            return ensureValid(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>        // create a new session rather than re-using an obj session</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>        // that avoids potential expensive cancels() for Signatures &amp; RSACipher</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>        if (maxSessions == Integer.MAX_VALUE ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>                activeSessions &lt; maxSessions) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>            session = openSession();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>            return ensureValid(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>        session = objSessions.poll();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>        if (session != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>            return ensureValid(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>        throw new ProviderException(&quot;Could not obtain session&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>    private Session ensureValid(Session session) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>        session.id();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>        return session;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>    synchronized Session killSession(Session session) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>        if ((session == null) || (token.isValid() == false)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>        if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>            String location = new Exception().getStackTrace()[2].toString();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>            System.out.println(&quot;Killing session (&quot; + location + &quot;) active: &quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>                + activeSessions);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>        closeSession(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>        return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>    synchronized Session releaseSession(Session session) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>        if ((session == null) || (token.isValid() == false)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>        if (session.hasObjects()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>            objSessions.release(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>            opSessions.release(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>        return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>    synchronized void demoteObjSession(Session session) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>        if (token.isValid() == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>        if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>            System.out.println(&quot;Demoting session, active: &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>                activeSessions);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>        boolean present = objSessions.remove(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>        if (present == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>            // session is currently in use</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>            // will be added to correct pool on release, nothing to do now</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>        opSessions.release(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>    private Session openSession() throws PKCS11Exception {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>        if ((maxSessions != Integer.MAX_VALUE) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>                (activeSessions &gt;= maxSessions)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>            throw new ProviderException(&quot;No more sessions available&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>        long id = token.p11.C_OpenSession</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>                    (token.provider.slotID, openSessionFlags, null, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>        Session session = new Session(token, id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>        activeSessions++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>        if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>            if (activeSessions &gt; maxActiveSessions) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>                maxActiveSessions = activeSessions;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>                if (maxActiveSessions % 10 == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>                    System.out.println(&quot;Open sessions: &quot; + maxActiveSessions);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>        return session;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>    private void closeSession(Session session) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>        session.close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>        activeSessions--;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>    private static final class Pool {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>        private final SessionManager mgr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>        private final List&lt;Session&gt; pool;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>        Pool(SessionManager mgr) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>            this.mgr = mgr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>            pool = new ArrayList&lt;Session&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>        boolean remove(Session session) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>            return pool.remove(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>        Session poll() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>            int n = pool.size();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>            if (n == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>                return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>            Session session = pool.remove(n - 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>            return session;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>        void release(Session session) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>            pool.add(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>            // if there are idle sessions, close them</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>            if (session.hasObjects()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>            int n = pool.size();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>            if (n &lt; 5) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>            Session oldestSession = pool.get(0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>            long time = System.currentTimeMillis();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>            if (session.isLive(time) &amp;&amp; oldestSession.isLive(time)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>            Collections.sort(pool);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>            int i = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>            while (i &lt; n - 1) { // always keep at least 1 session open</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>                oldestSession = pool.get(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>                if (oldestSession.isLive(time)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>                i++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>                mgr.closeSession(oldestSession);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>            if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>                System.out.println(&quot;Closing &quot; + i + &quot; idle sessions, active: &quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>                        + mgr.activeSessions);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>            List&lt;Session&gt; subList = pool.subList(0, i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>            subList.clear();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

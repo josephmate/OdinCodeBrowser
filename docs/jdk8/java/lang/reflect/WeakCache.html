@@ -3,386 +3,1523 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-package java.lang.reflect;
-
-import java.lang.ref.ReferenceQueue;
-import java.lang.ref.WeakReference;
-import java.util.Objects;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.function.BiFunction;
-import java.util.function.Supplier;
-
-/**
- * Cache mapping pairs of {@code (key, sub-key) -&gt; value}. Keys and values are
- * weakly but sub-keys are strongly referenced.  Keys are passed directly to
- * {@link #get} method which also takes a {@code parameter}. Sub-keys are
- * calculated from keys and parameters using the {@code subKeyFactory} function
- * passed to the constructor. Values are calculated from keys and parameters
- * using the {@code valueFactory} function passed to the constructor.
- * Keys can be {@code null} and are compared by identity while sub-keys returned by
- * {@code subKeyFactory} or values returned by {@code valueFactory}
- * can not be null. Sub-keys are compared using their {@link #equals} method.
- * Entries are expunged from cache lazily on each invocation to {@link #get},
- * {@link #containsValue} or {@link #size} methods when the WeakReferences to
- * keys are cleared. Cleared WeakReferences to individual values don't cause
- * expunging, but such entries are logically treated as non-existent and
- * trigger re-evaluation of {@code valueFactory} on request for their
- * key/subKey.
- *
- * @author Peter Levart
- * @param &lt;K&gt; type of keys
- * @param &lt;P&gt; type of parameters
- * @param &lt;V&gt; type of values
- */
-final class WeakCache&lt;K, P, V&gt; {
-
-    private final ReferenceQueue&lt;K&gt; refQueue
-        = new ReferenceQueue&lt;&gt;();
-    // the key type is Object for supporting null key
-    private final ConcurrentMap&lt;Object, ConcurrentMap&lt;Object, Supplier&lt;V&gt;&gt;&gt; map
-        = new ConcurrentHashMap&lt;&gt;();
-    private final ConcurrentMap&lt;Supplier&lt;V&gt;, Boolean&gt; reverseMap
-        = new ConcurrentHashMap&lt;&gt;();
-    private final BiFunction&lt;K, P, ?&gt; subKeyFactory;
-    private final BiFunction&lt;K, P, V&gt; valueFactory;
-
-    /**
-     * Construct an instance of {@code WeakCache}
-     *
-     * @param subKeyFactory a function mapping a pair of
-     *                      {@code (key, parameter) -&gt; sub-key}
-     * @param valueFactory  a function mapping a pair of
-     *                      {@code (key, parameter) -&gt; value}
-     * @throws NullPointerException if {@code subKeyFactory} or
-     *                              {@code valueFactory} is null.
-     */
-    public WeakCache(BiFunction&lt;K, P, ?&gt; subKeyFactory,
-                     BiFunction&lt;K, P, V&gt; valueFactory) {
-        this.subKeyFactory = Objects.requireNonNull(subKeyFactory);
-        this.valueFactory = Objects.requireNonNull(valueFactory);
-    }
-
-    /**
-     * Look-up the value through the cache. This always evaluates the
-     * {@code subKeyFactory} function and optionally evaluates
-     * {@code valueFactory} function if there is no entry in the cache for given
-     * pair of (key, subKey) or the entry has already been cleared.
-     *
-     * @param key       possibly null key
-     * @param parameter parameter used together with key to create sub-key and
-     *                  value (should not be null)
-     * @return the cached value (never null)
-     * @throws NullPointerException if {@code parameter} passed in or
-     *                              {@code sub-key} calculated by
-     *                              {@code subKeyFactory} or {@code value}
-     *                              calculated by {@code valueFactory} is null.
-     */
-    public V get(K key, P parameter) {
-        Objects.requireNonNull(parameter);
-
-        expungeStaleEntries();
-
-        Object cacheKey = CacheKey.valueOf(key, refQueue);
-
-        // lazily install the 2nd level valuesMap for the particular cacheKey
-        ConcurrentMap&lt;Object, Supplier&lt;V&gt;&gt; valuesMap = map.get(cacheKey);
-        if (valuesMap == null) {
-            ConcurrentMap&lt;Object, Supplier&lt;V&gt;&gt; oldValuesMap
-                = map.putIfAbsent(cacheKey,
-                                  valuesMap = new ConcurrentHashMap&lt;&gt;());
-            if (oldValuesMap != null) {
-                valuesMap = oldValuesMap;
-            }
-        }
-
-        // create subKey and retrieve the possible Supplier&lt;V&gt; stored by that
-        // subKey from valuesMap
-        Object subKey = Objects.requireNonNull(subKeyFactory.apply(key, parameter));
-        Supplier&lt;V&gt; supplier = valuesMap.get(subKey);
-        Factory factory = null;
-
-        while (true) {
-            if (supplier != null) {
-                // supplier might be a Factory or a CacheValue&lt;V&gt; instance
-                V value = supplier.get();
-                if (value != null) {
-                    return value;
-                }
-            }
-            // else no supplier in cache
-            // or a supplier that returned null (could be a cleared CacheValue
-            // or a Factory that wasn't successful in installing the CacheValue)
-
-            // lazily construct a Factory
-            if (factory == null) {
-                factory = new Factory(key, parameter, subKey, valuesMap);
-            }
-
-            if (supplier == null) {
-                supplier = valuesMap.putIfAbsent(subKey, factory);
-                if (supplier == null) {
-                    // successfully installed Factory
-                    supplier = factory;
-                }
-                // else retry with winning supplier
-            } else {
-                if (valuesMap.replace(subKey, supplier, factory)) {
-                    // successfully replaced
-                    // cleared CacheEntry / unsuccessful Factory
-                    // with our Factory
-                    supplier = factory;
-                } else {
-                    // retry with current supplier
-                    supplier = valuesMap.get(subKey);
-                }
-            }
-        }
-    }
-
-    /**
-     * Checks whether the specified non-null value is already present in this
-     * {@code WeakCache}. The check is made using identity comparison regardless
-     * of whether value's class overrides {@link Object#equals} or not.
-     *
-     * @param value the non-null value to check
-     * @return true if given {@code value} is already cached
-     * @throws NullPointerException if value is null
-     */
-    public boolean containsValue(V value) {
-        Objects.requireNonNull(value);
-
-        expungeStaleEntries();
-        return reverseMap.containsKey(new LookupValue&lt;&gt;(value));
-    }
-
-    /**
-     * Returns the current number of cached entries that
-     * can decrease over time when keys/values are GC-ed.
-     */
-    public int size() {
-        expungeStaleEntries();
-        return reverseMap.size();
-    }
-
-    private void expungeStaleEntries() {
-        CacheKey&lt;K&gt; cacheKey;
-        while ((cacheKey = (CacheKey&lt;K&gt;)refQueue.poll()) != null) {
-            cacheKey.expungeFrom(map, reverseMap);
-        }
-    }
-
-    /**
-     * A factory {@link Supplier} that implements the lazy synchronized
-     * construction of the value and installment of it into the cache.
-     */
-    private final class Factory implements Supplier&lt;V&gt; {
-
-        private final K key;
-        private final P parameter;
-        private final Object subKey;
-        private final ConcurrentMap&lt;Object, Supplier&lt;V&gt;&gt; valuesMap;
-
-        Factory(K key, P parameter, Object subKey,
-                ConcurrentMap&lt;Object, Supplier&lt;V&gt;&gt; valuesMap) {
-            this.key = key;
-            this.parameter = parameter;
-            this.subKey = subKey;
-            this.valuesMap = valuesMap;
-        }
-
-        @Override
-        public synchronized V get() { // serialize access
-            // re-check
-            Supplier&lt;V&gt; supplier = valuesMap.get(subKey);
-            if (supplier != this) {
-                // something changed while we were waiting:
-                // might be that we were replaced by a CacheValue
-                // or were removed because of failure -&gt;
-                // return null to signal WeakCache.get() to retry
-                // the loop
-                return null;
-            }
-            // else still us (supplier == this)
-
-            // create new value
-            V value = null;
-            try {
-                value = Objects.requireNonNull(valueFactory.apply(key, parameter));
-            } finally {
-                if (value == null) { // remove us on failure
-                    valuesMap.remove(subKey, this);
-                }
-            }
-            // the only path to reach here is with non-null value
-            assert value != null;
-
-            // wrap value with CacheValue (WeakReference)
-            CacheValue&lt;V&gt; cacheValue = new CacheValue&lt;&gt;(value);
-
-            // try replacing us with CacheValue (this should always succeed)
-            if (valuesMap.replace(subKey, this, cacheValue)) {
-                // put also in reverseMap
-                reverseMap.put(cacheValue, Boolean.TRUE);
-            } else {
-                throw new AssertionError(&quot;Should not reach here&quot;);
-            }
-
-            // successfully replaced us with new CacheValue -&gt; return the value
-            // wrapped by it
-            return value;
-        }
-    }
-
-    /**
-     * Common type of value suppliers that are holding a referent.
-     * The {@link #equals} and {@link #hashCode} of implementations is defined
-     * to compare the referent by identity.
-     */
-    private interface Value&lt;V&gt; extends Supplier&lt;V&gt; {}
-
-    /**
-     * An optimized {@link Value} used to look-up the value in
-     * {@link WeakCache#containsValue} method so that we are not
-     * constructing the whole {@link CacheValue} just to look-up the referent.
-     */
-    private static final class LookupValue&lt;V&gt; implements Value&lt;V&gt; {
-        private final V value;
-
-        LookupValue(V value) {
-            this.value = value;
-        }
-
-        @Override
-        public V get() {
-            return value;
-        }
-
-        @Override
-        public int hashCode() {
-            return System.identityHashCode(value); // compare by identity
-        }
-
-        @Override
-        public boolean equals(Object obj) {
-            return obj == this ||
-                   obj instanceof Value &amp;&amp;
-                   this.value == ((Value&lt;?&gt;) obj).get();  // compare by identity
-        }
-    }
-
-    /**
-     * A {@link Value} that weakly references the referent.
-     */
-    private static final class CacheValue&lt;V&gt;
-        extends WeakReference&lt;V&gt; implements Value&lt;V&gt;
-    {
-        private final int hash;
-
-        CacheValue(V value) {
-            super(value);
-            this.hash = System.identityHashCode(value); // compare by identity
-        }
-
-        @Override
-        public int hashCode() {
-            return hash;
-        }
-
-        @Override
-        public boolean equals(Object obj) {
-            V value;
-            return obj == this ||
-                   obj instanceof Value &amp;&amp;
-                   // cleared CacheValue is only equal to itself
-                   (value = get()) != null &amp;&amp;
-                   value == ((Value&lt;?&gt;) obj).get(); // compare by identity
-        }
-    }
-
-    /**
-     * CacheKey containing a weakly referenced {@code key}. It registers
-     * itself with the {@code refQueue} so that it can be used to expunge
-     * the entry when the {@link WeakReference} is cleared.
-     */
-    private static final class CacheKey&lt;K&gt; extends WeakReference&lt;K&gt; {
-
-        // a replacement for null keys
-        private static final Object NULL_KEY = new Object();
-
-        static &lt;K&gt; Object valueOf(K key, ReferenceQueue&lt;K&gt; refQueue) {
-            return key == null
-                   // null key means we can't weakly reference it,
-                   // so we use a NULL_KEY singleton as cache key
-                   ? NULL_KEY
-                   // non-null key requires wrapping with a WeakReference
-                   : new CacheKey&lt;&gt;(key, refQueue);
-        }
-
-        private final int hash;
-
-        private CacheKey(K key, ReferenceQueue&lt;K&gt; refQueue) {
-            super(key, refQueue);
-            this.hash = System.identityHashCode(key);  // compare by identity
-        }
-
-        @Override
-        public int hashCode() {
-            return hash;
-        }
-
-        @Override
-        public boolean equals(Object obj) {
-            K key;
-            return obj == this ||
-                   obj != null &amp;&amp;
-                   obj.getClass() == this.getClass() &amp;&amp;
-                   // cleared CacheKey is only equal to itself
-                   (key = this.get()) != null &amp;&amp;
-                   // compare key by identity
-                   key == ((CacheKey&lt;K&gt;) obj).get();
-        }
-
-        void expungeFrom(ConcurrentMap&lt;?, ? extends ConcurrentMap&lt;?, ?&gt;&gt; map,
-                         ConcurrentMap&lt;?, Boolean&gt; reverseMap) {
-            // removing just by key is always safe here because after a CacheKey
-            // is cleared and enqueue-ed it is only equal to itself
-            // (see equals method)...
-            ConcurrentMap&lt;?, ?&gt; valuesMap = map.remove(this);
-            // remove also from reverseMap if needed
-            if (valuesMap != null) {
-                for (Object cacheValue : valuesMap.values()) {
-                    reverseMap.remove(cacheValue);
-                }
-            }
-        }
-    }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre>package java.lang.reflect;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre>import java.lang.ref.ReferenceQueue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.lang.ref.WeakReference;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.util.Objects;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.util.concurrent.ConcurrentHashMap;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.util.concurrent.ConcurrentMap;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.util.function.BiFunction;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.util.function.Supplier;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre> * Cache mapping pairs of {@code (key, sub-key) -&gt; value}. Keys and values are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre> * weakly but sub-keys are strongly referenced.  Keys are passed directly to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre> * {@link #get} method which also takes a {@code parameter}. Sub-keys are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre> * calculated from keys and parameters using the {@code subKeyFactory} function</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre> * passed to the constructor. Values are calculated from keys and parameters</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre> * using the {@code valueFactory} function passed to the constructor.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre> * Keys can be {@code null} and are compared by identity while sub-keys returned by</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre> * {@code subKeyFactory} or values returned by {@code valueFactory}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre> * can not be null. Sub-keys are compared using their {@link #equals} method.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre> * Entries are expunged from cache lazily on each invocation to {@link #get},</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre> * {@link #containsValue} or {@link #size} methods when the WeakReferences to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre> * keys are cleared. Cleared WeakReferences to individual values don't cause</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre> * expunging, but such entries are logically treated as non-existent and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre> * trigger re-evaluation of {@code valueFactory} on request for their</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre> * key/subKey.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre> * @author Peter Levart</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre> * @param &lt;K&gt; type of keys</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre> * @param &lt;P&gt; type of parameters</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre> * @param &lt;V&gt; type of values</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>final class WeakCache&lt;K, P, V&gt; {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre>    private final ReferenceQueue&lt;K&gt; refQueue</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>        = new ReferenceQueue&lt;&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>    // the key type is Object for supporting null key</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre>    private final ConcurrentMap&lt;Object, ConcurrentMap&lt;Object, Supplier&lt;V&gt;&gt;&gt; map</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>        = new ConcurrentHashMap&lt;&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>    private final ConcurrentMap&lt;Supplier&lt;V&gt;, Boolean&gt; reverseMap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>        = new ConcurrentHashMap&lt;&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>    private final BiFunction&lt;K, P, ?&gt; subKeyFactory;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>    private final BiFunction&lt;K, P, V&gt; valueFactory;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>     * Construct an instance of {@code WeakCache}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>     * @param subKeyFactory a function mapping a pair of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>     *                      {@code (key, parameter) -&gt; sub-key}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>     * @param valueFactory  a function mapping a pair of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>     *                      {@code (key, parameter) -&gt; value}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>     * @throws NullPointerException if {@code subKeyFactory} or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>     *                              {@code valueFactory} is null.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>    public WeakCache(BiFunction&lt;K, P, ?&gt; subKeyFactory,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>                     BiFunction&lt;K, P, V&gt; valueFactory) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>        this.subKeyFactory = Objects.requireNonNull(subKeyFactory);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>        this.valueFactory = Objects.requireNonNull(valueFactory);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>     * Look-up the value through the cache. This always evaluates the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>     * {@code subKeyFactory} function and optionally evaluates</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>     * {@code valueFactory} function if there is no entry in the cache for given</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>     * pair of (key, subKey) or the entry has already been cleared.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>     * @param key       possibly null key</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>     * @param parameter parameter used together with key to create sub-key and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>     *                  value (should not be null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>     * @return the cached value (never null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>     * @throws NullPointerException if {@code parameter} passed in or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>     *                              {@code sub-key} calculated by</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>     *                              {@code subKeyFactory} or {@code value}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>     *                              calculated by {@code valueFactory} is null.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>    public V get(K key, P parameter) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>        Objects.requireNonNull(parameter);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>        expungeStaleEntries();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>        Object cacheKey = CacheKey.valueOf(key, refQueue);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>        // lazily install the 2nd level valuesMap for the particular cacheKey</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>        ConcurrentMap&lt;Object, Supplier&lt;V&gt;&gt; valuesMap = map.get(cacheKey);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>        if (valuesMap == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>            ConcurrentMap&lt;Object, Supplier&lt;V&gt;&gt; oldValuesMap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>                = map.putIfAbsent(cacheKey,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>                                  valuesMap = new ConcurrentHashMap&lt;&gt;());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>            if (oldValuesMap != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>                valuesMap = oldValuesMap;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>        // create subKey and retrieve the possible Supplier&lt;V&gt; stored by that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>        // subKey from valuesMap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>        Object subKey = Objects.requireNonNull(subKeyFactory.apply(key, parameter));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>        Supplier&lt;V&gt; supplier = valuesMap.get(subKey);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>        Factory factory = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>        while (true) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>            if (supplier != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>                // supplier might be a Factory or a CacheValue&lt;V&gt; instance</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>                V value = supplier.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>                if (value != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>                    return value;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>            // else no supplier in cache</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>            // or a supplier that returned null (could be a cleared CacheValue</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>            // or a Factory that wasn't successful in installing the CacheValue)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>            // lazily construct a Factory</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>            if (factory == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>                factory = new Factory(key, parameter, subKey, valuesMap);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>            if (supplier == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>                supplier = valuesMap.putIfAbsent(subKey, factory);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>                if (supplier == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>                    // successfully installed Factory</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>                    supplier = factory;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>                // else retry with winning supplier</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>                if (valuesMap.replace(subKey, supplier, factory)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>                    // successfully replaced</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>                    // cleared CacheEntry / unsuccessful Factory</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>                    // with our Factory</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>                    supplier = factory;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>                    // retry with current supplier</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>                    supplier = valuesMap.get(subKey);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>     * Checks whether the specified non-null value is already present in this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>     * {@code WeakCache}. The check is made using identity comparison regardless</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>     * of whether value's class overrides {@link Object#equals} or not.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>     * @param value the non-null value to check</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>     * @return true if given {@code value} is already cached</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>     * @throws NullPointerException if value is null</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>    public boolean containsValue(V value) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>        Objects.requireNonNull(value);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>        expungeStaleEntries();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>        return reverseMap.containsKey(new LookupValue&lt;&gt;(value));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>     * Returns the current number of cached entries that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>     * can decrease over time when keys/values are GC-ed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>    public int size() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>        expungeStaleEntries();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>        return reverseMap.size();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>    private void expungeStaleEntries() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>        CacheKey&lt;K&gt; cacheKey;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>        while ((cacheKey = (CacheKey&lt;K&gt;)refQueue.poll()) != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>            cacheKey.expungeFrom(map, reverseMap);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>     * A factory {@link Supplier} that implements the lazy synchronized</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>     * construction of the value and installment of it into the cache.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>    private final class Factory implements Supplier&lt;V&gt; {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>        private final K key;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>        private final P parameter;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>        private final Object subKey;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>        private final ConcurrentMap&lt;Object, Supplier&lt;V&gt;&gt; valuesMap;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>        Factory(K key, P parameter, Object subKey,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>                ConcurrentMap&lt;Object, Supplier&lt;V&gt;&gt; valuesMap) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>            this.key = key;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>            this.parameter = parameter;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>            this.subKey = subKey;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>            this.valuesMap = valuesMap;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>        public synchronized V get() { // serialize access</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>            // re-check</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>            Supplier&lt;V&gt; supplier = valuesMap.get(subKey);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>            if (supplier != this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>                // something changed while we were waiting:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>                // might be that we were replaced by a CacheValue</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>                // or were removed because of failure -&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>                // return null to signal WeakCache.get() to retry</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>                // the loop</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>                return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>            // else still us (supplier == this)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>            // create new value</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>            V value = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>                value = Objects.requireNonNull(valueFactory.apply(key, parameter));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>            } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>                if (value == null) { // remove us on failure</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>                    valuesMap.remove(subKey, this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>            // the only path to reach here is with non-null value</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>            assert value != null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>            // wrap value with CacheValue (WeakReference)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>            CacheValue&lt;V&gt; cacheValue = new CacheValue&lt;&gt;(value);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>            // try replacing us with CacheValue (this should always succeed)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>            if (valuesMap.replace(subKey, this, cacheValue)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>                // put also in reverseMap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>                reverseMap.put(cacheValue, Boolean.TRUE);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>                throw new AssertionError(&quot;Should not reach here&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>            // successfully replaced us with new CacheValue -&gt; return the value</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>            // wrapped by it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>            return value;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>     * Common type of value suppliers that are holding a referent.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>     * The {@link #equals} and {@link #hashCode} of implementations is defined</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>     * to compare the referent by identity.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>    private interface Value&lt;V&gt; extends Supplier&lt;V&gt; {}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>     * An optimized {@link Value} used to look-up the value in</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>     * {@link WeakCache#containsValue} method so that we are not</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>     * constructing the whole {@link CacheValue} just to look-up the referent.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>    private static final class LookupValue&lt;V&gt; implements Value&lt;V&gt; {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>        private final V value;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>        LookupValue(V value) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>            this.value = value;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>        public V get() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>            return value;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>        public int hashCode() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>            return System.identityHashCode(value); // compare by identity</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>        public boolean equals(Object obj) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>            return obj == this ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>                   obj instanceof Value &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>                   this.value == ((Value&lt;?&gt;) obj).get();  // compare by identity</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>     * A {@link Value} that weakly references the referent.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>    private static final class CacheValue&lt;V&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>        extends WeakReference&lt;V&gt; implements Value&lt;V&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>        private final int hash;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>        CacheValue(V value) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>            super(value);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>            this.hash = System.identityHashCode(value); // compare by identity</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>        public int hashCode() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>            return hash;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>        public boolean equals(Object obj) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>            V value;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>            return obj == this ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>                   obj instanceof Value &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>                   // cleared CacheValue is only equal to itself</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>                   (value = get()) != null &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>                   value == ((Value&lt;?&gt;) obj).get(); // compare by identity</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>     * CacheKey containing a weakly referenced {@code key}. It registers</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>     * itself with the {@code refQueue} so that it can be used to expunge</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>     * the entry when the {@link WeakReference} is cleared.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>    private static final class CacheKey&lt;K&gt; extends WeakReference&lt;K&gt; {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>        // a replacement for null keys</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>        private static final Object NULL_KEY = new Object();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>        static &lt;K&gt; Object valueOf(K key, ReferenceQueue&lt;K&gt; refQueue) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>            return key == null</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>                   // null key means we can't weakly reference it,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>                   // so we use a NULL_KEY singleton as cache key</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>                   ? NULL_KEY</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>                   // non-null key requires wrapping with a WeakReference</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>                   : new CacheKey&lt;&gt;(key, refQueue);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>        private final int hash;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>        private CacheKey(K key, ReferenceQueue&lt;K&gt; refQueue) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>            super(key, refQueue);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>            this.hash = System.identityHashCode(key);  // compare by identity</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>        public int hashCode() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>            return hash;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>        public boolean equals(Object obj) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>            K key;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>            return obj == this ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>                   obj != null &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>                   obj.getClass() == this.getClass() &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>                   // cleared CacheKey is only equal to itself</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>                   (key = this.get()) != null &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>                   // compare key by identity</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>                   key == ((CacheKey&lt;K&gt;) obj).get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>        void expungeFrom(ConcurrentMap&lt;?, ? extends ConcurrentMap&lt;?, ?&gt;&gt; map,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>                         ConcurrentMap&lt;?, Boolean&gt; reverseMap) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>            // removing just by key is always safe here because after a CacheKey</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>            // is cleared and enqueue-ed it is only equal to itself</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>            // (see equals method)...</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>            ConcurrentMap&lt;?, ?&gt; valuesMap = map.remove(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>            // remove also from reverseMap if needed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>            if (valuesMap != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>                for (Object cacheValue : valuesMap.values()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>                    reverseMap.remove(cacheValue);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

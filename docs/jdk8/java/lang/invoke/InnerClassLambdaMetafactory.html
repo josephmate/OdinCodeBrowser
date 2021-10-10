@@ -3,568 +3,2251 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2012, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package java.lang.invoke;
-
-import jdk.internal.org.objectweb.asm.*;
-import sun.invoke.util.BytecodeDescriptor;
-import sun.misc.Unsafe;
-import sun.security.action.GetPropertyAction;
-
-import java.io.FilePermission;
-import java.io.Serializable;
-import java.lang.reflect.Constructor;
-import java.security.AccessController;
-import java.security.PrivilegedAction;
-import java.util.LinkedHashSet;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.PropertyPermission;
-import java.util.Set;
-
-import static jdk.internal.org.objectweb.asm.Opcodes.*;
-
-/**
- * Lambda metafactory implementation which dynamically creates an
- * inner-class-like class per lambda callsite.
- *
- * @see LambdaMetafactory
- */
-/* package */ final class InnerClassLambdaMetafactory extends AbstractValidatingLambdaMetafactory {
-    private static final Unsafe UNSAFE = Unsafe.getUnsafe();
-
-    private static final int CLASSFILE_VERSION = 52;
-    private static final String METHOD_DESCRIPTOR_VOID = Type.getMethodDescriptor(Type.VOID_TYPE);
-    private static final String JAVA_LANG_OBJECT = &quot;java/lang/Object&quot;;
-    private static final String NAME_CTOR = &quot;&lt;init&gt;&quot;;
-    private static final String NAME_FACTORY = &quot;get$Lambda&quot;;
-
-    //Serialization support
-    private static final String NAME_SERIALIZED_LAMBDA = &quot;java/lang/invoke/SerializedLambda&quot;;
-    private static final String NAME_NOT_SERIALIZABLE_EXCEPTION = &quot;java/io/NotSerializableException&quot;;
-    private static final String DESCR_METHOD_WRITE_REPLACE = &quot;()Ljava/lang/Object;&quot;;
-    private static final String DESCR_METHOD_WRITE_OBJECT = &quot;(Ljava/io/ObjectOutputStream;)V&quot;;
-    private static final String DESCR_METHOD_READ_OBJECT = &quot;(Ljava/io/ObjectInputStream;)V&quot;;
-    private static final String NAME_METHOD_WRITE_REPLACE = &quot;writeReplace&quot;;
-    private static final String NAME_METHOD_READ_OBJECT = &quot;readObject&quot;;
-    private static final String NAME_METHOD_WRITE_OBJECT = &quot;writeObject&quot;;
-    private static final String DESCR_CTOR_SERIALIZED_LAMBDA
-            = MethodType.methodType(void.class,
-                                    Class.class,
-                                    String.class, String.class, String.class,
-                                    int.class, String.class, String.class, String.class,
-                                    String.class,
-                                    Object[].class).toMethodDescriptorString();
-    private static final String DESCR_CTOR_NOT_SERIALIZABLE_EXCEPTION
-            = MethodType.methodType(void.class, String.class).toMethodDescriptorString();
-    private static final String[] SER_HOSTILE_EXCEPTIONS = new String[] {NAME_NOT_SERIALIZABLE_EXCEPTION};
-
-
-    private static final String[] EMPTY_STRING_ARRAY = new String[0];
-
-    // Used to ensure that each spun class name is unique
-    private static final AtomicInteger counter = new AtomicInteger(0);
-
-    // For dumping generated classes to disk, for debugging purposes
-    private static final ProxyClassesDumper dumper;
-
-    static {
-        final String key = &quot;jdk.internal.lambda.dumpProxyClasses&quot;;
-        String path = AccessController.doPrivileged(
-                new GetPropertyAction(key), null,
-                new PropertyPermission(key , &quot;read&quot;));
-        dumper = (null == path) ? null : ProxyClassesDumper.getInstance(path);
-    }
-
-    // See context values in AbstractValidatingLambdaMetafactory
-    private final String implMethodClassName;        // Name of type containing implementation &quot;CC&quot;
-    private final String implMethodName;             // Name of implementation method &quot;impl&quot;
-    private final String implMethodDesc;             // Type descriptor for implementation methods &quot;(I)Ljava/lang/String;&quot;
-    private final Class&lt;?&gt; implMethodReturnClass;    // class for implementaion method return type &quot;Ljava/lang/String;&quot;
-    private final MethodType constructorType;        // Generated class constructor type &quot;(CC)void&quot;
-    private final ClassWriter cw;                    // ASM class writer
-    private final String[] argNames;                 // Generated names for the constructor arguments
-    private final String[] argDescs;                 // Type descriptors for the constructor arguments
-    private final String lambdaClassName;            // Generated name for the generated class &quot;X$$Lambda$1&quot;
-
-    /**
-     * General meta-factory constructor, supporting both standard cases and
-     * allowing for uncommon options such as serialization or bridging.
-     *
-     * @param caller Stacked automatically by VM; represents a lookup context
-     *               with the accessibility privileges of the caller.
-     * @param invokedType Stacked automatically by VM; the signature of the
-     *                    invoked method, which includes the expected static
-     *                    type of the returned lambda object, and the static
-     *                    types of the captured arguments for the lambda.  In
-     *                    the event that the implementation method is an
-     *                    instance method, the first argument in the invocation
-     *                    signature will correspond to the receiver.
-     * @param samMethodName Name of the method in the functional interface to
-     *                      which the lambda or method reference is being
-     *                      converted, represented as a String.
-     * @param samMethodType Type of the method in the functional interface to
-     *                      which the lambda or method reference is being
-     *                      converted, represented as a MethodType.
-     * @param implMethod The implementation method which should be called (with
-     *                   suitable adaptation of argument types, return types,
-     *                   and adjustment for captured arguments) when methods of
-     *                   the resulting functional interface instance are invoked.
-     * @param instantiatedMethodType The signature of the primary functional
-     *                               interface method after type variables are
-     *                               substituted with their instantiation from
-     *                               the capture site
-     * @param isSerializable Should the lambda be made serializable?  If set,
-     *                       either the target type or one of the additional SAM
-     *                       types must extend {@code Serializable}.
-     * @param markerInterfaces Additional interfaces which the lambda object
-     *                       should implement.
-     * @param additionalBridges Method types for additional signatures to be
-     *                          bridged to the implementation method
-     * @throws LambdaConversionException If any of the meta-factory protocol
-     * invariants are violated
-     */
-    public InnerClassLambdaMetafactory(MethodHandles.Lookup caller,
-                                       MethodType invokedType,
-                                       String samMethodName,
-                                       MethodType samMethodType,
-                                       MethodHandle implMethod,
-                                       MethodType instantiatedMethodType,
-                                       boolean isSerializable,
-                                       Class&lt;?&gt;[] markerInterfaces,
-                                       MethodType[] additionalBridges)
-            throws LambdaConversionException {
-        super(caller, invokedType, samMethodName, samMethodType,
-              implMethod, instantiatedMethodType,
-              isSerializable, markerInterfaces, additionalBridges);
-        implMethodClassName = implDefiningClass.getName().replace('.', '/');
-        implMethodName = implInfo.getName();
-        implMethodDesc = implMethodType.toMethodDescriptorString();
-        implMethodReturnClass = (implKind == MethodHandleInfo.REF_newInvokeSpecial)
-                ? implDefiningClass
-                : implMethodType.returnType();
-        constructorType = invokedType.changeReturnType(Void.TYPE);
-        lambdaClassName = targetClass.getName().replace('.', '/') + &quot;$$Lambda$&quot; + counter.incrementAndGet();
-        cw = new ClassWriter(ClassWriter.COMPUTE_MAXS);
-        int parameterCount = invokedType.parameterCount();
-        if (parameterCount &gt; 0) {
-            argNames = new String[parameterCount];
-            argDescs = new String[parameterCount];
-            for (int i = 0; i &lt; parameterCount; i++) {
-                argNames[i] = &quot;arg$&quot; + (i + 1);
-                argDescs[i] = BytecodeDescriptor.unparse(invokedType.parameterType(i));
-            }
-        } else {
-            argNames = argDescs = EMPTY_STRING_ARRAY;
-        }
-    }
-
-    /**
-     * Build the CallSite. Generate a class file which implements the functional
-     * interface, define the class, if there are no parameters create an instance
-     * of the class which the CallSite will return, otherwise, generate handles
-     * which will call the class' constructor.
-     *
-     * @return a CallSite, which, when invoked, will return an instance of the
-     * functional interface
-     * @throws ReflectiveOperationException
-     * @throws LambdaConversionException If properly formed functional interface
-     * is not found
-     */
-    @Override
-    CallSite buildCallSite() throws LambdaConversionException {
-        final Class&lt;?&gt; innerClass = spinInnerClass();
-        if (invokedType.parameterCount() == 0) {
-            final Constructor[] ctrs = AccessController.doPrivileged(
-                    new PrivilegedAction&lt;Constructor[]&gt;() {
-                @Override
-                public Constructor[] run() {
-                    Constructor&lt;?&gt;[] ctrs = innerClass.getDeclaredConstructors();
-                    if (ctrs.length == 1) {
-                        // The lambda implementing inner class constructor is private, set
-                        // it accessible (by us) before creating the constant sole instance
-                        ctrs[0].setAccessible(true);
-                    }
-                    return ctrs;
-                }
-                    });
-            if (ctrs.length != 1) {
-                throw new LambdaConversionException(&quot;Expected one lambda constructor for &quot;
-                        + innerClass.getCanonicalName() + &quot;, got &quot; + ctrs.length);
-            }
-
-            try {
-                Object inst = ctrs[0].newInstance();
-                return new ConstantCallSite(MethodHandles.constant(samBase, inst));
-            }
-            catch (ReflectiveOperationException e) {
-                throw new LambdaConversionException(&quot;Exception instantiating lambda object&quot;, e);
-            }
-        } else {
-            try {
-                UNSAFE.ensureClassInitialized(innerClass);
-                return new ConstantCallSite(
-                        MethodHandles.Lookup.IMPL_LOOKUP
-                             .findStatic(innerClass, NAME_FACTORY, invokedType));
-            }
-            catch (ReflectiveOperationException e) {
-                throw new LambdaConversionException(&quot;Exception finding constructor&quot;, e);
-            }
-        }
-    }
-
-    /**
-     * Generate a class file which implements the functional
-     * interface, define and return the class.
-     *
-     * @implNote The class that is generated does not include signature
-     * information for exceptions that may be present on the SAM method.
-     * This is to reduce classfile size, and is harmless as checked exceptions
-     * are erased anyway, no one will ever compile against this classfile,
-     * and we make no guarantees about the reflective properties of lambda
-     * objects.
-     *
-     * @return a Class which implements the functional interface
-     * @throws LambdaConversionException If properly formed functional interface
-     * is not found
-     */
-    private Class&lt;?&gt; spinInnerClass() throws LambdaConversionException {
-        String[] interfaces;
-        String samIntf = samBase.getName().replace('.', '/');
-        boolean accidentallySerializable = !isSerializable &amp;&amp; Serializable.class.isAssignableFrom(samBase);
-        if (markerInterfaces.length == 0) {
-            interfaces = new String[]{samIntf};
-        } else {
-            // Assure no duplicate interfaces (ClassFormatError)
-            Set&lt;String&gt; itfs = new LinkedHashSet&lt;&gt;(markerInterfaces.length + 1);
-            itfs.add(samIntf);
-            for (Class&lt;?&gt; markerInterface : markerInterfaces) {
-                itfs.add(markerInterface.getName().replace('.', '/'));
-                accidentallySerializable |= !isSerializable &amp;&amp; Serializable.class.isAssignableFrom(markerInterface);
-            }
-            interfaces = itfs.toArray(new String[itfs.size()]);
-        }
-
-        cw.visit(CLASSFILE_VERSION, ACC_SUPER + ACC_FINAL + ACC_SYNTHETIC,
-                 lambdaClassName, null,
-                 JAVA_LANG_OBJECT, interfaces);
-
-        // Generate final fields to be filled in by constructor
-        for (int i = 0; i &lt; argDescs.length; i++) {
-            FieldVisitor fv = cw.visitField(ACC_PRIVATE + ACC_FINAL,
-                                            argNames[i],
-                                            argDescs[i],
-                                            null, null);
-            fv.visitEnd();
-        }
-
-        generateConstructor();
-
-        if (invokedType.parameterCount() != 0) {
-            generateFactory();
-        }
-
-        // Forward the SAM method
-        MethodVisitor mv = cw.visitMethod(ACC_PUBLIC, samMethodName,
-                                          samMethodType.toMethodDescriptorString(), null, null);
-        new ForwardingMethodGenerator(mv).generate(samMethodType);
-
-        // Forward the bridges
-        if (additionalBridges != null) {
-            for (MethodType mt : additionalBridges) {
-                mv = cw.visitMethod(ACC_PUBLIC|ACC_BRIDGE, samMethodName,
-                                    mt.toMethodDescriptorString(), null, null);
-                new ForwardingMethodGenerator(mv).generate(mt);
-            }
-        }
-
-        if (isSerializable)
-            generateSerializationFriendlyMethods();
-        else if (accidentallySerializable)
-            generateSerializationHostileMethods();
-
-        cw.visitEnd();
-
-        // Define the generated class in this VM.
-
-        final byte[] classBytes = cw.toByteArray();
-
-        // If requested, dump out to a file for debugging purposes
-        if (dumper != null) {
-            AccessController.doPrivileged(new PrivilegedAction&lt;Void&gt;() {
-                @Override
-                public Void run() {
-                    dumper.dumpClass(lambdaClassName, classBytes);
-                    return null;
-                }
-            }, null,
-            new FilePermission(&quot;&lt;&lt;ALL FILES&gt;&gt;&quot;, &quot;read, write&quot;),
-            // createDirectories may need it
-            new PropertyPermission(&quot;user.dir&quot;, &quot;read&quot;));
-        }
-
-        return UNSAFE.defineAnonymousClass(targetClass, classBytes, null);
-    }
-
-    /**
-     * Generate the factory method for the class
-     */
-    private void generateFactory() {
-        MethodVisitor m = cw.visitMethod(ACC_PRIVATE | ACC_STATIC, NAME_FACTORY, invokedType.toMethodDescriptorString(), null, null);
-        m.visitCode();
-        m.visitTypeInsn(NEW, lambdaClassName);
-        m.visitInsn(Opcodes.DUP);
-        int parameterCount = invokedType.parameterCount();
-        for (int typeIndex = 0, varIndex = 0; typeIndex &lt; parameterCount; typeIndex++) {
-            Class&lt;?&gt; argType = invokedType.parameterType(typeIndex);
-            m.visitVarInsn(getLoadOpcode(argType), varIndex);
-            varIndex += getParameterSize(argType);
-        }
-        m.visitMethodInsn(INVOKESPECIAL, lambdaClassName, NAME_CTOR, constructorType.toMethodDescriptorString());
-        m.visitInsn(ARETURN);
-        m.visitMaxs(-1, -1);
-        m.visitEnd();
-    }
-
-    /**
-     * Generate the constructor for the class
-     */
-    private void generateConstructor() {
-        // Generate constructor
-        MethodVisitor ctor = cw.visitMethod(ACC_PRIVATE, NAME_CTOR,
-                                            constructorType.toMethodDescriptorString(), null, null);
-        ctor.visitCode();
-        ctor.visitVarInsn(ALOAD, 0);
-        ctor.visitMethodInsn(INVOKESPECIAL, JAVA_LANG_OBJECT, NAME_CTOR,
-                             METHOD_DESCRIPTOR_VOID);
-        int parameterCount = invokedType.parameterCount();
-        for (int i = 0, lvIndex = 0; i &lt; parameterCount; i++) {
-            ctor.visitVarInsn(ALOAD, 0);
-            Class&lt;?&gt; argType = invokedType.parameterType(i);
-            ctor.visitVarInsn(getLoadOpcode(argType), lvIndex + 1);
-            lvIndex += getParameterSize(argType);
-            ctor.visitFieldInsn(PUTFIELD, lambdaClassName, argNames[i], argDescs[i]);
-        }
-        ctor.visitInsn(RETURN);
-        // Maxs computed by ClassWriter.COMPUTE_MAXS, these arguments ignored
-        ctor.visitMaxs(-1, -1);
-        ctor.visitEnd();
-    }
-
-    /**
-     * Generate a writeReplace method that supports serialization
-     */
-    private void generateSerializationFriendlyMethods() {
-        TypeConvertingMethodAdapter mv
-                = new TypeConvertingMethodAdapter(
-                    cw.visitMethod(ACC_PRIVATE + ACC_FINAL,
-                    NAME_METHOD_WRITE_REPLACE, DESCR_METHOD_WRITE_REPLACE,
-                    null, null));
-
-        mv.visitCode();
-        mv.visitTypeInsn(NEW, NAME_SERIALIZED_LAMBDA);
-        mv.visitInsn(DUP);
-        mv.visitLdcInsn(Type.getType(targetClass));
-        mv.visitLdcInsn(invokedType.returnType().getName().replace('.', '/'));
-        mv.visitLdcInsn(samMethodName);
-        mv.visitLdcInsn(samMethodType.toMethodDescriptorString());
-        mv.visitLdcInsn(implInfo.getReferenceKind());
-        mv.visitLdcInsn(implInfo.getDeclaringClass().getName().replace('.', '/'));
-        mv.visitLdcInsn(implInfo.getName());
-        mv.visitLdcInsn(implInfo.getMethodType().toMethodDescriptorString());
-        mv.visitLdcInsn(instantiatedMethodType.toMethodDescriptorString());
-        mv.iconst(argDescs.length);
-        mv.visitTypeInsn(ANEWARRAY, JAVA_LANG_OBJECT);
-        for (int i = 0; i &lt; argDescs.length; i++) {
-            mv.visitInsn(DUP);
-            mv.iconst(i);
-            mv.visitVarInsn(ALOAD, 0);
-            mv.visitFieldInsn(GETFIELD, lambdaClassName, argNames[i], argDescs[i]);
-            mv.boxIfTypePrimitive(Type.getType(argDescs[i]));
-            mv.visitInsn(AASTORE);
-        }
-        mv.visitMethodInsn(INVOKESPECIAL, NAME_SERIALIZED_LAMBDA, NAME_CTOR,
-                DESCR_CTOR_SERIALIZED_LAMBDA);
-        mv.visitInsn(ARETURN);
-        // Maxs computed by ClassWriter.COMPUTE_MAXS, these arguments ignored
-        mv.visitMaxs(-1, -1);
-        mv.visitEnd();
-    }
-
-    /**
-     * Generate a readObject/writeObject method that is hostile to serialization
-     */
-    private void generateSerializationHostileMethods() {
-        MethodVisitor mv = cw.visitMethod(ACC_PRIVATE + ACC_FINAL,
-                                          NAME_METHOD_WRITE_OBJECT, DESCR_METHOD_WRITE_OBJECT,
-                                          null, SER_HOSTILE_EXCEPTIONS);
-        mv.visitCode();
-        mv.visitTypeInsn(NEW, NAME_NOT_SERIALIZABLE_EXCEPTION);
-        mv.visitInsn(DUP);
-        mv.visitLdcInsn(&quot;Non-serializable lambda&quot;);
-        mv.visitMethodInsn(INVOKESPECIAL, NAME_NOT_SERIALIZABLE_EXCEPTION, NAME_CTOR,
-                           DESCR_CTOR_NOT_SERIALIZABLE_EXCEPTION);
-        mv.visitInsn(ATHROW);
-        mv.visitMaxs(-1, -1);
-        mv.visitEnd();
-
-        mv = cw.visitMethod(ACC_PRIVATE + ACC_FINAL,
-                            NAME_METHOD_READ_OBJECT, DESCR_METHOD_READ_OBJECT,
-                            null, SER_HOSTILE_EXCEPTIONS);
-        mv.visitCode();
-        mv.visitTypeInsn(NEW, NAME_NOT_SERIALIZABLE_EXCEPTION);
-        mv.visitInsn(DUP);
-        mv.visitLdcInsn(&quot;Non-serializable lambda&quot;);
-        mv.visitMethodInsn(INVOKESPECIAL, NAME_NOT_SERIALIZABLE_EXCEPTION, NAME_CTOR,
-                           DESCR_CTOR_NOT_SERIALIZABLE_EXCEPTION);
-        mv.visitInsn(ATHROW);
-        mv.visitMaxs(-1, -1);
-        mv.visitEnd();
-    }
-
-    /**
-     * This class generates a method body which calls the lambda implementation
-     * method, converting arguments, as needed.
-     */
-    private class ForwardingMethodGenerator extends TypeConvertingMethodAdapter {
-
-        ForwardingMethodGenerator(MethodVisitor mv) {
-            super(mv);
-        }
-
-        void generate(MethodType methodType) {
-            visitCode();
-
-            if (implKind == MethodHandleInfo.REF_newInvokeSpecial) {
-                visitTypeInsn(NEW, implMethodClassName);
-                visitInsn(DUP);
-            }
-            for (int i = 0; i &lt; argNames.length; i++) {
-                visitVarInsn(ALOAD, 0);
-                visitFieldInsn(GETFIELD, lambdaClassName, argNames[i], argDescs[i]);
-            }
-
-            convertArgumentTypes(methodType);
-
-            // Invoke the method we want to forward to
-            visitMethodInsn(invocationOpcode(), implMethodClassName,
-                            implMethodName, implMethodDesc,
-                            implDefiningClass.isInterface());
-
-            // Convert the return value (if any) and return it
-            // Note: if adapting from non-void to void, the 'return'
-            // instruction will pop the unneeded result
-            Class&lt;?&gt; samReturnClass = methodType.returnType();
-            convertType(implMethodReturnClass, samReturnClass, samReturnClass);
-            visitInsn(getReturnOpcode(samReturnClass));
-            // Maxs computed by ClassWriter.COMPUTE_MAXS,these arguments ignored
-            visitMaxs(-1, -1);
-            visitEnd();
-        }
-
-        private void convertArgumentTypes(MethodType samType) {
-            int lvIndex = 0;
-            boolean samIncludesReceiver = implIsInstanceMethod &amp;&amp;
-                                                   invokedType.parameterCount() == 0;
-            int samReceiverLength = samIncludesReceiver ? 1 : 0;
-            if (samIncludesReceiver) {
-                // push receiver
-                Class&lt;?&gt; rcvrType = samType.parameterType(0);
-                visitVarInsn(getLoadOpcode(rcvrType), lvIndex + 1);
-                lvIndex += getParameterSize(rcvrType);
-                convertType(rcvrType, implDefiningClass, instantiatedMethodType.parameterType(0));
-            }
-            int samParametersLength = samType.parameterCount();
-            int argOffset = implMethodType.parameterCount() - samParametersLength;
-            for (int i = samReceiverLength; i &lt; samParametersLength; i++) {
-                Class&lt;?&gt; argType = samType.parameterType(i);
-                visitVarInsn(getLoadOpcode(argType), lvIndex + 1);
-                lvIndex += getParameterSize(argType);
-                convertType(argType, implMethodType.parameterType(argOffset + i), instantiatedMethodType.parameterType(i));
-            }
-        }
-
-        private int invocationOpcode() throws InternalError {
-            switch (implKind) {
-                case MethodHandleInfo.REF_invokeStatic:
-                    return INVOKESTATIC;
-                case MethodHandleInfo.REF_newInvokeSpecial:
-                    return INVOKESPECIAL;
-                 case MethodHandleInfo.REF_invokeVirtual:
-                    return INVOKEVIRTUAL;
-                case MethodHandleInfo.REF_invokeInterface:
-                    return INVOKEINTERFACE;
-                case MethodHandleInfo.REF_invokeSpecial:
-                    return INVOKESPECIAL;
-                default:
-                    throw new InternalError(&quot;Unexpected invocation kind: &quot; + implKind);
-            }
-        }
-    }
-
-    static int getParameterSize(Class&lt;?&gt; c) {
-        if (c == Void.TYPE) {
-            return 0;
-        } else if (c == Long.TYPE || c == Double.TYPE) {
-            return 2;
-        }
-        return 1;
-    }
-
-    static int getLoadOpcode(Class&lt;?&gt; c) {
-        if(c == Void.TYPE) {
-            throw new InternalError(&quot;Unexpected void type of load opcode&quot;);
-        }
-        return ILOAD + getOpcodeOffset(c);
-    }
-
-    static int getReturnOpcode(Class&lt;?&gt; c) {
-        if(c == Void.TYPE) {
-            return RETURN;
-        }
-        return IRETURN + getOpcodeOffset(c);
-    }
-
-    private static int getOpcodeOffset(Class&lt;?&gt; c) {
-        if (c.isPrimitive()) {
-            if (c == Long.TYPE) {
-                return 1;
-            } else if (c == Float.TYPE) {
-                return 2;
-            } else if (c == Double.TYPE) {
-                return 3;
-            }
-            return 0;
-        } else {
-            return 4;
-        }
-    }
-
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2012, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package java.lang.invoke;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import jdk.internal.org.objectweb.asm.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import sun.invoke.util.BytecodeDescriptor;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import sun.misc.Unsafe;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import sun.security.action.GetPropertyAction;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.io.FilePermission;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.io.Serializable;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import java.lang.reflect.Constructor;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.security.AccessController;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import java.security.PrivilegedAction;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import java.util.LinkedHashSet;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import java.util.concurrent.atomic.AtomicInteger;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre>import java.util.PropertyPermission;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre>import java.util.Set;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>import static jdk.internal.org.objectweb.asm.Opcodes.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre> * Lambda metafactory implementation which dynamically creates an</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre> * inner-class-like class per lambda callsite.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre> * @see LambdaMetafactory</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>/* package */ final class InnerClassLambdaMetafactory extends AbstractValidatingLambdaMetafactory {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre>    private static final Unsafe UNSAFE = Unsafe.getUnsafe();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre>    private static final int CLASSFILE_VERSION = 52;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>    private static final String METHOD_DESCRIPTOR_VOID = Type.getMethodDescriptor(Type.VOID_TYPE);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre>    private static final String JAVA_LANG_OBJECT = &quot;java/lang/Object&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>    private static final String NAME_CTOR = &quot;&lt;init&gt;&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>    private static final String NAME_FACTORY = &quot;get$Lambda&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>    //Serialization support</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>    private static final String NAME_SERIALIZED_LAMBDA = &quot;java/lang/invoke/SerializedLambda&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre>    private static final String NAME_NOT_SERIALIZABLE_EXCEPTION = &quot;java/io/NotSerializableException&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>    private static final String DESCR_METHOD_WRITE_REPLACE = &quot;()Ljava/lang/Object;&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>    private static final String DESCR_METHOD_WRITE_OBJECT = &quot;(Ljava/io/ObjectOutputStream;)V&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>    private static final String DESCR_METHOD_READ_OBJECT = &quot;(Ljava/io/ObjectInputStream;)V&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>    private static final String NAME_METHOD_WRITE_REPLACE = &quot;writeReplace&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>    private static final String NAME_METHOD_READ_OBJECT = &quot;readObject&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>    private static final String NAME_METHOD_WRITE_OBJECT = &quot;writeObject&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>    private static final String DESCR_CTOR_SERIALIZED_LAMBDA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>            = MethodType.methodType(void.class,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>                                    Class.class,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>                                    String.class, String.class, String.class,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>                                    int.class, String.class, String.class, String.class,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>                                    String.class,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>                                    Object[].class).toMethodDescriptorString();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>    private static final String DESCR_CTOR_NOT_SERIALIZABLE_EXCEPTION</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>            = MethodType.methodType(void.class, String.class).toMethodDescriptorString();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>    private static final String[] SER_HOSTILE_EXCEPTIONS = new String[] {NAME_NOT_SERIALIZABLE_EXCEPTION};</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>    private static final String[] EMPTY_STRING_ARRAY = new String[0];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>    // Used to ensure that each spun class name is unique</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>    private static final AtomicInteger counter = new AtomicInteger(0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>    // For dumping generated classes to disk, for debugging purposes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>    private static final ProxyClassesDumper dumper;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>    static {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>        final String key = &quot;jdk.internal.lambda.dumpProxyClasses&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>        String path = AccessController.doPrivileged(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>                new GetPropertyAction(key), null,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>                new PropertyPermission(key , &quot;read&quot;));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>        dumper = (null == path) ? null : ProxyClassesDumper.getInstance(path);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>    // See context values in AbstractValidatingLambdaMetafactory</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>    private final String implMethodClassName;        // Name of type containing implementation &quot;CC&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>    private final String implMethodName;             // Name of implementation method &quot;impl&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>    private final String implMethodDesc;             // Type descriptor for implementation methods &quot;(I)Ljava/lang/String;&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>    private final Class&lt;?&gt; implMethodReturnClass;    // class for implementaion method return type &quot;Ljava/lang/String;&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>    private final MethodType constructorType;        // Generated class constructor type &quot;(CC)void&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>    private final ClassWriter cw;                    // ASM class writer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>    private final String[] argNames;                 // Generated names for the constructor arguments</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>    private final String[] argDescs;                 // Type descriptors for the constructor arguments</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>    private final String lambdaClassName;            // Generated name for the generated class &quot;X$$Lambda$1&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>     * General meta-factory constructor, supporting both standard cases and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>     * allowing for uncommon options such as serialization or bridging.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>     * @param caller Stacked automatically by VM; represents a lookup context</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>     *               with the accessibility privileges of the caller.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>     * @param invokedType Stacked automatically by VM; the signature of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>     *                    invoked method, which includes the expected static</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>     *                    type of the returned lambda object, and the static</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>     *                    types of the captured arguments for the lambda.  In</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>     *                    the event that the implementation method is an</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>     *                    instance method, the first argument in the invocation</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>     *                    signature will correspond to the receiver.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>     * @param samMethodName Name of the method in the functional interface to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>     *                      which the lambda or method reference is being</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>     *                      converted, represented as a String.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>     * @param samMethodType Type of the method in the functional interface to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>     *                      which the lambda or method reference is being</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>     *                      converted, represented as a MethodType.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>     * @param implMethod The implementation method which should be called (with</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>     *                   suitable adaptation of argument types, return types,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>     *                   and adjustment for captured arguments) when methods of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>     *                   the resulting functional interface instance are invoked.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>     * @param instantiatedMethodType The signature of the primary functional</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>     *                               interface method after type variables are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>     *                               substituted with their instantiation from</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>     *                               the capture site</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>     * @param isSerializable Should the lambda be made serializable?  If set,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>     *                       either the target type or one of the additional SAM</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>     *                       types must extend {@code Serializable}.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>     * @param markerInterfaces Additional interfaces which the lambda object</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>     *                       should implement.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>     * @param additionalBridges Method types for additional signatures to be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>     *                          bridged to the implementation method</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>     * @throws LambdaConversionException If any of the meta-factory protocol</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>     * invariants are violated</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>    public InnerClassLambdaMetafactory(MethodHandles.Lookup caller,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>                                       MethodType invokedType,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>                                       String samMethodName,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>                                       MethodType samMethodType,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>                                       MethodHandle implMethod,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>                                       MethodType instantiatedMethodType,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>                                       boolean isSerializable,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>                                       Class&lt;?&gt;[] markerInterfaces,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>                                       MethodType[] additionalBridges)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>            throws LambdaConversionException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>        super(caller, invokedType, samMethodName, samMethodType,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>              implMethod, instantiatedMethodType,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>              isSerializable, markerInterfaces, additionalBridges);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>        implMethodClassName = implDefiningClass.getName().replace('.', '/');</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>        implMethodName = implInfo.getName();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>        implMethodDesc = implMethodType.toMethodDescriptorString();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>        implMethodReturnClass = (implKind == MethodHandleInfo.REF_newInvokeSpecial)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>                ? implDefiningClass</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>                : implMethodType.returnType();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>        constructorType = invokedType.changeReturnType(Void.TYPE);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>        lambdaClassName = targetClass.getName().replace('.', '/') + &quot;$$Lambda$&quot; + counter.incrementAndGet();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>        cw = new ClassWriter(ClassWriter.COMPUTE_MAXS);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>        int parameterCount = invokedType.parameterCount();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>        if (parameterCount &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>            argNames = new String[parameterCount];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>            argDescs = new String[parameterCount];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>            for (int i = 0; i &lt; parameterCount; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>                argNames[i] = &quot;arg$&quot; + (i + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>                argDescs[i] = BytecodeDescriptor.unparse(invokedType.parameterType(i));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>            argNames = argDescs = EMPTY_STRING_ARRAY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>     * Build the CallSite. Generate a class file which implements the functional</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>     * interface, define the class, if there are no parameters create an instance</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>     * of the class which the CallSite will return, otherwise, generate handles</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>     * which will call the class' constructor.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>     * @return a CallSite, which, when invoked, will return an instance of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>     * functional interface</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>     * @throws ReflectiveOperationException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>     * @throws LambdaConversionException If properly formed functional interface</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>     * is not found</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>    CallSite buildCallSite() throws LambdaConversionException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>        final Class&lt;?&gt; innerClass = spinInnerClass();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>        if (invokedType.parameterCount() == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>            final Constructor[] ctrs = AccessController.doPrivileged(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>                    new PrivilegedAction&lt;Constructor[]&gt;() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>                @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>                public Constructor[] run() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>                    Constructor&lt;?&gt;[] ctrs = innerClass.getDeclaredConstructors();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>                    if (ctrs.length == 1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>                        // The lambda implementing inner class constructor is private, set</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>                        // it accessible (by us) before creating the constant sole instance</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>                        ctrs[0].setAccessible(true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>                    return ctrs;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>                    });</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>            if (ctrs.length != 1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>                throw new LambdaConversionException(&quot;Expected one lambda constructor for &quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>                        + innerClass.getCanonicalName() + &quot;, got &quot; + ctrs.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>                Object inst = ctrs[0].newInstance();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>                return new ConstantCallSite(MethodHandles.constant(samBase, inst));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>            catch (ReflectiveOperationException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>                throw new LambdaConversionException(&quot;Exception instantiating lambda object&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>                UNSAFE.ensureClassInitialized(innerClass);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>                return new ConstantCallSite(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>                        MethodHandles.Lookup.IMPL_LOOKUP</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>                             .findStatic(innerClass, NAME_FACTORY, invokedType));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>            catch (ReflectiveOperationException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>                throw new LambdaConversionException(&quot;Exception finding constructor&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>     * Generate a class file which implements the functional</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>     * interface, define and return the class.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>     * @implNote The class that is generated does not include signature</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>     * information for exceptions that may be present on the SAM method.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>     * This is to reduce classfile size, and is harmless as checked exceptions</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>     * are erased anyway, no one will ever compile against this classfile,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>     * and we make no guarantees about the reflective properties of lambda</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>     * objects.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>     * @return a Class which implements the functional interface</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>     * @throws LambdaConversionException If properly formed functional interface</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>     * is not found</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>    private Class&lt;?&gt; spinInnerClass() throws LambdaConversionException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>        String[] interfaces;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>        String samIntf = samBase.getName().replace('.', '/');</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>        boolean accidentallySerializable = !isSerializable &amp;&amp; Serializable.class.isAssignableFrom(samBase);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>        if (markerInterfaces.length == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>            interfaces = new String[]{samIntf};</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>            // Assure no duplicate interfaces (ClassFormatError)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>            Set&lt;String&gt; itfs = new LinkedHashSet&lt;&gt;(markerInterfaces.length + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>            itfs.add(samIntf);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>            for (Class&lt;?&gt; markerInterface : markerInterfaces) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>                itfs.add(markerInterface.getName().replace('.', '/'));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>                accidentallySerializable |= !isSerializable &amp;&amp; Serializable.class.isAssignableFrom(markerInterface);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>            interfaces = itfs.toArray(new String[itfs.size()]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>        cw.visit(CLASSFILE_VERSION, ACC_SUPER + ACC_FINAL + ACC_SYNTHETIC,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>                 lambdaClassName, null,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>                 JAVA_LANG_OBJECT, interfaces);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>        // Generate final fields to be filled in by constructor</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; argDescs.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>            FieldVisitor fv = cw.visitField(ACC_PRIVATE + ACC_FINAL,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>                                            argNames[i],</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>                                            argDescs[i],</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>                                            null, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>            fv.visitEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>        generateConstructor();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>        if (invokedType.parameterCount() != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>            generateFactory();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>        // Forward the SAM method</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>        MethodVisitor mv = cw.visitMethod(ACC_PUBLIC, samMethodName,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>                                          samMethodType.toMethodDescriptorString(), null, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>        new ForwardingMethodGenerator(mv).generate(samMethodType);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>        // Forward the bridges</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>        if (additionalBridges != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>            for (MethodType mt : additionalBridges) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>                mv = cw.visitMethod(ACC_PUBLIC|ACC_BRIDGE, samMethodName,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>                                    mt.toMethodDescriptorString(), null, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>                new ForwardingMethodGenerator(mv).generate(mt);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>        if (isSerializable)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>            generateSerializationFriendlyMethods();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>        else if (accidentallySerializable)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>            generateSerializationHostileMethods();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>        cw.visitEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>        // Define the generated class in this VM.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>        final byte[] classBytes = cw.toByteArray();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>        // If requested, dump out to a file for debugging purposes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>        if (dumper != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>            AccessController.doPrivileged(new PrivilegedAction&lt;Void&gt;() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>                @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>                public Void run() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>                    dumper.dumpClass(lambdaClassName, classBytes);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>                    return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>            }, null,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>            new FilePermission(&quot;&lt;&lt;ALL FILES&gt;&gt;&quot;, &quot;read, write&quot;),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>            // createDirectories may need it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>            new PropertyPermission(&quot;user.dir&quot;, &quot;read&quot;));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>        return UNSAFE.defineAnonymousClass(targetClass, classBytes, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>     * Generate the factory method for the class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>    private void generateFactory() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>        MethodVisitor m = cw.visitMethod(ACC_PRIVATE | ACC_STATIC, NAME_FACTORY, invokedType.toMethodDescriptorString(), null, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>        m.visitCode();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>        m.visitTypeInsn(NEW, lambdaClassName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>        m.visitInsn(Opcodes.DUP);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>        int parameterCount = invokedType.parameterCount();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>        for (int typeIndex = 0, varIndex = 0; typeIndex &lt; parameterCount; typeIndex++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>            Class&lt;?&gt; argType = invokedType.parameterType(typeIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>            m.visitVarInsn(getLoadOpcode(argType), varIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>            varIndex += getParameterSize(argType);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>        m.visitMethodInsn(INVOKESPECIAL, lambdaClassName, NAME_CTOR, constructorType.toMethodDescriptorString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>        m.visitInsn(ARETURN);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>        m.visitMaxs(-1, -1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>        m.visitEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>     * Generate the constructor for the class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>    private void generateConstructor() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>        // Generate constructor</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>        MethodVisitor ctor = cw.visitMethod(ACC_PRIVATE, NAME_CTOR,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>                                            constructorType.toMethodDescriptorString(), null, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>        ctor.visitCode();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>        ctor.visitVarInsn(ALOAD, 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>        ctor.visitMethodInsn(INVOKESPECIAL, JAVA_LANG_OBJECT, NAME_CTOR,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>                             METHOD_DESCRIPTOR_VOID);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>        int parameterCount = invokedType.parameterCount();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>        for (int i = 0, lvIndex = 0; i &lt; parameterCount; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>            ctor.visitVarInsn(ALOAD, 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>            Class&lt;?&gt; argType = invokedType.parameterType(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>            ctor.visitVarInsn(getLoadOpcode(argType), lvIndex + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>            lvIndex += getParameterSize(argType);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>            ctor.visitFieldInsn(PUTFIELD, lambdaClassName, argNames[i], argDescs[i]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>        ctor.visitInsn(RETURN);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>        // Maxs computed by ClassWriter.COMPUTE_MAXS, these arguments ignored</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>        ctor.visitMaxs(-1, -1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>        ctor.visitEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>     * Generate a writeReplace method that supports serialization</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>    private void generateSerializationFriendlyMethods() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>        TypeConvertingMethodAdapter mv</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>                = new TypeConvertingMethodAdapter(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>                    cw.visitMethod(ACC_PRIVATE + ACC_FINAL,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>                    NAME_METHOD_WRITE_REPLACE, DESCR_METHOD_WRITE_REPLACE,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>                    null, null));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>        mv.visitCode();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>        mv.visitTypeInsn(NEW, NAME_SERIALIZED_LAMBDA);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>        mv.visitInsn(DUP);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>        mv.visitLdcInsn(Type.getType(targetClass));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>        mv.visitLdcInsn(invokedType.returnType().getName().replace('.', '/'));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>        mv.visitLdcInsn(samMethodName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>        mv.visitLdcInsn(samMethodType.toMethodDescriptorString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>        mv.visitLdcInsn(implInfo.getReferenceKind());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>        mv.visitLdcInsn(implInfo.getDeclaringClass().getName().replace('.', '/'));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>        mv.visitLdcInsn(implInfo.getName());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>        mv.visitLdcInsn(implInfo.getMethodType().toMethodDescriptorString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>        mv.visitLdcInsn(instantiatedMethodType.toMethodDescriptorString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>        mv.iconst(argDescs.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>        mv.visitTypeInsn(ANEWARRAY, JAVA_LANG_OBJECT);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; argDescs.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>            mv.visitInsn(DUP);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>            mv.iconst(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>            mv.visitVarInsn(ALOAD, 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>            mv.visitFieldInsn(GETFIELD, lambdaClassName, argNames[i], argDescs[i]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>            mv.boxIfTypePrimitive(Type.getType(argDescs[i]));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>            mv.visitInsn(AASTORE);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>        mv.visitMethodInsn(INVOKESPECIAL, NAME_SERIALIZED_LAMBDA, NAME_CTOR,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>                DESCR_CTOR_SERIALIZED_LAMBDA);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>        mv.visitInsn(ARETURN);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>        // Maxs computed by ClassWriter.COMPUTE_MAXS, these arguments ignored</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>        mv.visitMaxs(-1, -1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>        mv.visitEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>     * Generate a readObject/writeObject method that is hostile to serialization</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>    private void generateSerializationHostileMethods() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>        MethodVisitor mv = cw.visitMethod(ACC_PRIVATE + ACC_FINAL,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>                                          NAME_METHOD_WRITE_OBJECT, DESCR_METHOD_WRITE_OBJECT,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>                                          null, SER_HOSTILE_EXCEPTIONS);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>        mv.visitCode();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>        mv.visitTypeInsn(NEW, NAME_NOT_SERIALIZABLE_EXCEPTION);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>        mv.visitInsn(DUP);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>        mv.visitLdcInsn(&quot;Non-serializable lambda&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>        mv.visitMethodInsn(INVOKESPECIAL, NAME_NOT_SERIALIZABLE_EXCEPTION, NAME_CTOR,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>                           DESCR_CTOR_NOT_SERIALIZABLE_EXCEPTION);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>        mv.visitInsn(ATHROW);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>        mv.visitMaxs(-1, -1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>        mv.visitEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>        mv = cw.visitMethod(ACC_PRIVATE + ACC_FINAL,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>                            NAME_METHOD_READ_OBJECT, DESCR_METHOD_READ_OBJECT,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>                            null, SER_HOSTILE_EXCEPTIONS);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>        mv.visitCode();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>        mv.visitTypeInsn(NEW, NAME_NOT_SERIALIZABLE_EXCEPTION);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>        mv.visitInsn(DUP);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>        mv.visitLdcInsn(&quot;Non-serializable lambda&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>        mv.visitMethodInsn(INVOKESPECIAL, NAME_NOT_SERIALIZABLE_EXCEPTION, NAME_CTOR,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>                           DESCR_CTOR_NOT_SERIALIZABLE_EXCEPTION);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>        mv.visitInsn(ATHROW);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>        mv.visitMaxs(-1, -1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>        mv.visitEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>     * This class generates a method body which calls the lambda implementation</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>     * method, converting arguments, as needed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>    private class ForwardingMethodGenerator extends TypeConvertingMethodAdapter {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>        ForwardingMethodGenerator(MethodVisitor mv) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>            super(mv);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>        void generate(MethodType methodType) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>            visitCode();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>            if (implKind == MethodHandleInfo.REF_newInvokeSpecial) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>                visitTypeInsn(NEW, implMethodClassName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>                visitInsn(DUP);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>            for (int i = 0; i &lt; argNames.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>                visitVarInsn(ALOAD, 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>                visitFieldInsn(GETFIELD, lambdaClassName, argNames[i], argDescs[i]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>            convertArgumentTypes(methodType);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>            // Invoke the method we want to forward to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>            visitMethodInsn(invocationOpcode(), implMethodClassName,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>                            implMethodName, implMethodDesc,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>                            implDefiningClass.isInterface());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>            // Convert the return value (if any) and return it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>            // Note: if adapting from non-void to void, the 'return'</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>            // instruction will pop the unneeded result</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>            Class&lt;?&gt; samReturnClass = methodType.returnType();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>            convertType(implMethodReturnClass, samReturnClass, samReturnClass);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>            visitInsn(getReturnOpcode(samReturnClass));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>            // Maxs computed by ClassWriter.COMPUTE_MAXS,these arguments ignored</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>            visitMaxs(-1, -1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>            visitEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>        private void convertArgumentTypes(MethodType samType) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>            int lvIndex = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>            boolean samIncludesReceiver = implIsInstanceMethod &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>                                                   invokedType.parameterCount() == 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>            int samReceiverLength = samIncludesReceiver ? 1 : 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>            if (samIncludesReceiver) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>                // push receiver</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>                Class&lt;?&gt; rcvrType = samType.parameterType(0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>                visitVarInsn(getLoadOpcode(rcvrType), lvIndex + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>                lvIndex += getParameterSize(rcvrType);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>                convertType(rcvrType, implDefiningClass, instantiatedMethodType.parameterType(0));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>            int samParametersLength = samType.parameterCount();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>            int argOffset = implMethodType.parameterCount() - samParametersLength;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>            for (int i = samReceiverLength; i &lt; samParametersLength; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>                Class&lt;?&gt; argType = samType.parameterType(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>                visitVarInsn(getLoadOpcode(argType), lvIndex + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>                lvIndex += getParameterSize(argType);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>                convertType(argType, implMethodType.parameterType(argOffset + i), instantiatedMethodType.parameterType(i));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>        private int invocationOpcode() throws InternalError {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>            switch (implKind) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>                case MethodHandleInfo.REF_invokeStatic:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>                    return INVOKESTATIC;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>                case MethodHandleInfo.REF_newInvokeSpecial:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>                    return INVOKESPECIAL;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>                 case MethodHandleInfo.REF_invokeVirtual:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>                    return INVOKEVIRTUAL;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>                case MethodHandleInfo.REF_invokeInterface:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>                    return INVOKEINTERFACE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>                case MethodHandleInfo.REF_invokeSpecial:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre>                    return INVOKESPECIAL;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>                default:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>                    throw new InternalError(&quot;Unexpected invocation kind: &quot; + implKind);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>    static int getParameterSize(Class&lt;?&gt; c) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>        if (c == Void.TYPE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>            return 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>        } else if (c == Long.TYPE || c == Double.TYPE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>            return 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>        return 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>    static int getLoadOpcode(Class&lt;?&gt; c) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>        if(c == Void.TYPE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>            throw new InternalError(&quot;Unexpected void type of load opcode&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>        return ILOAD + getOpcodeOffset(c);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>    static int getReturnOpcode(Class&lt;?&gt; c) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>        if(c == Void.TYPE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>            return RETURN;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>        return IRETURN + getOpcodeOffset(c);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>    private static int getOpcodeOffset(Class&lt;?&gt; c) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>        if (c.isPrimitive()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>            if (c == Long.TYPE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>                return 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>            } else if (c == Float.TYPE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>                return 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>            } else if (c == Double.TYPE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>                return 3;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>            return 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>            return 4;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

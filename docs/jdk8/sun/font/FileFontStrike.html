@@ -3,953 +3,3791 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2003, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package sun.font;
-
-import java.lang.ref.SoftReference;
-import java.lang.ref.WeakReference;
-import java.awt.Font;
-import java.awt.GraphicsEnvironment;
-import java.awt.Rectangle;
-import java.awt.geom.AffineTransform;
-import java.awt.geom.GeneralPath;
-import java.awt.geom.NoninvertibleTransformException;
-import java.awt.geom.Point2D;
-import java.awt.geom.Rectangle2D;
-import java.util.concurrent.ConcurrentHashMap;
-import static sun.awt.SunHints.*;
-
-
-public class FileFontStrike extends PhysicalStrike {
-
-    /* fffe and ffff are values we specially interpret as meaning
-     * invisible glyphs.
-     */
-    static final int INVISIBLE_GLYPHS = 0x0fffe;
-
-    private FileFont fileFont;
-
-    /* REMIND: replace this scheme with one that installs a cache
-     * instance of the appropriate type. It will require changes in
-     * FontStrikeDisposer and NativeStrike etc.
-     */
-    private static final int UNINITIALISED = 0;
-    private static final int INTARRAY      = 1;
-    private static final int LONGARRAY     = 2;
-    private static final int SEGINTARRAY   = 3;
-    private static final int SEGLONGARRAY  = 4;
-
-    private volatile int glyphCacheFormat = UNINITIALISED;
-
-    /* segmented arrays are blocks of 32 */
-    private static final int SEGSHIFT = 5;
-    private static final int SEGSIZE  = 1 &lt;&lt; SEGSHIFT;
-
-    private boolean segmentedCache;
-    private int[][] segIntGlyphImages;
-    private long[][] segLongGlyphImages;
-
-    /* The &quot;metrics&quot; information requested by clients is usually nothing
-     * more than the horizontal advance of the character.
-     * In most cases this advance and other metrics information is stored
-     * in the glyph image cache.
-     * But in some cases we do not automatically retrieve the glyph
-     * image when the advance is requested. In those cases we want to
-     * cache the advances since this has been shown to be important for
-     * performance.
-     * The segmented cache is used in cases when the single array
-     * would be too large.
-     */
-    private float[] horizontalAdvances;
-    private float[][] segHorizontalAdvances;
-
-    /* Outline bounds are used when printing and when drawing outlines
-     * to the screen. On balance the relative rarity of these cases
-     * and the fact that getting this requires generating a path at
-     * the scaler level means that its probably OK to store these
-     * in a Java-level hashmap as the trade-off between time and space.
-     * Later can revisit whether to cache these at all, or elsewhere.
-     * Should also profile whether subsequent to getting the bounds, the
-     * outline itself is also requested. The 1.4 implementation doesn't
-     * cache outlines so you could generate the path twice - once to get
-     * the bounds and again to return the outline to the client.
-     * If the two uses are coincident then also look into caching outlines.
-     * One simple optimisation is that we could store the last single
-     * outline retrieved. This assumes that bounds then outline will always
-     * be retrieved for a glyph rather than retrieving bounds for all glyphs
-     * then outlines for all glyphs.
-     */
-    ConcurrentHashMap&lt;Integer, Rectangle2D.Float&gt; boundsMap;
-    SoftReference&lt;ConcurrentHashMap&lt;Integer, Point2D.Float&gt;&gt;
-        glyphMetricsMapRef;
-
-    AffineTransform invertDevTx;
-
-    boolean useNatives;
-    NativeStrike[] nativeStrikes;
-
-    /* Used only for communication to native layer */
-    private int intPtSize;
-
-    /* Perform global initialisation needed for Windows native rasterizer */
-    private static native boolean initNative();
-    private static boolean isXPorLater = false;
-    static {
-        if (FontUtilities.isWindows &amp;&amp; !FontUtilities.useT2K &amp;&amp;
-            !GraphicsEnvironment.isHeadless()) {
-            isXPorLater = initNative();
-        }
-    }
-
-    FileFontStrike(FileFont fileFont, FontStrikeDesc desc) {
-        super(fileFont, desc);
-        this.fileFont = fileFont;
-
-        if (desc.style != fileFont.style) {
-          /* If using algorithmic styling, the base values are
-           * boldness = 1.0, italic = 0.0. The superclass constructor
-           * initialises these.
-           */
-            if ((desc.style &amp; Font.ITALIC) == Font.ITALIC &amp;&amp;
-                (fileFont.style &amp; Font.ITALIC) == 0) {
-                algoStyle = true;
-                italic = 0.7f;
-            }
-            if ((desc.style &amp; Font.BOLD) == Font.BOLD &amp;&amp;
-                ((fileFont.style &amp; Font.BOLD) == 0)) {
-                algoStyle = true;
-                boldness = 1.33f;
-            }
-        }
-        double[] matrix = new double[4];
-        AffineTransform at = desc.glyphTx;
-        at.getMatrix(matrix);
-        if (!desc.devTx.isIdentity() &amp;&amp;
-            desc.devTx.getType() != AffineTransform.TYPE_TRANSLATION) {
-            try {
-                invertDevTx = desc.devTx.createInverse();
-            } catch (NoninvertibleTransformException e) {
-            }
-        }
-
-        /* Amble fonts are better rendered unhinted although there's the
-         * inevitable fuzziness that accompanies this due to no longer
-         * snapping stems to the pixel grid. The exception is that in B&amp;W
-         * mode they are worse without hinting. The down side to that is that
-         * B&amp;W metrics will differ which normally isn't the case, although
-         * since AA mode is part of the measuring context that should be OK.
-         * We don't expect Amble to be installed in the Windows fonts folder.
-         * If we were to, then we'd also might want to disable using the
-         * native rasteriser path which is used for LCD mode for platform
-         * fonts. since we have no way to disable hinting by GDI.
-         * In the case of Amble, since its 'gasp' table says to disable
-         * hinting, I'd expect GDI to follow that, so likely it should
-         * all be consistent even if GDI used.
-         */
-        boolean disableHinting = desc.aaHint != INTVAL_TEXT_ANTIALIAS_OFF &amp;&amp;
-                                 fileFont.familyName.startsWith(&quot;Amble&quot;);
-
-        /* If any of the values is NaN then substitute the null scaler context.
-         * This will return null images, zero advance, and empty outlines
-         * as no rendering need take place in this case.
-         * We pass in the null scaler as the singleton null context
-         * requires it. However
-         */
-        if (Double.isNaN(matrix[0]) || Double.isNaN(matrix[1]) ||
-            Double.isNaN(matrix[2]) || Double.isNaN(matrix[3]) ||
-            fileFont.getScaler() == null) {
-            pScalerContext = NullFontScaler.getNullScalerContext();
-        } else {
-            pScalerContext = fileFont.getScaler().createScalerContext(matrix,
-                                    desc.aaHint, desc.fmHint,
-                                    boldness, italic, disableHinting);
-        }
-
-        mapper = fileFont.getMapper();
-        int numGlyphs = mapper.getNumGlyphs();
-
-        /* Always segment for fonts with &gt; 256 glyphs, but also for smaller
-         * fonts with non-typical sizes and transforms.
-         * Segmenting for all non-typical pt sizes helps to minimize memory
-         * usage when very many distinct strikes are created.
-         * The size range of 0-&gt;5 and 37-&gt;INF for segmenting is arbitrary
-         * but the intention is that typical GUI integer point sizes (6-&gt;36)
-         * should not segment unless there's another reason to do so.
-         */
-        float ptSize = (float)matrix[3]; // interpreted only when meaningful.
-        int iSize = intPtSize = (int)ptSize;
-        boolean isSimpleTx = (at.getType() &amp; complexTX) == 0;
-        segmentedCache =
-            (numGlyphs &gt; SEGSIZE &lt;&lt; 3) ||
-            ((numGlyphs &gt; SEGSIZE &lt;&lt; 1) &amp;&amp;
-             (!isSimpleTx || ptSize != iSize || iSize &lt; 6 || iSize &gt; 36));
-
-        /* This can only happen if we failed to allocate memory for context.
-         * NB: in such case we may still have some memory in java heap
-         *     but subsequent attempt to allocate null scaler context
-         *     may fail too (cause it is allocate in the native heap).
-         *     It is not clear how to make this more robust but on the
-         *     other hand getting NULL here seems to be extremely unlikely.
-         */
-        if (pScalerContext == 0L) {
-            /* REMIND: when the code is updated to install cache objects
-             * rather than using a switch this will be more efficient.
-             */
-            this.disposer = new FontStrikeDisposer(fileFont, desc);
-            initGlyphCache();
-            pScalerContext = NullFontScaler.getNullScalerContext();
-            SunFontManager.getInstance().deRegisterBadFont(fileFont);
-            return;
-        }
-        /* First, see if native code should be used to create the glyph.
-         * GDI will return the integer metrics, not fractional metrics, which
-         * may be requested for this strike, so we would require here that :
-         * desc.fmHint != INTVAL_FRACTIONALMETRICS_ON
-         * except that the advance returned by GDI is always overwritten by
-         * the JDK rasteriser supplied one (see getGlyphImageFromWindows()).
-         */
-        if (FontUtilities.isWindows &amp;&amp; isXPorLater &amp;&amp;
-            !FontUtilities.useT2K &amp;&amp;
-            !GraphicsEnvironment.isHeadless() &amp;&amp;
-            !fileFont.useJavaRasterizer &amp;&amp;
-            (desc.aaHint == INTVAL_TEXT_ANTIALIAS_LCD_HRGB ||
-             desc.aaHint == INTVAL_TEXT_ANTIALIAS_LCD_HBGR) &amp;&amp;
-            (matrix[1] == 0.0 &amp;&amp; matrix[2] == 0.0 &amp;&amp;
-             matrix[0] == matrix[3] &amp;&amp;
-             matrix[0] &gt;= 3.0 &amp;&amp; matrix[0] &lt;= 100.0) &amp;&amp;
-            !((TrueTypeFont)fileFont).useEmbeddedBitmapsForSize(intPtSize)) {
-            useNatives = true;
-        }
-        else if (fileFont.checkUseNatives() &amp;&amp; desc.aaHint==0 &amp;&amp; !algoStyle) {
-            /* Check its a simple scale of a pt size in the range
-             * where native bitmaps typically exist (6-36 pts) */
-            if (matrix[1] == 0.0 &amp;&amp; matrix[2] == 0.0 &amp;&amp;
-                matrix[0] &gt;= 6.0 &amp;&amp; matrix[0] &lt;= 36.0 &amp;&amp;
-                matrix[0] == matrix[3]) {
-                useNatives = true;
-                int numNatives = fileFont.nativeFonts.length;
-                nativeStrikes = new NativeStrike[numNatives];
-                /* Maybe initialise these strikes lazily?. But we
-                 * know we need at least one
-                 */
-                for (int i=0; i&lt;numNatives; i++) {
-                    nativeStrikes[i] =
-                        new NativeStrike(fileFont.nativeFonts[i], desc, false);
-                }
-            }
-        }
-        if (FontUtilities.isLogging() &amp;&amp; FontUtilities.isWindows) {
-            FontUtilities.getLogger().info
-                (&quot;Strike for &quot; + fileFont + &quot; at size = &quot; + intPtSize +
-                 &quot; use natives = &quot; + useNatives +
-                 &quot; useJavaRasteriser = &quot; + fileFont.useJavaRasterizer +
-                 &quot; AAHint = &quot; + desc.aaHint +
-                 &quot; Has Embedded bitmaps = &quot; +
-                 ((TrueTypeFont)fileFont).
-                 useEmbeddedBitmapsForSize(intPtSize));
-        }
-        this.disposer = new FontStrikeDisposer(fileFont, desc, pScalerContext);
-
-        /* Always get the image and the advance together for smaller sizes
-         * that are likely to be important to rendering performance.
-         * The pixel size of 48.0 can be thought of as
-         * &quot;maximumSizeForGetImageWithAdvance&quot;.
-         * This should be no greater than OutlineTextRender.THRESHOLD.
-         */
-        double maxSz = 48.0;
-        getImageWithAdvance =
-            Math.abs(at.getScaleX()) &lt;= maxSz &amp;&amp;
-            Math.abs(at.getScaleY()) &lt;= maxSz &amp;&amp;
-            Math.abs(at.getShearX()) &lt;= maxSz &amp;&amp;
-            Math.abs(at.getShearY()) &lt;= maxSz;
-
-        /* Some applications request advance frequently during layout.
-         * If we are not getting and caching the image with the advance,
-         * there is a potentially significant performance penalty if the
-         * advance is repeatedly requested before requesting the image.
-         * We should at least cache the horizontal advance.
-         * REMIND: could use info in the font, eg hmtx, to retrieve some
-         * advances. But still want to cache it here.
-         */
-
-        if (!getImageWithAdvance) {
-            if (!segmentedCache) {
-                horizontalAdvances = new float[numGlyphs];
-                /* use max float as uninitialised advance */
-                for (int i=0; i&lt;numGlyphs; i++) {
-                    horizontalAdvances[i] = Float.MAX_VALUE;
-                }
-            } else {
-                int numSegments = (numGlyphs + SEGSIZE-1)/SEGSIZE;
-                segHorizontalAdvances = new float[numSegments][];
-            }
-        }
-    }
-
-    /* A number of methods are delegated by the strike to the scaler
-     * context which is a shared resource on a physical font.
-     */
-
-    public int getNumGlyphs() {
-        return fileFont.getNumGlyphs();
-    }
-
-    long getGlyphImageFromNative(int glyphCode) {
-        if (FontUtilities.isWindows) {
-            return getGlyphImageFromWindows(glyphCode);
-        } else {
-            return getGlyphImageFromX11(glyphCode);
-        }
-    }
-
-    /* There's no global state conflicts, so this method is not
-     * presently synchronized.
-     */
-    private native long _getGlyphImageFromWindows(String family,
-                                                  int style,
-                                                  int size,
-                                                  int glyphCode,
-                                                  boolean fracMetrics);
-
-    long getGlyphImageFromWindows(int glyphCode) {
-        String family = fileFont.getFamilyName(null);
-        int style = desc.style &amp; Font.BOLD | desc.style &amp; Font.ITALIC
-            | fileFont.getStyle();
-        int size = intPtSize;
-        long ptr = _getGlyphImageFromWindows
-            (family, style, size, glyphCode,
-             desc.fmHint == INTVAL_FRACTIONALMETRICS_ON);
-        if (ptr != 0) {
-            /* Get the advance from the JDK rasterizer. This is mostly
-             * necessary for the fractional metrics case, but there are
-             * also some very small number (&lt;0.25%) of marginal cases where
-             * there is some rounding difference between windows and JDK.
-             * After these are resolved, we can restrict this extra
-             * work to the FM case.
-             */
-            float advance = getGlyphAdvance(glyphCode, false);
-            StrikeCache.unsafe.putFloat(ptr + StrikeCache.xAdvanceOffset,
-                                        advance);
-            return ptr;
-        } else {
-            return fileFont.getGlyphImage(pScalerContext, glyphCode);
-        }
-    }
-
-    /* Try the native strikes first, then try the fileFont strike */
-    long getGlyphImageFromX11(int glyphCode) {
-        long glyphPtr;
-        char charCode = fileFont.glyphToCharMap[glyphCode];
-        for (int i=0;i&lt;nativeStrikes.length;i++) {
-            CharToGlyphMapper mapper = fileFont.nativeFonts[i].getMapper();
-            int gc = mapper.charToGlyph(charCode)&amp;0xffff;
-            if (gc != mapper.getMissingGlyphCode()) {
-                glyphPtr = nativeStrikes[i].getGlyphImagePtrNoCache(gc);
-                if (glyphPtr != 0L) {
-                    return glyphPtr;
-                }
-            }
-        }
-        return fileFont.getGlyphImage(pScalerContext, glyphCode);
-    }
-
-    long getGlyphImagePtr(int glyphCode) {
-        if (glyphCode &gt;= INVISIBLE_GLYPHS) {
-            return StrikeCache.invisibleGlyphPtr;
-        }
-        long glyphPtr = 0L;
-        if ((glyphPtr = getCachedGlyphPtr(glyphCode)) != 0L) {
-            return glyphPtr;
-        } else {
-            if (useNatives) {
-                glyphPtr = getGlyphImageFromNative(glyphCode);
-                if (glyphPtr == 0L &amp;&amp; FontUtilities.isLogging()) {
-                    FontUtilities.getLogger().info
-                        (&quot;Strike for &quot; + fileFont +
-                         &quot; at size = &quot; + intPtSize +
-                         &quot; couldn't get native glyph for code = &quot; + glyphCode);
-                 }
-            } if (glyphPtr == 0L) {
-                glyphPtr = fileFont.getGlyphImage(pScalerContext,
-                                                  glyphCode);
-            }
-            return setCachedGlyphPtr(glyphCode, glyphPtr);
-        }
-    }
-
-    void getGlyphImagePtrs(int[] glyphCodes, long[] images, int  len) {
-
-        for (int i=0; i&lt;len; i++) {
-            int glyphCode = glyphCodes[i];
-            if (glyphCode &gt;= INVISIBLE_GLYPHS) {
-                images[i] = StrikeCache.invisibleGlyphPtr;
-                continue;
-            } else if ((images[i] = getCachedGlyphPtr(glyphCode)) != 0L) {
-                continue;
-            } else {
-                long glyphPtr = 0L;
-                if (useNatives) {
-                    glyphPtr = getGlyphImageFromNative(glyphCode);
-                } if (glyphPtr == 0L) {
-                    glyphPtr = fileFont.getGlyphImage(pScalerContext,
-                                                      glyphCode);
-                }
-                images[i] = setCachedGlyphPtr(glyphCode, glyphPtr);
-            }
-        }
-    }
-
-    /* The following method is called from CompositeStrike as a special case.
-     */
-    private static final int SLOTZEROMAX = 0xffffff;
-    int getSlot0GlyphImagePtrs(int[] glyphCodes, long[] images, int len) {
-
-        int convertedCnt = 0;
-
-        for (int i=0; i&lt;len; i++) {
-            int glyphCode = glyphCodes[i];
-            if (glyphCode &gt;= SLOTZEROMAX) {
-                return convertedCnt;
-            } else {
-                convertedCnt++;
-            }
-            if (glyphCode &gt;= INVISIBLE_GLYPHS) {
-                images[i] = StrikeCache.invisibleGlyphPtr;
-                continue;
-            } else if ((images[i] = getCachedGlyphPtr(glyphCode)) != 0L) {
-                continue;
-            } else {
-                long glyphPtr = 0L;
-                if (useNatives) {
-                    glyphPtr = getGlyphImageFromNative(glyphCode);
-                }
-                if (glyphPtr == 0L) {
-                    glyphPtr = fileFont.getGlyphImage(pScalerContext,
-                                                      glyphCode);
-                }
-                images[i] = setCachedGlyphPtr(glyphCode, glyphPtr);
-            }
-        }
-        return convertedCnt;
-    }
-
-    /* Only look in the cache */
-    long getCachedGlyphPtr(int glyphCode) {
-        switch (glyphCacheFormat) {
-            case INTARRAY:
-                return intGlyphImages[glyphCode] &amp; INTMASK;
-            case SEGINTARRAY:
-                int segIndex = glyphCode &gt;&gt; SEGSHIFT;
-                if (segIntGlyphImages[segIndex] != null) {
-                    int subIndex = glyphCode % SEGSIZE;
-                    return segIntGlyphImages[segIndex][subIndex] &amp; INTMASK;
-                } else {
-                    return 0L;
-                }
-            case LONGARRAY:
-                return longGlyphImages[glyphCode];
-            case SEGLONGARRAY:
-                segIndex = glyphCode &gt;&gt; SEGSHIFT;
-                if (segLongGlyphImages[segIndex] != null) {
-                    int subIndex = glyphCode % SEGSIZE;
-                    return segLongGlyphImages[segIndex][subIndex];
-                } else {
-                    return 0L;
-                }
-        }
-        /* If reach here cache is UNINITIALISED. */
-        return 0L;
-    }
-
-    private synchronized long setCachedGlyphPtr(int glyphCode, long glyphPtr) {
-        switch (glyphCacheFormat) {
-            case INTARRAY:
-                if (intGlyphImages[glyphCode] == 0) {
-                    intGlyphImages[glyphCode] = (int)glyphPtr;
-                    return glyphPtr;
-                } else {
-                    StrikeCache.freeIntPointer((int)glyphPtr);
-                    return intGlyphImages[glyphCode] &amp; INTMASK;
-                }
-
-            case SEGINTARRAY:
-                int segIndex = glyphCode &gt;&gt; SEGSHIFT;
-                int subIndex = glyphCode % SEGSIZE;
-                if (segIntGlyphImages[segIndex] == null) {
-                    segIntGlyphImages[segIndex] = new int[SEGSIZE];
-                }
-                if (segIntGlyphImages[segIndex][subIndex] == 0) {
-                    segIntGlyphImages[segIndex][subIndex] = (int)glyphPtr;
-                    return glyphPtr;
-                } else {
-                    StrikeCache.freeIntPointer((int)glyphPtr);
-                    return segIntGlyphImages[segIndex][subIndex] &amp; INTMASK;
-                }
-
-            case LONGARRAY:
-                if (longGlyphImages[glyphCode] == 0L) {
-                    longGlyphImages[glyphCode] = glyphPtr;
-                    return glyphPtr;
-                } else {
-                    StrikeCache.freeLongPointer(glyphPtr);
-                    return longGlyphImages[glyphCode];
-                }
-
-           case SEGLONGARRAY:
-                segIndex = glyphCode &gt;&gt; SEGSHIFT;
-                subIndex = glyphCode % SEGSIZE;
-                if (segLongGlyphImages[segIndex] == null) {
-                    segLongGlyphImages[segIndex] = new long[SEGSIZE];
-                }
-                if (segLongGlyphImages[segIndex][subIndex] == 0L) {
-                    segLongGlyphImages[segIndex][subIndex] = glyphPtr;
-                    return glyphPtr;
-                } else {
-                    StrikeCache.freeLongPointer(glyphPtr);
-                    return segLongGlyphImages[segIndex][subIndex];
-                }
-        }
-
-        /* Reach here only when the cache is not initialised which is only
-         * for the first glyph to be initialised in the strike.
-         * Initialise it and recurse. Note that we are already synchronized.
-         */
-        initGlyphCache();
-        return setCachedGlyphPtr(glyphCode, glyphPtr);
-    }
-
-    /* Called only from synchronized code or constructor */
-    private synchronized void initGlyphCache() {
-
-        int numGlyphs = mapper.getNumGlyphs();
-        int tmpFormat = UNINITIALISED;
-        if (segmentedCache) {
-            int numSegments = (numGlyphs + SEGSIZE-1)/SEGSIZE;
-            if (longAddresses) {
-                tmpFormat = SEGLONGARRAY;
-                segLongGlyphImages = new long[numSegments][];
-                this.disposer.segLongGlyphImages = segLongGlyphImages;
-             } else {
-                 tmpFormat = SEGINTARRAY;
-                 segIntGlyphImages = new int[numSegments][];
-                 this.disposer.segIntGlyphImages = segIntGlyphImages;
-             }
-        } else {
-            if (longAddresses) {
-                tmpFormat = LONGARRAY;
-                longGlyphImages = new long[numGlyphs];
-                this.disposer.longGlyphImages = longGlyphImages;
-            } else {
-                tmpFormat = INTARRAY;
-                intGlyphImages = new int[numGlyphs];
-                this.disposer.intGlyphImages = intGlyphImages;
-            }
-        }
-        glyphCacheFormat = tmpFormat;
-    }
-
-    float getGlyphAdvance(int glyphCode) {
-        return getGlyphAdvance(glyphCode, true);
-    }
-
-    /* Metrics info is always retrieved. If the GlyphInfo address is non-zero
-     * then metrics info there is valid and can just be copied.
-     * This is in user space coordinates unless getUserAdv == false.
-     * Device space advance should not be propagated out of this class.
-     */
-    private float getGlyphAdvance(int glyphCode, boolean getUserAdv) {
-        float advance;
-
-        if (glyphCode &gt;= INVISIBLE_GLYPHS) {
-            return 0f;
-        }
-
-        /* Notes on the (getUserAdv == false) case.
-         *
-         * Setting getUserAdv == false is internal to this class.
-         * If there's no graphics transform we can let
-         * getGlyphAdvance take its course, and potentially caching in
-         * advances arrays, except for signalling that
-         * getUserAdv == false means there is no need to create an image.
-         * It is possible that code already calculated the user advance,
-         * and it is desirable to take advantage of that work.
-         * But, if there's a transform and we want device advance, we
-         * can't use any values cached in the advances arrays - unless
-         * first re-transform them into device space using 'desc.devTx'.
-         * invertDevTx is null if the graphics transform is identity,
-         * a translate, or non-invertible. The latter case should
-         * not ever occur in the getUserAdv == false path.
-         * In other words its either null, or the inversion of a
-         * simple uniform scale. If its null, we can populate and
-         * use the advance caches as normal.
-         *
-         * If we don't find a cached value, obtain the device advance and
-         * return it. This will get stashed on the image by the caller and any
-         * subsequent metrics calls will be able to use it as is the case
-         * whenever an image is what is initially requested.
-         *
-         * Don't query if there's a value cached on the image, since this
-         * getUserAdv==false code path is entered solely when none exists.
-         */
-        if (horizontalAdvances != null) {
-            advance = horizontalAdvances[glyphCode];
-            if (advance != Float.MAX_VALUE) {
-                if (!getUserAdv &amp;&amp; invertDevTx != null) {
-                    Point2D.Float metrics = new Point2D.Float(advance, 0f);
-                    desc.devTx.deltaTransform(metrics, metrics);
-                    return metrics.x;
-                } else {
-                    return advance;
-                }
-            }
-        } else if (segmentedCache &amp;&amp; segHorizontalAdvances != null) {
-            int segIndex = glyphCode &gt;&gt; SEGSHIFT;
-            float[] subArray = segHorizontalAdvances[segIndex];
-            if (subArray != null) {
-                advance = subArray[glyphCode % SEGSIZE];
-                if (advance != Float.MAX_VALUE) {
-                    if (!getUserAdv &amp;&amp; invertDevTx != null) {
-                        Point2D.Float metrics = new Point2D.Float(advance, 0f);
-                        desc.devTx.deltaTransform(metrics, metrics);
-                        return metrics.x;
-                    } else {
-                        return advance;
-                    }
-                }
-            }
-        }
-
-        if (!getUserAdv &amp;&amp; invertDevTx != null) {
-            Point2D.Float metrics = new Point2D.Float();
-            fileFont.getGlyphMetrics(pScalerContext, glyphCode, metrics);
-            return metrics.x;
-        }
-
-        if (invertDevTx != null || !getUserAdv) {
-            /* If there is a device transform need x &amp; y advance to
-             * transform back into user space.
-             */
-            advance = getGlyphMetrics(glyphCode, getUserAdv).x;
-        } else {
-            long glyphPtr;
-            if (getImageWithAdvance) {
-                /* A heuristic optimisation says that for most cases its
-                 * worthwhile retrieving the image at the same time as the
-                 * advance. So here we get the image data even if its not
-                 * already cached.
-                 */
-                glyphPtr = getGlyphImagePtr(glyphCode);
-            } else {
-                glyphPtr = getCachedGlyphPtr(glyphCode);
-            }
-            if (glyphPtr != 0L) {
-                advance = StrikeCache.unsafe.getFloat
-                    (glyphPtr + StrikeCache.xAdvanceOffset);
-
-            } else {
-                advance = fileFont.getGlyphAdvance(pScalerContext, glyphCode);
-            }
-        }
-
-        if (horizontalAdvances != null) {
-            horizontalAdvances[glyphCode] = advance;
-        } else if (segmentedCache &amp;&amp; segHorizontalAdvances != null) {
-            int segIndex = glyphCode &gt;&gt; SEGSHIFT;
-            int subIndex = glyphCode % SEGSIZE;
-            if (segHorizontalAdvances[segIndex] == null) {
-                segHorizontalAdvances[segIndex] = new float[SEGSIZE];
-                for (int i=0; i&lt;SEGSIZE; i++) {
-                     segHorizontalAdvances[segIndex][i] = Float.MAX_VALUE;
-                }
-            }
-            segHorizontalAdvances[segIndex][subIndex] = advance;
-        }
-        return advance;
-    }
-
-    float getCodePointAdvance(int cp) {
-        return getGlyphAdvance(mapper.charToGlyph(cp));
-    }
-
-    /**
-     * Result and pt are both in device space.
-     */
-    void getGlyphImageBounds(int glyphCode, Point2D.Float pt,
-                             Rectangle result) {
-
-        long ptr = getGlyphImagePtr(glyphCode);
-        float topLeftX, topLeftY;
-
-        /* With our current design NULL ptr is not possible
-           but if we eventually allow scalers to return NULL pointers
-           this check might be actually useful. */
-        if (ptr == 0L) {
-            result.x = (int) Math.floor(pt.x);
-            result.y = (int) Math.floor(pt.y);
-            result.width = result.height = 0;
-            return;
-        }
-
-        topLeftX = StrikeCache.unsafe.getFloat(ptr+StrikeCache.topLeftXOffset);
-        topLeftY = StrikeCache.unsafe.getFloat(ptr+StrikeCache.topLeftYOffset);
-
-        result.x = (int)Math.floor(pt.x + topLeftX);
-        result.y = (int)Math.floor(pt.y + topLeftY);
-        result.width =
-            StrikeCache.unsafe.getShort(ptr+StrikeCache.widthOffset)  &amp;0x0ffff;
-        result.height =
-            StrikeCache.unsafe.getShort(ptr+StrikeCache.heightOffset) &amp;0x0ffff;
-
-        /* HRGB LCD text may have padding that is empty. This is almost always
-         * going to be when topLeftX is -2 or less.
-         * Try to return a tighter bounding box in that case.
-         * If the first three bytes of every row are all zero, then
-         * add 1 to &quot;x&quot; and reduce &quot;width&quot; by 1.
-         */
-        if ((desc.aaHint == INTVAL_TEXT_ANTIALIAS_LCD_HRGB ||
-             desc.aaHint == INTVAL_TEXT_ANTIALIAS_LCD_HBGR)
-            &amp;&amp; topLeftX &lt;= -2.0f) {
-            int minx = getGlyphImageMinX(ptr, (int)result.x);
-            if (minx &gt; result.x) {
-                result.x += 1;
-                result.width -=1;
-            }
-        }
-    }
-
-    private int getGlyphImageMinX(long ptr, int origMinX) {
-
-        int width = StrikeCache.unsafe.getChar(ptr+StrikeCache.widthOffset);
-        int height = StrikeCache.unsafe.getChar(ptr+StrikeCache.heightOffset);
-        int rowBytes =
-            StrikeCache.unsafe.getChar(ptr+StrikeCache.rowBytesOffset);
-
-        if (rowBytes == width) {
-            return origMinX;
-        }
-
-        long pixelData =
-            StrikeCache.unsafe.getAddress(ptr + StrikeCache.pixelDataOffset);
-
-        if (pixelData == 0L) {
-            return origMinX;
-        }
-
-        for (int y=0;y&lt;height;y++) {
-            for (int x=0;x&lt;3;x++) {
-                if (StrikeCache.unsafe.getByte(pixelData+y*rowBytes+x) != 0) {
-                    return origMinX;
-                }
-            }
-        }
-        return origMinX+1;
-    }
-
-    /* These 3 metrics methods below should be implemented to return
-     * values in user space.
-     */
-    StrikeMetrics getFontMetrics() {
-        if (strikeMetrics == null) {
-            strikeMetrics =
-                fileFont.getFontMetrics(pScalerContext);
-            if (invertDevTx != null) {
-                strikeMetrics.convertToUserSpace(invertDevTx);
-            }
-        }
-        return strikeMetrics;
-    }
-
-    Point2D.Float getGlyphMetrics(int glyphCode) {
-        return getGlyphMetrics(glyphCode, true);
-    }
-
-    private Point2D.Float getGlyphMetrics(int glyphCode, boolean getImage) {
-        Point2D.Float metrics = new Point2D.Float();
-
-        // !!! or do we force sgv user glyphs?
-        if (glyphCode &gt;= INVISIBLE_GLYPHS) {
-            return metrics;
-        }
-        long glyphPtr;
-        if (getImageWithAdvance &amp;&amp; getImage) {
-            /* A heuristic optimisation says that for most cases its
-             * worthwhile retrieving the image at the same time as the
-             * metrics. So here we get the image data even if its not
-             * already cached.
-             */
-            glyphPtr = getGlyphImagePtr(glyphCode);
-        } else {
-             glyphPtr = getCachedGlyphPtr(glyphCode);
-        }
-        if (glyphPtr != 0L) {
-            metrics = new Point2D.Float();
-            metrics.x = StrikeCache.unsafe.getFloat
-                (glyphPtr + StrikeCache.xAdvanceOffset);
-            metrics.y = StrikeCache.unsafe.getFloat
-                (glyphPtr + StrikeCache.yAdvanceOffset);
-            /* advance is currently in device space, need to convert back
-             * into user space.
-             * This must not include the translation component. */
-            if (invertDevTx != null) {
-                invertDevTx.deltaTransform(metrics, metrics);
-            }
-        } else {
-            /* We sometimes cache these metrics as they are expensive to
-             * generate for large glyphs.
-             * We never reach this path if we obtain images with advances.
-             * But if we do not obtain images with advances its possible that
-             * we first obtain this information, then the image, and never
-             * will access this value again.
-             */
-            Integer key = Integer.valueOf(glyphCode);
-            Point2D.Float value = null;
-            ConcurrentHashMap&lt;Integer, Point2D.Float&gt; glyphMetricsMap = null;
-            if (glyphMetricsMapRef != null) {
-                glyphMetricsMap = glyphMetricsMapRef.get();
-            }
-            if (glyphMetricsMap != null) {
-                value = glyphMetricsMap.get(key);
-                if (value != null) {
-                    metrics.x = value.x;
-                    metrics.y = value.y;
-                    /* already in user space */
-                    return metrics;
-                }
-            }
-            if (value == null) {
-                fileFont.getGlyphMetrics(pScalerContext, glyphCode, metrics);
-                /* advance is currently in device space, need to convert back
-                 * into user space.
-                 */
-                if (invertDevTx != null) {
-                    invertDevTx.deltaTransform(metrics, metrics);
-                }
-                value = new Point2D.Float(metrics.x, metrics.y);
-                /* We aren't synchronizing here so it is possible to
-                 * overwrite the map with another one but this is harmless.
-                 */
-                if (glyphMetricsMap == null) {
-                    glyphMetricsMap =
-                        new ConcurrentHashMap&lt;Integer, Point2D.Float&gt;();
-                    glyphMetricsMapRef =
-                        new SoftReference&lt;ConcurrentHashMap&lt;Integer,
-                        Point2D.Float&gt;&gt;(glyphMetricsMap);
-                }
-                glyphMetricsMap.put(key, value);
-            }
-        }
-        return metrics;
-    }
-
-    Point2D.Float getCharMetrics(char ch) {
-        return getGlyphMetrics(mapper.charToGlyph(ch));
-    }
-
-    /* The caller of this can be trusted to return a copy of this
-     * return value rectangle to public API. In fact frequently it
-     * can't use use this return value directly anyway.
-     * This returns bounds in device space. Currently the only
-     * caller is SGV and it converts back to user space.
-     * We could change things so that this code does the conversion so
-     * that all coords coming out of the font system are converted back
-     * into user space even if they were measured in device space.
-     * The same applies to the other methods that return outlines (below)
-     * But it may make particular sense for this method that caches its
-     * results.
-     * There'd be plenty of exceptions, to this too, eg getGlyphPoint needs
-     * device coords as its called from native layout and getGlyphImageBounds
-     * is used by GlyphVector.getGlyphPixelBounds which is specified to
-     * return device coordinates, the image pointers aren't really used
-     * up in Java code either.
-     */
-    Rectangle2D.Float getGlyphOutlineBounds(int glyphCode) {
-
-        if (boundsMap == null) {
-            boundsMap = new ConcurrentHashMap&lt;Integer, Rectangle2D.Float&gt;();
-        }
-
-        Integer key = Integer.valueOf(glyphCode);
-        Rectangle2D.Float bounds = boundsMap.get(key);
-
-        if (bounds == null) {
-            bounds = fileFont.getGlyphOutlineBounds(pScalerContext, glyphCode);
-            boundsMap.put(key, bounds);
-        }
-        return bounds;
-    }
-
-    public Rectangle2D getOutlineBounds(int glyphCode) {
-        return fileFont.getGlyphOutlineBounds(pScalerContext, glyphCode);
-    }
-
-    private
-        WeakReference&lt;ConcurrentHashMap&lt;Integer,GeneralPath&gt;&gt; outlineMapRef;
-
-    GeneralPath getGlyphOutline(int glyphCode, float x, float y) {
-
-        GeneralPath gp = null;
-        ConcurrentHashMap&lt;Integer, GeneralPath&gt; outlineMap = null;
-
-        if (outlineMapRef != null) {
-            outlineMap = outlineMapRef.get();
-            if (outlineMap != null) {
-                gp = (GeneralPath)outlineMap.get(glyphCode);
-            }
-        }
-
-        if (gp == null) {
-            gp = fileFont.getGlyphOutline(pScalerContext, glyphCode, 0, 0);
-            if (outlineMap == null) {
-                outlineMap = new ConcurrentHashMap&lt;Integer, GeneralPath&gt;();
-                outlineMapRef =
-                   new WeakReference
-                       &lt;ConcurrentHashMap&lt;Integer,GeneralPath&gt;&gt;(outlineMap);
-            }
-            outlineMap.put(glyphCode, gp);
-        }
-        gp = (GeneralPath)gp.clone(); // mutable!
-        if (x != 0f || y != 0f) {
-            gp.transform(AffineTransform.getTranslateInstance(x, y));
-        }
-        return gp;
-    }
-
-    GeneralPath getGlyphVectorOutline(int[] glyphs, float x, float y) {
-        return fileFont.getGlyphVectorOutline(pScalerContext,
-                                              glyphs, glyphs.length, x, y);
-    }
-
-    protected void adjustPoint(Point2D.Float pt) {
-        if (invertDevTx != null) {
-            invertDevTx.deltaTransform(pt, pt);
-        }
-    }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2003, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package sun.font;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.lang.ref.SoftReference;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.lang.ref.WeakReference;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.awt.Font;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.awt.GraphicsEnvironment;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.awt.Rectangle;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.awt.geom.AffineTransform;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.awt.geom.GeneralPath;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import java.awt.geom.NoninvertibleTransformException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.awt.geom.Point2D;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import java.awt.geom.Rectangle2D;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import java.util.concurrent.ConcurrentHashMap;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import static sun.awt.SunHints.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>public class FileFontStrike extends PhysicalStrike {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre>    /* fffe and ffff are values we specially interpret as meaning</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre>     * invisible glyphs.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre>    static final int INVISIBLE_GLYPHS = 0x0fffe;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre>    private FileFont fileFont;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>    /* REMIND: replace this scheme with one that installs a cache</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre>     * instance of the appropriate type. It will require changes in</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre>     * FontStrikeDisposer and NativeStrike etc.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>    private static final int UNINITIALISED = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre>    private static final int INTARRAY      = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>    private static final int LONGARRAY     = 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>    private static final int SEGINTARRAY   = 3;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre>    private static final int SEGLONGARRAY  = 4;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>    private volatile int glyphCacheFormat = UNINITIALISED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>    /* segmented arrays are blocks of 32 */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>    private static final int SEGSHIFT = 5;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>    private static final int SEGSIZE  = 1 &lt;&lt; SEGSHIFT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>    private boolean segmentedCache;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>    private int[][] segIntGlyphImages;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>    private long[][] segLongGlyphImages;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>    /* The &quot;metrics&quot; information requested by clients is usually nothing</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>     * more than the horizontal advance of the character.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>     * In most cases this advance and other metrics information is stored</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>     * in the glyph image cache.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>     * But in some cases we do not automatically retrieve the glyph</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>     * image when the advance is requested. In those cases we want to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>     * cache the advances since this has been shown to be important for</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>     * performance.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>     * The segmented cache is used in cases when the single array</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>     * would be too large.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>    private float[] horizontalAdvances;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>    private float[][] segHorizontalAdvances;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>    /* Outline bounds are used when printing and when drawing outlines</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>     * to the screen. On balance the relative rarity of these cases</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>     * and the fact that getting this requires generating a path at</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>     * the scaler level means that its probably OK to store these</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>     * in a Java-level hashmap as the trade-off between time and space.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>     * Later can revisit whether to cache these at all, or elsewhere.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>     * Should also profile whether subsequent to getting the bounds, the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>     * outline itself is also requested. The 1.4 implementation doesn't</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>     * cache outlines so you could generate the path twice - once to get</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>     * the bounds and again to return the outline to the client.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>     * If the two uses are coincident then also look into caching outlines.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>     * One simple optimisation is that we could store the last single</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>     * outline retrieved. This assumes that bounds then outline will always</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>     * be retrieved for a glyph rather than retrieving bounds for all glyphs</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>     * then outlines for all glyphs.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>    ConcurrentHashMap&lt;Integer, Rectangle2D.Float&gt; boundsMap;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>    SoftReference&lt;ConcurrentHashMap&lt;Integer, Point2D.Float&gt;&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>        glyphMetricsMapRef;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>    AffineTransform invertDevTx;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>    boolean useNatives;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>    NativeStrike[] nativeStrikes;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>    /* Used only for communication to native layer */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>    private int intPtSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>    /* Perform global initialisation needed for Windows native rasterizer */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>    private static native boolean initNative();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>    private static boolean isXPorLater = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>    static {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>        if (FontUtilities.isWindows &amp;&amp; !FontUtilities.useT2K &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>            !GraphicsEnvironment.isHeadless()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>            isXPorLater = initNative();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>    FileFontStrike(FileFont fileFont, FontStrikeDesc desc) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>        super(fileFont, desc);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>        this.fileFont = fileFont;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>        if (desc.style != fileFont.style) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>          /* If using algorithmic styling, the base values are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>           * boldness = 1.0, italic = 0.0. The superclass constructor</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>           * initialises these.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>           */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>            if ((desc.style &amp; Font.ITALIC) == Font.ITALIC &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>                (fileFont.style &amp; Font.ITALIC) == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>                algoStyle = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>                italic = 0.7f;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>            if ((desc.style &amp; Font.BOLD) == Font.BOLD &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>                ((fileFont.style &amp; Font.BOLD) == 0)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>                algoStyle = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>                boldness = 1.33f;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>        double[] matrix = new double[4];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>        AffineTransform at = desc.glyphTx;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>        at.getMatrix(matrix);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>        if (!desc.devTx.isIdentity() &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>            desc.devTx.getType() != AffineTransform.TYPE_TRANSLATION) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>                invertDevTx = desc.devTx.createInverse();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>            } catch (NoninvertibleTransformException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>        /* Amble fonts are better rendered unhinted although there's the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>         * inevitable fuzziness that accompanies this due to no longer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>         * snapping stems to the pixel grid. The exception is that in B&amp;W</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>         * mode they are worse without hinting. The down side to that is that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>         * B&amp;W metrics will differ which normally isn't the case, although</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>         * since AA mode is part of the measuring context that should be OK.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>         * We don't expect Amble to be installed in the Windows fonts folder.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>         * If we were to, then we'd also might want to disable using the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>         * native rasteriser path which is used for LCD mode for platform</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>         * fonts. since we have no way to disable hinting by GDI.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>         * In the case of Amble, since its 'gasp' table says to disable</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>         * hinting, I'd expect GDI to follow that, so likely it should</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>         * all be consistent even if GDI used.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>        boolean disableHinting = desc.aaHint != INTVAL_TEXT_ANTIALIAS_OFF &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>                                 fileFont.familyName.startsWith(&quot;Amble&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>        /* If any of the values is NaN then substitute the null scaler context.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>         * This will return null images, zero advance, and empty outlines</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>         * as no rendering need take place in this case.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>         * We pass in the null scaler as the singleton null context</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>         * requires it. However</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>        if (Double.isNaN(matrix[0]) || Double.isNaN(matrix[1]) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>            Double.isNaN(matrix[2]) || Double.isNaN(matrix[3]) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>            fileFont.getScaler() == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>            pScalerContext = NullFontScaler.getNullScalerContext();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>            pScalerContext = fileFont.getScaler().createScalerContext(matrix,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>                                    desc.aaHint, desc.fmHint,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>                                    boldness, italic, disableHinting);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>        mapper = fileFont.getMapper();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>        int numGlyphs = mapper.getNumGlyphs();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>        /* Always segment for fonts with &gt; 256 glyphs, but also for smaller</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>         * fonts with non-typical sizes and transforms.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>         * Segmenting for all non-typical pt sizes helps to minimize memory</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>         * usage when very many distinct strikes are created.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>         * The size range of 0-&gt;5 and 37-&gt;INF for segmenting is arbitrary</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>         * but the intention is that typical GUI integer point sizes (6-&gt;36)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>         * should not segment unless there's another reason to do so.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>        float ptSize = (float)matrix[3]; // interpreted only when meaningful.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>        int iSize = intPtSize = (int)ptSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>        boolean isSimpleTx = (at.getType() &amp; complexTX) == 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>        segmentedCache =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>            (numGlyphs &gt; SEGSIZE &lt;&lt; 3) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>            ((numGlyphs &gt; SEGSIZE &lt;&lt; 1) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>             (!isSimpleTx || ptSize != iSize || iSize &lt; 6 || iSize &gt; 36));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>        /* This can only happen if we failed to allocate memory for context.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>         * NB: in such case we may still have some memory in java heap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>         *     but subsequent attempt to allocate null scaler context</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>         *     may fail too (cause it is allocate in the native heap).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>         *     It is not clear how to make this more robust but on the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>         *     other hand getting NULL here seems to be extremely unlikely.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>        if (pScalerContext == 0L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>            /* REMIND: when the code is updated to install cache objects</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>             * rather than using a switch this will be more efficient.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>             */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>            this.disposer = new FontStrikeDisposer(fileFont, desc);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>            initGlyphCache();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>            pScalerContext = NullFontScaler.getNullScalerContext();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>            SunFontManager.getInstance().deRegisterBadFont(fileFont);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>        /* First, see if native code should be used to create the glyph.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>         * GDI will return the integer metrics, not fractional metrics, which</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>         * may be requested for this strike, so we would require here that :</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>         * desc.fmHint != INTVAL_FRACTIONALMETRICS_ON</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>         * except that the advance returned by GDI is always overwritten by</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>         * the JDK rasteriser supplied one (see getGlyphImageFromWindows()).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>        if (FontUtilities.isWindows &amp;&amp; isXPorLater &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>            !FontUtilities.useT2K &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>            !GraphicsEnvironment.isHeadless() &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>            !fileFont.useJavaRasterizer &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>            (desc.aaHint == INTVAL_TEXT_ANTIALIAS_LCD_HRGB ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>             desc.aaHint == INTVAL_TEXT_ANTIALIAS_LCD_HBGR) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>            (matrix[1] == 0.0 &amp;&amp; matrix[2] == 0.0 &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>             matrix[0] == matrix[3] &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>             matrix[0] &gt;= 3.0 &amp;&amp; matrix[0] &lt;= 100.0) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>            !((TrueTypeFont)fileFont).useEmbeddedBitmapsForSize(intPtSize)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>            useNatives = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>        else if (fileFont.checkUseNatives() &amp;&amp; desc.aaHint==0 &amp;&amp; !algoStyle) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>            /* Check its a simple scale of a pt size in the range</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>             * where native bitmaps typically exist (6-36 pts) */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>            if (matrix[1] == 0.0 &amp;&amp; matrix[2] == 0.0 &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>                matrix[0] &gt;= 6.0 &amp;&amp; matrix[0] &lt;= 36.0 &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>                matrix[0] == matrix[3]) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>                useNatives = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>                int numNatives = fileFont.nativeFonts.length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>                nativeStrikes = new NativeStrike[numNatives];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>                /* Maybe initialise these strikes lazily?. But we</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>                 * know we need at least one</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>                 */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>                for (int i=0; i&lt;numNatives; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>                    nativeStrikes[i] =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>                        new NativeStrike(fileFont.nativeFonts[i], desc, false);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>        if (FontUtilities.isLogging() &amp;&amp; FontUtilities.isWindows) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>            FontUtilities.getLogger().info</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>                (&quot;Strike for &quot; + fileFont + &quot; at size = &quot; + intPtSize +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>                 &quot; use natives = &quot; + useNatives +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>                 &quot; useJavaRasteriser = &quot; + fileFont.useJavaRasterizer +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>                 &quot; AAHint = &quot; + desc.aaHint +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>                 &quot; Has Embedded bitmaps = &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>                 ((TrueTypeFont)fileFont).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>                 useEmbeddedBitmapsForSize(intPtSize));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>        this.disposer = new FontStrikeDisposer(fileFont, desc, pScalerContext);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>        /* Always get the image and the advance together for smaller sizes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>         * that are likely to be important to rendering performance.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>         * The pixel size of 48.0 can be thought of as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>         * &quot;maximumSizeForGetImageWithAdvance&quot;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>         * This should be no greater than OutlineTextRender.THRESHOLD.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>        double maxSz = 48.0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>        getImageWithAdvance =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>            Math.abs(at.getScaleX()) &lt;= maxSz &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>            Math.abs(at.getScaleY()) &lt;= maxSz &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>            Math.abs(at.getShearX()) &lt;= maxSz &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>            Math.abs(at.getShearY()) &lt;= maxSz;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>        /* Some applications request advance frequently during layout.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>         * If we are not getting and caching the image with the advance,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>         * there is a potentially significant performance penalty if the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>         * advance is repeatedly requested before requesting the image.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>         * We should at least cache the horizontal advance.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>         * REMIND: could use info in the font, eg hmtx, to retrieve some</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>         * advances. But still want to cache it here.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>        if (!getImageWithAdvance) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>            if (!segmentedCache) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>                horizontalAdvances = new float[numGlyphs];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>                /* use max float as uninitialised advance */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>                for (int i=0; i&lt;numGlyphs; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>                    horizontalAdvances[i] = Float.MAX_VALUE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>                int numSegments = (numGlyphs + SEGSIZE-1)/SEGSIZE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>                segHorizontalAdvances = new float[numSegments][];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>    /* A number of methods are delegated by the strike to the scaler</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>     * context which is a shared resource on a physical font.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>    public int getNumGlyphs() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>        return fileFont.getNumGlyphs();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>    long getGlyphImageFromNative(int glyphCode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>        if (FontUtilities.isWindows) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>            return getGlyphImageFromWindows(glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>            return getGlyphImageFromX11(glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>    /* There's no global state conflicts, so this method is not</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>     * presently synchronized.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>    private native long _getGlyphImageFromWindows(String family,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>                                                  int style,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>                                                  int size,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>                                                  int glyphCode,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>                                                  boolean fracMetrics);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>    long getGlyphImageFromWindows(int glyphCode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>        String family = fileFont.getFamilyName(null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>        int style = desc.style &amp; Font.BOLD | desc.style &amp; Font.ITALIC</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>            | fileFont.getStyle();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>        int size = intPtSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>        long ptr = _getGlyphImageFromWindows</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>            (family, style, size, glyphCode,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>             desc.fmHint == INTVAL_FRACTIONALMETRICS_ON);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>        if (ptr != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>            /* Get the advance from the JDK rasterizer. This is mostly</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>             * necessary for the fractional metrics case, but there are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>             * also some very small number (&lt;0.25%) of marginal cases where</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>             * there is some rounding difference between windows and JDK.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>             * After these are resolved, we can restrict this extra</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>             * work to the FM case.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>             */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>            float advance = getGlyphAdvance(glyphCode, false);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>            StrikeCache.unsafe.putFloat(ptr + StrikeCache.xAdvanceOffset,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>                                        advance);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>            return ptr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>            return fileFont.getGlyphImage(pScalerContext, glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>    /* Try the native strikes first, then try the fileFont strike */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>    long getGlyphImageFromX11(int glyphCode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>        long glyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>        char charCode = fileFont.glyphToCharMap[glyphCode];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>        for (int i=0;i&lt;nativeStrikes.length;i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>            CharToGlyphMapper mapper = fileFont.nativeFonts[i].getMapper();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>            int gc = mapper.charToGlyph(charCode)&amp;0xffff;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>            if (gc != mapper.getMissingGlyphCode()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>                glyphPtr = nativeStrikes[i].getGlyphImagePtrNoCache(gc);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>                if (glyphPtr != 0L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>                    return glyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>        return fileFont.getGlyphImage(pScalerContext, glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>    long getGlyphImagePtr(int glyphCode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>        if (glyphCode &gt;= INVISIBLE_GLYPHS) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>            return StrikeCache.invisibleGlyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>        long glyphPtr = 0L;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>        if ((glyphPtr = getCachedGlyphPtr(glyphCode)) != 0L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>            return glyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>            if (useNatives) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>                glyphPtr = getGlyphImageFromNative(glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>                if (glyphPtr == 0L &amp;&amp; FontUtilities.isLogging()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>                    FontUtilities.getLogger().info</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>                        (&quot;Strike for &quot; + fileFont +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>                         &quot; at size = &quot; + intPtSize +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>                         &quot; couldn't get native glyph for code = &quot; + glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>                 }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>            } if (glyphPtr == 0L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>                glyphPtr = fileFont.getGlyphImage(pScalerContext,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>                                                  glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>            return setCachedGlyphPtr(glyphCode, glyphPtr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>    void getGlyphImagePtrs(int[] glyphCodes, long[] images, int  len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>        for (int i=0; i&lt;len; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>            int glyphCode = glyphCodes[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>            if (glyphCode &gt;= INVISIBLE_GLYPHS) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>                images[i] = StrikeCache.invisibleGlyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>                continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>            } else if ((images[i] = getCachedGlyphPtr(glyphCode)) != 0L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>                continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>                long glyphPtr = 0L;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>                if (useNatives) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>                    glyphPtr = getGlyphImageFromNative(glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>                } if (glyphPtr == 0L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>                    glyphPtr = fileFont.getGlyphImage(pScalerContext,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>                                                      glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>                images[i] = setCachedGlyphPtr(glyphCode, glyphPtr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>    /* The following method is called from CompositeStrike as a special case.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>    private static final int SLOTZEROMAX = 0xffffff;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>    int getSlot0GlyphImagePtrs(int[] glyphCodes, long[] images, int len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>        int convertedCnt = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>        for (int i=0; i&lt;len; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>            int glyphCode = glyphCodes[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>            if (glyphCode &gt;= SLOTZEROMAX) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>                return convertedCnt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>                convertedCnt++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>            if (glyphCode &gt;= INVISIBLE_GLYPHS) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>                images[i] = StrikeCache.invisibleGlyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>                continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>            } else if ((images[i] = getCachedGlyphPtr(glyphCode)) != 0L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>                continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>                long glyphPtr = 0L;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>                if (useNatives) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>                    glyphPtr = getGlyphImageFromNative(glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>                if (glyphPtr == 0L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>                    glyphPtr = fileFont.getGlyphImage(pScalerContext,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>                                                      glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>                images[i] = setCachedGlyphPtr(glyphCode, glyphPtr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>        return convertedCnt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>    /* Only look in the cache */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>    long getCachedGlyphPtr(int glyphCode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>        switch (glyphCacheFormat) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>            case INTARRAY:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>                return intGlyphImages[glyphCode] &amp; INTMASK;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>            case SEGINTARRAY:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>                int segIndex = glyphCode &gt;&gt; SEGSHIFT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>                if (segIntGlyphImages[segIndex] != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>                    int subIndex = glyphCode % SEGSIZE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>                    return segIntGlyphImages[segIndex][subIndex] &amp; INTMASK;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>                    return 0L;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>            case LONGARRAY:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>                return longGlyphImages[glyphCode];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>            case SEGLONGARRAY:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>                segIndex = glyphCode &gt;&gt; SEGSHIFT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>                if (segLongGlyphImages[segIndex] != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>                    int subIndex = glyphCode % SEGSIZE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>                    return segLongGlyphImages[segIndex][subIndex];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>                    return 0L;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>        /* If reach here cache is UNINITIALISED. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>        return 0L;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>    private synchronized long setCachedGlyphPtr(int glyphCode, long glyphPtr) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>        switch (glyphCacheFormat) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>            case INTARRAY:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>                if (intGlyphImages[glyphCode] == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>                    intGlyphImages[glyphCode] = (int)glyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>                    return glyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>                    StrikeCache.freeIntPointer((int)glyphPtr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>                    return intGlyphImages[glyphCode] &amp; INTMASK;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>            case SEGINTARRAY:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>                int segIndex = glyphCode &gt;&gt; SEGSHIFT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>                int subIndex = glyphCode % SEGSIZE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>                if (segIntGlyphImages[segIndex] == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>                    segIntGlyphImages[segIndex] = new int[SEGSIZE];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>                if (segIntGlyphImages[segIndex][subIndex] == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>                    segIntGlyphImages[segIndex][subIndex] = (int)glyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>                    return glyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre>                    StrikeCache.freeIntPointer((int)glyphPtr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>                    return segIntGlyphImages[segIndex][subIndex] &amp; INTMASK;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>            case LONGARRAY:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>                if (longGlyphImages[glyphCode] == 0L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>                    longGlyphImages[glyphCode] = glyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>                    return glyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>                    StrikeCache.freeLongPointer(glyphPtr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>                    return longGlyphImages[glyphCode];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>           case SEGLONGARRAY:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>                segIndex = glyphCode &gt;&gt; SEGSHIFT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>                subIndex = glyphCode % SEGSIZE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>                if (segLongGlyphImages[segIndex] == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>                    segLongGlyphImages[segIndex] = new long[SEGSIZE];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>                if (segLongGlyphImages[segIndex][subIndex] == 0L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>                    segLongGlyphImages[segIndex][subIndex] = glyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>                    return glyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>                    StrikeCache.freeLongPointer(glyphPtr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>                    return segLongGlyphImages[segIndex][subIndex];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>        /* Reach here only when the cache is not initialised which is only</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>         * for the first glyph to be initialised in the strike.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>         * Initialise it and recurse. Note that we are already synchronized.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>        initGlyphCache();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>        return setCachedGlyphPtr(glyphCode, glyphPtr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>    /* Called only from synchronized code or constructor */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>    private synchronized void initGlyphCache() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>        int numGlyphs = mapper.getNumGlyphs();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>        int tmpFormat = UNINITIALISED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre>        if (segmentedCache) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>            int numSegments = (numGlyphs + SEGSIZE-1)/SEGSIZE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>            if (longAddresses) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>                tmpFormat = SEGLONGARRAY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>                segLongGlyphImages = new long[numSegments][];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>                this.disposer.segLongGlyphImages = segLongGlyphImages;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>             } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>                 tmpFormat = SEGINTARRAY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>                 segIntGlyphImages = new int[numSegments][];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>                 this.disposer.segIntGlyphImages = segIntGlyphImages;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>             }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>            if (longAddresses) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>                tmpFormat = LONGARRAY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>                longGlyphImages = new long[numGlyphs];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>                this.disposer.longGlyphImages = longGlyphImages;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>                tmpFormat = INTARRAY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>                intGlyphImages = new int[numGlyphs];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre>                this.disposer.intGlyphImages = intGlyphImages;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>        glyphCacheFormat = tmpFormat;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>    float getGlyphAdvance(int glyphCode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre>        return getGlyphAdvance(glyphCode, true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>    /* Metrics info is always retrieved. If the GlyphInfo address is non-zero</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>     * then metrics info there is valid and can just be copied.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>     * This is in user space coordinates unless getUserAdv == false.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>     * Device space advance should not be propagated out of this class.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>    private float getGlyphAdvance(int glyphCode, boolean getUserAdv) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>        float advance;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>        if (glyphCode &gt;= INVISIBLE_GLYPHS) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>            return 0f;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>        /* Notes on the (getUserAdv == false) case.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>         *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>         * Setting getUserAdv == false is internal to this class.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>         * If there's no graphics transform we can let</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre>         * getGlyphAdvance take its course, and potentially caching in</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre>         * advances arrays, except for signalling that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>         * getUserAdv == false means there is no need to create an image.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>         * It is possible that code already calculated the user advance,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>         * and it is desirable to take advantage of that work.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>         * But, if there's a transform and we want device advance, we</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>         * can't use any values cached in the advances arrays - unless</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>         * first re-transform them into device space using 'desc.devTx'.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>         * invertDevTx is null if the graphics transform is identity,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>         * a translate, or non-invertible. The latter case should</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>         * not ever occur in the getUserAdv == false path.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>         * In other words its either null, or the inversion of a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>         * simple uniform scale. If its null, we can populate and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>         * use the advance caches as normal.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>         *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>         * If we don't find a cached value, obtain the device advance and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre>         * return it. This will get stashed on the image by the caller and any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>         * subsequent metrics calls will be able to use it as is the case</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>         * whenever an image is what is initially requested.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>         *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre>         * Don't query if there's a value cached on the image, since this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>         * getUserAdv==false code path is entered solely when none exists.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>        if (horizontalAdvances != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>            advance = horizontalAdvances[glyphCode];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>            if (advance != Float.MAX_VALUE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>                if (!getUserAdv &amp;&amp; invertDevTx != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>                    Point2D.Float metrics = new Point2D.Float(advance, 0f);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>                    desc.devTx.deltaTransform(metrics, metrics);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>                    return metrics.x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>                    return advance;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre>        } else if (segmentedCache &amp;&amp; segHorizontalAdvances != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre>            int segIndex = glyphCode &gt;&gt; SEGSHIFT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>            float[] subArray = segHorizontalAdvances[segIndex];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>            if (subArray != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>                advance = subArray[glyphCode % SEGSIZE];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre>                if (advance != Float.MAX_VALUE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>                    if (!getUserAdv &amp;&amp; invertDevTx != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>                        Point2D.Float metrics = new Point2D.Float(advance, 0f);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre>                        desc.devTx.deltaTransform(metrics, metrics);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>                        return metrics.x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre>                    } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>                        return advance;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>        if (!getUserAdv &amp;&amp; invertDevTx != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>            Point2D.Float metrics = new Point2D.Float();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>            fileFont.getGlyphMetrics(pScalerContext, glyphCode, metrics);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>            return metrics.x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>        if (invertDevTx != null || !getUserAdv) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>            /* If there is a device transform need x &amp; y advance to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>             * transform back into user space.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>             */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>            advance = getGlyphMetrics(glyphCode, getUserAdv).x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>            long glyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>            if (getImageWithAdvance) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre>                /* A heuristic optimisation says that for most cases its</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre>                 * worthwhile retrieving the image at the same time as the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre>                 * advance. So here we get the image data even if its not</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>                 * already cached.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre>                 */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>                glyphPtr = getGlyphImagePtr(glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>                glyphPtr = getCachedGlyphPtr(glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>            if (glyphPtr != 0L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre>                advance = StrikeCache.unsafe.getFloat</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>                    (glyphPtr + StrikeCache.xAdvanceOffset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre>                advance = fileFont.getGlyphAdvance(pScalerContext, glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>        if (horizontalAdvances != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>            horizontalAdvances[glyphCode] = advance;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>        } else if (segmentedCache &amp;&amp; segHorizontalAdvances != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>            int segIndex = glyphCode &gt;&gt; SEGSHIFT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre>            int subIndex = glyphCode % SEGSIZE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre>            if (segHorizontalAdvances[segIndex] == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre>                segHorizontalAdvances[segIndex] = new float[SEGSIZE];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>                for (int i=0; i&lt;SEGSIZE; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>                     segHorizontalAdvances[segIndex][i] = Float.MAX_VALUE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre>            segHorizontalAdvances[segIndex][subIndex] = advance;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre>        return advance;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>    float getCodePointAdvance(int cp) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre>        return getGlyphAdvance(mapper.charToGlyph(cp));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre>     * Result and pt are both in device space.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre>    void getGlyphImageBounds(int glyphCode, Point2D.Float pt,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre>                             Rectangle result) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre>        long ptr = getGlyphImagePtr(glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>        float topLeftX, topLeftY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre>        /* With our current design NULL ptr is not possible</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>           but if we eventually allow scalers to return NULL pointers</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre>           this check might be actually useful. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre>        if (ptr == 0L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>            result.x = (int) Math.floor(pt.x);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>            result.y = (int) Math.floor(pt.y);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre>            result.width = result.height = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre>        topLeftX = StrikeCache.unsafe.getFloat(ptr+StrikeCache.topLeftXOffset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>        topLeftY = StrikeCache.unsafe.getFloat(ptr+StrikeCache.topLeftYOffset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre>        result.x = (int)Math.floor(pt.x + topLeftX);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre>        result.y = (int)Math.floor(pt.y + topLeftY);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre>        result.width =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre>            StrikeCache.unsafe.getShort(ptr+StrikeCache.widthOffset)  &amp;0x0ffff;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="719" href="#"></a></td>
+<td><pre>        result.height =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="720" href="#"></a></td>
+<td><pre>            StrikeCache.unsafe.getShort(ptr+StrikeCache.heightOffset) &amp;0x0ffff;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="721" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="722" href="#"></a></td>
+<td><pre>        /* HRGB LCD text may have padding that is empty. This is almost always</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="723" href="#"></a></td>
+<td><pre>         * going to be when topLeftX is -2 or less.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="724" href="#"></a></td>
+<td><pre>         * Try to return a tighter bounding box in that case.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="725" href="#"></a></td>
+<td><pre>         * If the first three bytes of every row are all zero, then</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="726" href="#"></a></td>
+<td><pre>         * add 1 to &quot;x&quot; and reduce &quot;width&quot; by 1.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="727" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="728" href="#"></a></td>
+<td><pre>        if ((desc.aaHint == INTVAL_TEXT_ANTIALIAS_LCD_HRGB ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="729" href="#"></a></td>
+<td><pre>             desc.aaHint == INTVAL_TEXT_ANTIALIAS_LCD_HBGR)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="730" href="#"></a></td>
+<td><pre>            &amp;&amp; topLeftX &lt;= -2.0f) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="731" href="#"></a></td>
+<td><pre>            int minx = getGlyphImageMinX(ptr, (int)result.x);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="732" href="#"></a></td>
+<td><pre>            if (minx &gt; result.x) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="733" href="#"></a></td>
+<td><pre>                result.x += 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="734" href="#"></a></td>
+<td><pre>                result.width -=1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="735" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="736" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="737" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="738" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="739" href="#"></a></td>
+<td><pre>    private int getGlyphImageMinX(long ptr, int origMinX) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="740" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="741" href="#"></a></td>
+<td><pre>        int width = StrikeCache.unsafe.getChar(ptr+StrikeCache.widthOffset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="742" href="#"></a></td>
+<td><pre>        int height = StrikeCache.unsafe.getChar(ptr+StrikeCache.heightOffset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="743" href="#"></a></td>
+<td><pre>        int rowBytes =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="744" href="#"></a></td>
+<td><pre>            StrikeCache.unsafe.getChar(ptr+StrikeCache.rowBytesOffset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="745" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="746" href="#"></a></td>
+<td><pre>        if (rowBytes == width) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="747" href="#"></a></td>
+<td><pre>            return origMinX;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="748" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="749" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="750" href="#"></a></td>
+<td><pre>        long pixelData =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="751" href="#"></a></td>
+<td><pre>            StrikeCache.unsafe.getAddress(ptr + StrikeCache.pixelDataOffset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="752" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="753" href="#"></a></td>
+<td><pre>        if (pixelData == 0L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="754" href="#"></a></td>
+<td><pre>            return origMinX;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="755" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="756" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="757" href="#"></a></td>
+<td><pre>        for (int y=0;y&lt;height;y++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="758" href="#"></a></td>
+<td><pre>            for (int x=0;x&lt;3;x++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="759" href="#"></a></td>
+<td><pre>                if (StrikeCache.unsafe.getByte(pixelData+y*rowBytes+x) != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="760" href="#"></a></td>
+<td><pre>                    return origMinX;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="761" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="762" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="763" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="764" href="#"></a></td>
+<td><pre>        return origMinX+1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="765" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="766" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="767" href="#"></a></td>
+<td><pre>    /* These 3 metrics methods below should be implemented to return</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="768" href="#"></a></td>
+<td><pre>     * values in user space.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="769" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="770" href="#"></a></td>
+<td><pre>    StrikeMetrics getFontMetrics() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="771" href="#"></a></td>
+<td><pre>        if (strikeMetrics == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="772" href="#"></a></td>
+<td><pre>            strikeMetrics =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="773" href="#"></a></td>
+<td><pre>                fileFont.getFontMetrics(pScalerContext);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="774" href="#"></a></td>
+<td><pre>            if (invertDevTx != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="775" href="#"></a></td>
+<td><pre>                strikeMetrics.convertToUserSpace(invertDevTx);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="776" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="777" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="778" href="#"></a></td>
+<td><pre>        return strikeMetrics;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="779" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="780" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="781" href="#"></a></td>
+<td><pre>    Point2D.Float getGlyphMetrics(int glyphCode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="782" href="#"></a></td>
+<td><pre>        return getGlyphMetrics(glyphCode, true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="783" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="784" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="785" href="#"></a></td>
+<td><pre>    private Point2D.Float getGlyphMetrics(int glyphCode, boolean getImage) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="786" href="#"></a></td>
+<td><pre>        Point2D.Float metrics = new Point2D.Float();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="787" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="788" href="#"></a></td>
+<td><pre>        // !!! or do we force sgv user glyphs?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="789" href="#"></a></td>
+<td><pre>        if (glyphCode &gt;= INVISIBLE_GLYPHS) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="790" href="#"></a></td>
+<td><pre>            return metrics;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="791" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="792" href="#"></a></td>
+<td><pre>        long glyphPtr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="793" href="#"></a></td>
+<td><pre>        if (getImageWithAdvance &amp;&amp; getImage) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="794" href="#"></a></td>
+<td><pre>            /* A heuristic optimisation says that for most cases its</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="795" href="#"></a></td>
+<td><pre>             * worthwhile retrieving the image at the same time as the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="796" href="#"></a></td>
+<td><pre>             * metrics. So here we get the image data even if its not</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="797" href="#"></a></td>
+<td><pre>             * already cached.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="798" href="#"></a></td>
+<td><pre>             */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="799" href="#"></a></td>
+<td><pre>            glyphPtr = getGlyphImagePtr(glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="800" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="801" href="#"></a></td>
+<td><pre>             glyphPtr = getCachedGlyphPtr(glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="802" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="803" href="#"></a></td>
+<td><pre>        if (glyphPtr != 0L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="804" href="#"></a></td>
+<td><pre>            metrics = new Point2D.Float();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="805" href="#"></a></td>
+<td><pre>            metrics.x = StrikeCache.unsafe.getFloat</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="806" href="#"></a></td>
+<td><pre>                (glyphPtr + StrikeCache.xAdvanceOffset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="807" href="#"></a></td>
+<td><pre>            metrics.y = StrikeCache.unsafe.getFloat</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="808" href="#"></a></td>
+<td><pre>                (glyphPtr + StrikeCache.yAdvanceOffset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="809" href="#"></a></td>
+<td><pre>            /* advance is currently in device space, need to convert back</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="810" href="#"></a></td>
+<td><pre>             * into user space.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="811" href="#"></a></td>
+<td><pre>             * This must not include the translation component. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="812" href="#"></a></td>
+<td><pre>            if (invertDevTx != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="813" href="#"></a></td>
+<td><pre>                invertDevTx.deltaTransform(metrics, metrics);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="814" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="815" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="816" href="#"></a></td>
+<td><pre>            /* We sometimes cache these metrics as they are expensive to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="817" href="#"></a></td>
+<td><pre>             * generate for large glyphs.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="818" href="#"></a></td>
+<td><pre>             * We never reach this path if we obtain images with advances.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="819" href="#"></a></td>
+<td><pre>             * But if we do not obtain images with advances its possible that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="820" href="#"></a></td>
+<td><pre>             * we first obtain this information, then the image, and never</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="821" href="#"></a></td>
+<td><pre>             * will access this value again.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="822" href="#"></a></td>
+<td><pre>             */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="823" href="#"></a></td>
+<td><pre>            Integer key = Integer.valueOf(glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="824" href="#"></a></td>
+<td><pre>            Point2D.Float value = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="825" href="#"></a></td>
+<td><pre>            ConcurrentHashMap&lt;Integer, Point2D.Float&gt; glyphMetricsMap = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="826" href="#"></a></td>
+<td><pre>            if (glyphMetricsMapRef != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="827" href="#"></a></td>
+<td><pre>                glyphMetricsMap = glyphMetricsMapRef.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="828" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="829" href="#"></a></td>
+<td><pre>            if (glyphMetricsMap != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="830" href="#"></a></td>
+<td><pre>                value = glyphMetricsMap.get(key);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="831" href="#"></a></td>
+<td><pre>                if (value != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="832" href="#"></a></td>
+<td><pre>                    metrics.x = value.x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="833" href="#"></a></td>
+<td><pre>                    metrics.y = value.y;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="834" href="#"></a></td>
+<td><pre>                    /* already in user space */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="835" href="#"></a></td>
+<td><pre>                    return metrics;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="836" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="837" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="838" href="#"></a></td>
+<td><pre>            if (value == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="839" href="#"></a></td>
+<td><pre>                fileFont.getGlyphMetrics(pScalerContext, glyphCode, metrics);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="840" href="#"></a></td>
+<td><pre>                /* advance is currently in device space, need to convert back</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="841" href="#"></a></td>
+<td><pre>                 * into user space.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="842" href="#"></a></td>
+<td><pre>                 */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="843" href="#"></a></td>
+<td><pre>                if (invertDevTx != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="844" href="#"></a></td>
+<td><pre>                    invertDevTx.deltaTransform(metrics, metrics);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="845" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="846" href="#"></a></td>
+<td><pre>                value = new Point2D.Float(metrics.x, metrics.y);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="847" href="#"></a></td>
+<td><pre>                /* We aren't synchronizing here so it is possible to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="848" href="#"></a></td>
+<td><pre>                 * overwrite the map with another one but this is harmless.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="849" href="#"></a></td>
+<td><pre>                 */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="850" href="#"></a></td>
+<td><pre>                if (glyphMetricsMap == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="851" href="#"></a></td>
+<td><pre>                    glyphMetricsMap =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="852" href="#"></a></td>
+<td><pre>                        new ConcurrentHashMap&lt;Integer, Point2D.Float&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="853" href="#"></a></td>
+<td><pre>                    glyphMetricsMapRef =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="854" href="#"></a></td>
+<td><pre>                        new SoftReference&lt;ConcurrentHashMap&lt;Integer,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="855" href="#"></a></td>
+<td><pre>                        Point2D.Float&gt;&gt;(glyphMetricsMap);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="856" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="857" href="#"></a></td>
+<td><pre>                glyphMetricsMap.put(key, value);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="858" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="859" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="860" href="#"></a></td>
+<td><pre>        return metrics;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="861" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="862" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="863" href="#"></a></td>
+<td><pre>    Point2D.Float getCharMetrics(char ch) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="864" href="#"></a></td>
+<td><pre>        return getGlyphMetrics(mapper.charToGlyph(ch));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="865" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="866" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="867" href="#"></a></td>
+<td><pre>    /* The caller of this can be trusted to return a copy of this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="868" href="#"></a></td>
+<td><pre>     * return value rectangle to public API. In fact frequently it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="869" href="#"></a></td>
+<td><pre>     * can't use use this return value directly anyway.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="870" href="#"></a></td>
+<td><pre>     * This returns bounds in device space. Currently the only</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="871" href="#"></a></td>
+<td><pre>     * caller is SGV and it converts back to user space.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="872" href="#"></a></td>
+<td><pre>     * We could change things so that this code does the conversion so</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="873" href="#"></a></td>
+<td><pre>     * that all coords coming out of the font system are converted back</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="874" href="#"></a></td>
+<td><pre>     * into user space even if they were measured in device space.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="875" href="#"></a></td>
+<td><pre>     * The same applies to the other methods that return outlines (below)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="876" href="#"></a></td>
+<td><pre>     * But it may make particular sense for this method that caches its</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="877" href="#"></a></td>
+<td><pre>     * results.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="878" href="#"></a></td>
+<td><pre>     * There'd be plenty of exceptions, to this too, eg getGlyphPoint needs</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="879" href="#"></a></td>
+<td><pre>     * device coords as its called from native layout and getGlyphImageBounds</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="880" href="#"></a></td>
+<td><pre>     * is used by GlyphVector.getGlyphPixelBounds which is specified to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="881" href="#"></a></td>
+<td><pre>     * return device coordinates, the image pointers aren't really used</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="882" href="#"></a></td>
+<td><pre>     * up in Java code either.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="883" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="884" href="#"></a></td>
+<td><pre>    Rectangle2D.Float getGlyphOutlineBounds(int glyphCode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="885" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="886" href="#"></a></td>
+<td><pre>        if (boundsMap == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="887" href="#"></a></td>
+<td><pre>            boundsMap = new ConcurrentHashMap&lt;Integer, Rectangle2D.Float&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="888" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="889" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="890" href="#"></a></td>
+<td><pre>        Integer key = Integer.valueOf(glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="891" href="#"></a></td>
+<td><pre>        Rectangle2D.Float bounds = boundsMap.get(key);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="892" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="893" href="#"></a></td>
+<td><pre>        if (bounds == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="894" href="#"></a></td>
+<td><pre>            bounds = fileFont.getGlyphOutlineBounds(pScalerContext, glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="895" href="#"></a></td>
+<td><pre>            boundsMap.put(key, bounds);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="896" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="897" href="#"></a></td>
+<td><pre>        return bounds;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="898" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="899" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="900" href="#"></a></td>
+<td><pre>    public Rectangle2D getOutlineBounds(int glyphCode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="901" href="#"></a></td>
+<td><pre>        return fileFont.getGlyphOutlineBounds(pScalerContext, glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="902" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="903" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="904" href="#"></a></td>
+<td><pre>    private</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="905" href="#"></a></td>
+<td><pre>        WeakReference&lt;ConcurrentHashMap&lt;Integer,GeneralPath&gt;&gt; outlineMapRef;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="906" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="907" href="#"></a></td>
+<td><pre>    GeneralPath getGlyphOutline(int glyphCode, float x, float y) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="908" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="909" href="#"></a></td>
+<td><pre>        GeneralPath gp = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="910" href="#"></a></td>
+<td><pre>        ConcurrentHashMap&lt;Integer, GeneralPath&gt; outlineMap = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="911" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="912" href="#"></a></td>
+<td><pre>        if (outlineMapRef != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="913" href="#"></a></td>
+<td><pre>            outlineMap = outlineMapRef.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="914" href="#"></a></td>
+<td><pre>            if (outlineMap != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="915" href="#"></a></td>
+<td><pre>                gp = (GeneralPath)outlineMap.get(glyphCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="916" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="917" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="918" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="919" href="#"></a></td>
+<td><pre>        if (gp == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="920" href="#"></a></td>
+<td><pre>            gp = fileFont.getGlyphOutline(pScalerContext, glyphCode, 0, 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="921" href="#"></a></td>
+<td><pre>            if (outlineMap == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="922" href="#"></a></td>
+<td><pre>                outlineMap = new ConcurrentHashMap&lt;Integer, GeneralPath&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="923" href="#"></a></td>
+<td><pre>                outlineMapRef =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="924" href="#"></a></td>
+<td><pre>                   new WeakReference</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="925" href="#"></a></td>
+<td><pre>                       &lt;ConcurrentHashMap&lt;Integer,GeneralPath&gt;&gt;(outlineMap);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="926" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="927" href="#"></a></td>
+<td><pre>            outlineMap.put(glyphCode, gp);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="928" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="929" href="#"></a></td>
+<td><pre>        gp = (GeneralPath)gp.clone(); // mutable!</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="930" href="#"></a></td>
+<td><pre>        if (x != 0f || y != 0f) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="931" href="#"></a></td>
+<td><pre>            gp.transform(AffineTransform.getTranslateInstance(x, y));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="932" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="933" href="#"></a></td>
+<td><pre>        return gp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="934" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="935" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="936" href="#"></a></td>
+<td><pre>    GeneralPath getGlyphVectorOutline(int[] glyphs, float x, float y) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="937" href="#"></a></td>
+<td><pre>        return fileFont.getGlyphVectorOutline(pScalerContext,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="938" href="#"></a></td>
+<td><pre>                                              glyphs, glyphs.length, x, y);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="939" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="940" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="941" href="#"></a></td>
+<td><pre>    protected void adjustPoint(Point2D.Float pt) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="942" href="#"></a></td>
+<td><pre>        if (invertDevTx != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="943" href="#"></a></td>
+<td><pre>            invertDevTx.deltaTransform(pt, pt);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="944" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="945" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="946" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

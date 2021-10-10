@@ -3,542 +3,2147 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2007, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package sun.java2d.pipe;
-
-import java.awt.Color;
-import java.awt.GradientPaint;
-import java.awt.LinearGradientPaint;
-import java.awt.MultipleGradientPaint;
-import java.awt.MultipleGradientPaint.ColorSpaceType;
-import java.awt.MultipleGradientPaint.CycleMethod;
-import java.awt.Paint;
-import java.awt.RadialGradientPaint;
-import java.awt.TexturePaint;
-import java.awt.geom.AffineTransform;
-import java.awt.geom.Point2D;
-import java.awt.geom.Rectangle2D;
-import java.awt.image.AffineTransformOp;
-import java.awt.image.BufferedImage;
-import sun.awt.image.PixelConverter;
-import sun.java2d.SunGraphics2D;
-import sun.java2d.SurfaceData;
-import sun.java2d.loops.CompositeType;
-import sun.java2d.loops.SurfaceType;
-import static sun.java2d.pipe.BufferedOpCodes.*;
-
-import java.lang.annotation.Native;
-
-public class BufferedPaints {
-
-    static void setPaint(RenderQueue rq, SunGraphics2D sg2d,
-                         Paint paint, int ctxflags)
-    {
-        if (sg2d.paintState &lt;= SunGraphics2D.PAINT_ALPHACOLOR) {
-            setColor(rq, sg2d.pixel);
-        } else {
-            boolean useMask = (ctxflags &amp; BufferedContext.USE_MASK) != 0;
-            switch (sg2d.paintState) {
-            case SunGraphics2D.PAINT_GRADIENT:
-                setGradientPaint(rq, sg2d,
-                                 (GradientPaint)paint, useMask);
-                break;
-            case SunGraphics2D.PAINT_LIN_GRADIENT:
-                setLinearGradientPaint(rq, sg2d,
-                                       (LinearGradientPaint)paint, useMask);
-                break;
-            case SunGraphics2D.PAINT_RAD_GRADIENT:
-                setRadialGradientPaint(rq, sg2d,
-                                       (RadialGradientPaint)paint, useMask);
-                break;
-            case SunGraphics2D.PAINT_TEXTURE:
-                setTexturePaint(rq, sg2d,
-                                (TexturePaint)paint, useMask);
-                break;
-            default:
-                break;
-            }
-        }
-    }
-
-    static void resetPaint(RenderQueue rq) {
-        // assert rq.lock.isHeldByCurrentThread();
-        rq.ensureCapacity(4);
-        RenderBuffer buf = rq.getBuffer();
-        buf.putInt(RESET_PAINT);
-    }
-
-/****************************** Color support *******************************/
-
-    private static void setColor(RenderQueue rq, int pixel) {
-        // assert rq.lock.isHeldByCurrentThread();
-        rq.ensureCapacity(8);
-        RenderBuffer buf = rq.getBuffer();
-        buf.putInt(SET_COLOR);
-        buf.putInt(pixel);
-    }
-
-/************************* GradientPaint support ****************************/
-
-    /**
-     * Note: This code is factored out into a separate static method
-     * so that it can be shared by both the Gradient and LinearGradient
-     * implementations.  LinearGradient uses this code (for the
-     * two-color sRGB case only) because it can be much faster than the
-     * equivalent implementation that uses fragment shaders.
-     *
-     * We use OpenGL's texture coordinate generator to automatically
-     * apply a smooth gradient (either cyclic or acyclic) to the geometry
-     * being rendered.  This technique is almost identical to the one
-     * described in the comments for BufferedPaints.setTexturePaint(),
-     * except the calculations take place in one dimension instead of two.
-     * Instead of an anchor rectangle in the TexturePaint case, we use
-     * the vector between the two GradientPaint end points in our
-     * calculations.  The generator uses a single plane equation that
-     * takes the (x,y) location (in device space) of the fragment being
-     * rendered to calculate a (u) texture coordinate for that fragment:
-     *     u = Ax + By + Cz + Dw
-     *
-     * The gradient renderer uses a two-pixel 1D texture where the first
-     * pixel contains the first GradientPaint color, and the second pixel
-     * contains the second GradientPaint color.  (Note that we use the
-     * GL_CLAMP_TO_EDGE wrapping mode for acyclic gradients so that we
-     * clamp the colors properly at the extremes.)  The following diagram
-     * attempts to show the layout of the texture containing the two
-     * GradientPaint colors (C1 and C2):
-     *
-     *                        +-----------------+
-     *                        |   C1   |   C2   |
-     *                        |        |        |
-     *                        +-----------------+
-     *                      u=0  .25  .5   .75  1
-     *
-     * We calculate our plane equation constants (A,B,D) such that u=0.25
-     * corresponds to the first GradientPaint end point in user space and
-     * u=0.75 corresponds to the second end point.  This is somewhat
-     * non-obvious, but since the gradient colors are generated by
-     * interpolating between C1 and C2, we want the pure color at the
-     * end points, and we will get the pure color only when u correlates
-     * to the center of a texel.  The following chart shows the expected
-     * color for some sample values of u (where C' is the color halfway
-     * between C1 and C2):
-     *
-     *       u value      acyclic (GL_CLAMP)      cyclic (GL_REPEAT)
-     *       -------      ------------------      ------------------
-     *        -0.25              C1                       C2
-     *         0.0               C1                       C'
-     *         0.25              C1                       C1
-     *         0.5               C'                       C'
-     *         0.75              C2                       C2
-     *         1.0               C2                       C'
-     *         1.25              C2                       C1
-     *
-     * Original inspiration for this technique came from UMD's Agile2D
-     * project (GradientManager.java).
-     */
-    private static void setGradientPaint(RenderQueue rq, AffineTransform at,
-                                         Color c1, Color c2,
-                                         Point2D pt1, Point2D pt2,
-                                         boolean isCyclic, boolean useMask)
-    {
-        // convert gradient colors to IntArgbPre format
-        PixelConverter pc = PixelConverter.ArgbPre.instance;
-        int pixel1 = pc.rgbToPixel(c1.getRGB(), null);
-        int pixel2 = pc.rgbToPixel(c2.getRGB(), null);
-
-        // calculate plane equation constants
-        double x = pt1.getX();
-        double y = pt1.getY();
-        at.translate(x, y);
-        // now gradient point 1 is at the origin
-        x = pt2.getX() - x;
-        y = pt2.getY() - y;
-        double len = Math.sqrt(x * x + y * y);
-        at.rotate(x, y);
-        // now gradient point 2 is on the positive x-axis
-        at.scale(2*len, 1);
-        // now gradient point 2 is at (0.5, 0)
-        at.translate(-0.25, 0);
-        // now gradient point 1 is at (0.25, 0), point 2 is at (0.75, 0)
-
-        double p0, p1, p3;
-        try {
-            at.invert();
-            p0 = at.getScaleX();
-            p1 = at.getShearX();
-            p3 = at.getTranslateX();
-        } catch (java.awt.geom.NoninvertibleTransformException e) {
-            p0 = p1 = p3 = 0.0;
-        }
-
-        // assert rq.lock.isHeldByCurrentThread();
-        rq.ensureCapacityAndAlignment(44, 12);
-        RenderBuffer buf = rq.getBuffer();
-        buf.putInt(SET_GRADIENT_PAINT);
-        buf.putInt(useMask ? 1 : 0);
-        buf.putInt(isCyclic ? 1 : 0);
-        buf.putDouble(p0).putDouble(p1).putDouble(p3);
-        buf.putInt(pixel1).putInt(pixel2);
-    }
-
-    private static void setGradientPaint(RenderQueue rq,
-                                         SunGraphics2D sg2d,
-                                         GradientPaint paint,
-                                         boolean useMask)
-    {
-        setGradientPaint(rq, (AffineTransform)sg2d.transform.clone(),
-                         paint.getColor1(), paint.getColor2(),
-                         paint.getPoint1(), paint.getPoint2(),
-                         paint.isCyclic(), useMask);
-    }
-
-/************************** TexturePaint support ****************************/
-
-    /**
-     * We use OpenGL's texture coordinate generator to automatically
-     * map the TexturePaint image to the geometry being rendered.  The
-     * generator uses two separate plane equations that take the (x,y)
-     * location (in device space) of the fragment being rendered to
-     * calculate (u,v) texture coordinates for that fragment:
-     *     u = Ax + By + Cz + Dw
-     *     v = Ex + Fy + Gz + Hw
-     *
-     * Since we use a 2D orthographic projection, we can assume that z=0
-     * and w=1 for any fragment.  So we need to calculate appropriate
-     * values for the plane equation constants (A,B,D) and (E,F,H) such
-     * that {u,v}=0 for the top-left of the TexturePaint's anchor
-     * rectangle and {u,v}=1 for the bottom-right of the anchor rectangle.
-     * We can easily make the texture image repeat for {u,v} values
-     * outside the range [0,1] by specifying the GL_REPEAT texture wrap
-     * mode.
-     *
-     * Calculating the plane equation constants is surprisingly simple.
-     * We can think of it as an inverse matrix operation that takes
-     * device space coordinates and transforms them into user space
-     * coordinates that correspond to a location relative to the anchor
-     * rectangle.  First, we translate and scale the current user space
-     * transform by applying the anchor rectangle bounds.  We then take
-     * the inverse of this affine transform.  The rows of the resulting
-     * inverse matrix correlate nicely to the plane equation constants
-     * we were seeking.
-     */
-    private static void setTexturePaint(RenderQueue rq,
-                                        SunGraphics2D sg2d,
-                                        TexturePaint paint,
-                                        boolean useMask)
-    {
-        BufferedImage bi = paint.getImage();
-        SurfaceData dstData = sg2d.surfaceData;
-        SurfaceData srcData =
-            dstData.getSourceSurfaceData(bi, SunGraphics2D.TRANSFORM_ISIDENT,
-                                         CompositeType.SrcOver, null);
-        boolean filter =
-            (sg2d.interpolationType !=
-             AffineTransformOp.TYPE_NEAREST_NEIGHBOR);
-
-        // calculate plane equation constants
-        AffineTransform at = (AffineTransform)sg2d.transform.clone();
-        Rectangle2D anchor = paint.getAnchorRect();
-        at.translate(anchor.getX(), anchor.getY());
-        at.scale(anchor.getWidth(), anchor.getHeight());
-
-        double xp0, xp1, xp3, yp0, yp1, yp3;
-        try {
-            at.invert();
-            xp0 = at.getScaleX();
-            xp1 = at.getShearX();
-            xp3 = at.getTranslateX();
-            yp0 = at.getShearY();
-            yp1 = at.getScaleY();
-            yp3 = at.getTranslateY();
-        } catch (java.awt.geom.NoninvertibleTransformException e) {
-            xp0 = xp1 = xp3 = yp0 = yp1 = yp3 = 0.0;
-        }
-
-        // assert rq.lock.isHeldByCurrentThread();
-        rq.ensureCapacityAndAlignment(68, 12);
-        RenderBuffer buf = rq.getBuffer();
-        buf.putInt(SET_TEXTURE_PAINT);
-        buf.putInt(useMask ? 1 : 0);
-        buf.putInt(filter ? 1 : 0);
-        buf.putLong(srcData.getNativeOps());
-        buf.putDouble(xp0).putDouble(xp1).putDouble(xp3);
-        buf.putDouble(yp0).putDouble(yp1).putDouble(yp3);
-    }
-
-/****************** Shared MultipleGradientPaint support ********************/
-
-    /**
-     * The maximum number of gradient &quot;stops&quot; supported by our native
-     * fragment shader implementations.
-     *
-     * This value has been empirically determined and capped to allow
-     * our native shaders to run on all shader-level graphics hardware,
-     * even on the older, more limited GPUs.  Even the oldest Nvidia
-     * hardware could handle 16, or even 32 fractions without any problem.
-     * But the first-generation boards from ATI would fall back into
-     * software mode (which is unusably slow) for values larger than 12;
-     * it appears that those boards do not have enough native registers
-     * to support the number of array accesses required by our gradient
-     * shaders.  So for now we will cap this value at 12, but we can
-     * re-evaluate this in the future as hardware becomes more capable.
-     */
-    @Native public static final int MULTI_MAX_FRACTIONS = 12;
-
-    /**
-     * Helper function to convert a color component in sRGB space to
-     * linear RGB space.  Copied directly from the
-     * MultipleGradientPaintContext class.
-     */
-    public static int convertSRGBtoLinearRGB(int color) {
-        float input, output;
-
-        input = color / 255.0f;
-        if (input &lt;= 0.04045f) {
-            output = input / 12.92f;
-        } else {
-            output = (float)Math.pow((input + 0.055) / 1.055, 2.4);
-        }
-
-        return Math.round(output * 255.0f);
-    }
-
-    /**
-     * Helper function to convert a (non-premultiplied) Color in sRGB
-     * space to an IntArgbPre pixel value, optionally in linear RGB space.
-     * Based on the PixelConverter.ArgbPre.rgbToPixel() method.
-     */
-    private static int colorToIntArgbPrePixel(Color c, boolean linear) {
-        int rgb = c.getRGB();
-        if (!linear &amp;&amp; ((rgb &gt;&gt; 24) == -1)) {
-            return rgb;
-        }
-        int a = rgb &gt;&gt;&gt; 24;
-        int r = (rgb &gt;&gt; 16) &amp; 0xff;
-        int g = (rgb &gt;&gt;  8) &amp; 0xff;
-        int b = (rgb      ) &amp; 0xff;
-        if (linear) {
-            r = convertSRGBtoLinearRGB(r);
-            g = convertSRGBtoLinearRGB(g);
-            b = convertSRGBtoLinearRGB(b);
-        }
-        int a2 = a + (a &gt;&gt; 7);
-        r = (r * a2) &gt;&gt; 8;
-        g = (g * a2) &gt;&gt; 8;
-        b = (b * a2) &gt;&gt; 8;
-        return ((a &lt;&lt; 24) | (r &lt;&lt; 16) | (g &lt;&lt; 8) | (b));
-    }
-
-    /**
-     * Converts the given array of Color objects into an int array
-     * containing IntArgbPre pixel values.  If the linear parameter
-     * is true, the Color values will be converted into a linear RGB
-     * color space before being returned.
-     */
-    private static int[] convertToIntArgbPrePixels(Color[] colors,
-                                                   boolean linear)
-    {
-        int[] pixels = new int[colors.length];
-        for (int i = 0; i &lt; colors.length; i++) {
-            pixels[i] = colorToIntArgbPrePixel(colors[i], linear);
-        }
-        return pixels;
-    }
-
-/********************** LinearGradientPaint support *************************/
-
-    /**
-     * This method uses techniques that are nearly identical to those
-     * employed in setGradientPaint() above.  The primary difference
-     * is that at the native level we use a fragment shader to manually
-     * apply the plane equation constants to the current fragment position
-     * to calculate the gradient position in the range [0,1] (the native
-     * code for GradientPaint does the same, except that it uses OpenGL's
-     * automatic texture coordinate generation facilities).
-     *
-     * One other minor difference worth mentioning is that
-     * setGradientPaint() calculates the plane equation constants
-     * such that the gradient end points are positioned at 0.25 and 0.75
-     * (for reasons discussed in the comments for that method).  In
-     * contrast, for LinearGradientPaint we setup the equation constants
-     * such that the gradient end points fall at 0.0 and 1.0.  The
-     * reason for this difference is that in the fragment shader we
-     * have more control over how the gradient values are interpreted
-     * (depending on the paint's CycleMethod).
-     */
-    private static void setLinearGradientPaint(RenderQueue rq,
-                                               SunGraphics2D sg2d,
-                                               LinearGradientPaint paint,
-                                               boolean useMask)
-    {
-        boolean linear =
-            (paint.getColorSpace() == ColorSpaceType.LINEAR_RGB);
-        Color[] colors = paint.getColors();
-        int numStops = colors.length;
-        Point2D pt1 = paint.getStartPoint();
-        Point2D pt2 = paint.getEndPoint();
-        AffineTransform at = paint.getTransform();
-        at.preConcatenate(sg2d.transform);
-
-        if (!linear &amp;&amp; numStops == 2 &amp;&amp;
-            paint.getCycleMethod() != CycleMethod.REPEAT)
-        {
-            // delegate to the optimized two-color gradient codepath
-            boolean isCyclic =
-                (paint.getCycleMethod() != CycleMethod.NO_CYCLE);
-            setGradientPaint(rq, at,
-                             colors[0], colors[1],
-                             pt1, pt2,
-                             isCyclic, useMask);
-            return;
-        }
-
-        int cycleMethod = paint.getCycleMethod().ordinal();
-        float[] fractions = paint.getFractions();
-        int[] pixels = convertToIntArgbPrePixels(colors, linear);
-
-        // calculate plane equation constants
-        double x = pt1.getX();
-        double y = pt1.getY();
-        at.translate(x, y);
-        // now gradient point 1 is at the origin
-        x = pt2.getX() - x;
-        y = pt2.getY() - y;
-        double len = Math.sqrt(x * x + y * y);
-        at.rotate(x, y);
-        // now gradient point 2 is on the positive x-axis
-        at.scale(len, 1);
-        // now gradient point 1 is at (0.0, 0), point 2 is at (1.0, 0)
-
-        float p0, p1, p3;
-        try {
-            at.invert();
-            p0 = (float)at.getScaleX();
-            p1 = (float)at.getShearX();
-            p3 = (float)at.getTranslateX();
-        } catch (java.awt.geom.NoninvertibleTransformException e) {
-            p0 = p1 = p3 = 0.0f;
-        }
-
-        // assert rq.lock.isHeldByCurrentThread();
-        rq.ensureCapacity(20 + 12 + (numStops*4*2));
-        RenderBuffer buf = rq.getBuffer();
-        buf.putInt(SET_LINEAR_GRADIENT_PAINT);
-        buf.putInt(useMask ? 1 : 0);
-        buf.putInt(linear  ? 1 : 0);
-        buf.putInt(cycleMethod);
-        buf.putInt(numStops);
-        buf.putFloat(p0);
-        buf.putFloat(p1);
-        buf.putFloat(p3);
-        buf.put(fractions);
-        buf.put(pixels);
-    }
-
-/********************** RadialGradientPaint support *************************/
-
-    /**
-     * This method calculates six m** values and a focusX value that
-     * are used by the native fragment shader.  These techniques are
-     * based on a whitepaper by Daniel Rice on radial gradient performance
-     * (attached to the bug report for 6521533).  One can refer to that
-     * document for the complete set of formulas and calculations, but
-     * the basic goal is to compose a transform that will convert an
-     * (x,y) position in device space into a &quot;u&quot; value that represents
-     * the relative distance to the gradient focus point.  The resulting
-     * value can be used to look up the appropriate color by linearly
-     * interpolating between the two nearest colors in the gradient.
-     */
-    private static void setRadialGradientPaint(RenderQueue rq,
-                                               SunGraphics2D sg2d,
-                                               RadialGradientPaint paint,
-                                               boolean useMask)
-    {
-        boolean linear =
-            (paint.getColorSpace() == ColorSpaceType.LINEAR_RGB);
-        int cycleMethod = paint.getCycleMethod().ordinal();
-        float[] fractions = paint.getFractions();
-        Color[] colors = paint.getColors();
-        int numStops = colors.length;
-        int[] pixels = convertToIntArgbPrePixels(colors, linear);
-        Point2D center = paint.getCenterPoint();
-        Point2D focus = paint.getFocusPoint();
-        float radius = paint.getRadius();
-
-        // save original (untransformed) center and focus points
-        double cx = center.getX();
-        double cy = center.getY();
-        double fx = focus.getX();
-        double fy = focus.getY();
-
-        // transform from gradient coords to device coords
-        AffineTransform at = paint.getTransform();
-        at.preConcatenate(sg2d.transform);
-        focus = at.transform(focus, focus);
-
-        // transform unit circle to gradient coords; we start with the
-        // unit circle (center=(0,0), focus on positive x-axis, radius=1)
-        // and then transform into gradient space
-        at.translate(cx, cy);
-        at.rotate(fx - cx, fy - cy);
-        at.scale(radius, radius);
-
-        // invert to get mapping from device coords to unit circle
-        try {
-            at.invert();
-        } catch (Exception e) {
-            at.setToScale(0.0, 0.0);
-        }
-        focus = at.transform(focus, focus);
-
-        // clamp the focus point so that it does not rest on, or outside
-        // of, the circumference of the gradient circle
-        fx = Math.min(focus.getX(), 0.99);
-
-        // assert rq.lock.isHeldByCurrentThread();
-        rq.ensureCapacity(20 + 28 + (numStops*4*2));
-        RenderBuffer buf = rq.getBuffer();
-        buf.putInt(SET_RADIAL_GRADIENT_PAINT);
-        buf.putInt(useMask ? 1 : 0);
-        buf.putInt(linear  ? 1 : 0);
-        buf.putInt(numStops);
-        buf.putInt(cycleMethod);
-        buf.putFloat((float)at.getScaleX());
-        buf.putFloat((float)at.getShearX());
-        buf.putFloat((float)at.getTranslateX());
-        buf.putFloat((float)at.getShearY());
-        buf.putFloat((float)at.getScaleY());
-        buf.putFloat((float)at.getTranslateY());
-        buf.putFloat((float)fx);
-        buf.put(fractions);
-        buf.put(pixels);
-    }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2007, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package sun.java2d.pipe;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.awt.Color;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.awt.GradientPaint;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.awt.LinearGradientPaint;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.awt.MultipleGradientPaint;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.awt.MultipleGradientPaint.ColorSpaceType;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.awt.MultipleGradientPaint.CycleMethod;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.awt.Paint;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import java.awt.RadialGradientPaint;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.awt.TexturePaint;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import java.awt.geom.AffineTransform;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import java.awt.geom.Point2D;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import java.awt.geom.Rectangle2D;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre>import java.awt.image.AffineTransformOp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre>import java.awt.image.BufferedImage;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>import sun.awt.image.PixelConverter;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>import sun.java2d.SunGraphics2D;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre>import sun.java2d.SurfaceData;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre>import sun.java2d.loops.CompositeType;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>import sun.java2d.loops.SurfaceType;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre>import static sun.java2d.pipe.BufferedOpCodes.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre>import java.lang.annotation.Native;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>public class BufferedPaints {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre>    static void setPaint(RenderQueue rq, SunGraphics2D sg2d,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre>                         Paint paint, int ctxflags)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre>        if (sg2d.paintState &lt;= SunGraphics2D.PAINT_ALPHACOLOR) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>            setColor(rq, sg2d.pixel);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre>            boolean useMask = (ctxflags &amp; BufferedContext.USE_MASK) != 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>            switch (sg2d.paintState) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>            case SunGraphics2D.PAINT_GRADIENT:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre>                setGradientPaint(rq, sg2d,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>                                 (GradientPaint)paint, useMask);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>            case SunGraphics2D.PAINT_LIN_GRADIENT:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>                setLinearGradientPaint(rq, sg2d,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>                                       (LinearGradientPaint)paint, useMask);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>            case SunGraphics2D.PAINT_RAD_GRADIENT:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>                setRadialGradientPaint(rq, sg2d,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>                                       (RadialGradientPaint)paint, useMask);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>            case SunGraphics2D.PAINT_TEXTURE:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>                setTexturePaint(rq, sg2d,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>                                (TexturePaint)paint, useMask);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>            default:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>    static void resetPaint(RenderQueue rq) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>        // assert rq.lock.isHeldByCurrentThread();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>        rq.ensureCapacity(4);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>        RenderBuffer buf = rq.getBuffer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>        buf.putInt(RESET_PAINT);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>/****************************** Color support *******************************/</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>    private static void setColor(RenderQueue rq, int pixel) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>        // assert rq.lock.isHeldByCurrentThread();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>        rq.ensureCapacity(8);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>        RenderBuffer buf = rq.getBuffer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>        buf.putInt(SET_COLOR);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>        buf.putInt(pixel);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>/************************* GradientPaint support ****************************/</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>     * Note: This code is factored out into a separate static method</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>     * so that it can be shared by both the Gradient and LinearGradient</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>     * implementations.  LinearGradient uses this code (for the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>     * two-color sRGB case only) because it can be much faster than the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>     * equivalent implementation that uses fragment shaders.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>     * We use OpenGL's texture coordinate generator to automatically</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>     * apply a smooth gradient (either cyclic or acyclic) to the geometry</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>     * being rendered.  This technique is almost identical to the one</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>     * described in the comments for BufferedPaints.setTexturePaint(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>     * except the calculations take place in one dimension instead of two.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>     * Instead of an anchor rectangle in the TexturePaint case, we use</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>     * the vector between the two GradientPaint end points in our</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>     * calculations.  The generator uses a single plane equation that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>     * takes the (x,y) location (in device space) of the fragment being</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>     * rendered to calculate a (u) texture coordinate for that fragment:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>     *     u = Ax + By + Cz + Dw</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>     * The gradient renderer uses a two-pixel 1D texture where the first</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>     * pixel contains the first GradientPaint color, and the second pixel</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>     * contains the second GradientPaint color.  (Note that we use the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>     * GL_CLAMP_TO_EDGE wrapping mode for acyclic gradients so that we</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>     * clamp the colors properly at the extremes.)  The following diagram</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>     * attempts to show the layout of the texture containing the two</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>     * GradientPaint colors (C1 and C2):</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>     *                        +-----------------+</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>     *                        |   C1   |   C2   |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>     *                        |        |        |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>     *                        +-----------------+</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>     *                      u=0  .25  .5   .75  1</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>     * We calculate our plane equation constants (A,B,D) such that u=0.25</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>     * corresponds to the first GradientPaint end point in user space and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>     * u=0.75 corresponds to the second end point.  This is somewhat</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>     * non-obvious, but since the gradient colors are generated by</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>     * interpolating between C1 and C2, we want the pure color at the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>     * end points, and we will get the pure color only when u correlates</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>     * to the center of a texel.  The following chart shows the expected</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>     * color for some sample values of u (where C' is the color halfway</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>     * between C1 and C2):</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>     *       u value      acyclic (GL_CLAMP)      cyclic (GL_REPEAT)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>     *       -------      ------------------      ------------------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>     *        -0.25              C1                       C2</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>     *         0.0               C1                       C'</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>     *         0.25              C1                       C1</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>     *         0.5               C'                       C'</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>     *         0.75              C2                       C2</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>     *         1.0               C2                       C'</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>     *         1.25              C2                       C1</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>     * Original inspiration for this technique came from UMD's Agile2D</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>     * project (GradientManager.java).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>    private static void setGradientPaint(RenderQueue rq, AffineTransform at,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>                                         Color c1, Color c2,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>                                         Point2D pt1, Point2D pt2,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>                                         boolean isCyclic, boolean useMask)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>        // convert gradient colors to IntArgbPre format</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>        PixelConverter pc = PixelConverter.ArgbPre.instance;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>        int pixel1 = pc.rgbToPixel(c1.getRGB(), null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>        int pixel2 = pc.rgbToPixel(c2.getRGB(), null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>        // calculate plane equation constants</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>        double x = pt1.getX();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>        double y = pt1.getY();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>        at.translate(x, y);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>        // now gradient point 1 is at the origin</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>        x = pt2.getX() - x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>        y = pt2.getY() - y;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>        double len = Math.sqrt(x * x + y * y);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>        at.rotate(x, y);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>        // now gradient point 2 is on the positive x-axis</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>        at.scale(2*len, 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>        // now gradient point 2 is at (0.5, 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>        at.translate(-0.25, 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>        // now gradient point 1 is at (0.25, 0), point 2 is at (0.75, 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>        double p0, p1, p3;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>            at.invert();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>            p0 = at.getScaleX();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>            p1 = at.getShearX();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>            p3 = at.getTranslateX();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>        } catch (java.awt.geom.NoninvertibleTransformException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>            p0 = p1 = p3 = 0.0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>        // assert rq.lock.isHeldByCurrentThread();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>        rq.ensureCapacityAndAlignment(44, 12);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>        RenderBuffer buf = rq.getBuffer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>        buf.putInt(SET_GRADIENT_PAINT);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>        buf.putInt(useMask ? 1 : 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>        buf.putInt(isCyclic ? 1 : 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>        buf.putDouble(p0).putDouble(p1).putDouble(p3);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>        buf.putInt(pixel1).putInt(pixel2);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>    private static void setGradientPaint(RenderQueue rq,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>                                         SunGraphics2D sg2d,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>                                         GradientPaint paint,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>                                         boolean useMask)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>        setGradientPaint(rq, (AffineTransform)sg2d.transform.clone(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>                         paint.getColor1(), paint.getColor2(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>                         paint.getPoint1(), paint.getPoint2(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>                         paint.isCyclic(), useMask);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>/************************** TexturePaint support ****************************/</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>     * We use OpenGL's texture coordinate generator to automatically</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>     * map the TexturePaint image to the geometry being rendered.  The</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>     * generator uses two separate plane equations that take the (x,y)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>     * location (in device space) of the fragment being rendered to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>     * calculate (u,v) texture coordinates for that fragment:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>     *     u = Ax + By + Cz + Dw</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>     *     v = Ex + Fy + Gz + Hw</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>     * Since we use a 2D orthographic projection, we can assume that z=0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>     * and w=1 for any fragment.  So we need to calculate appropriate</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>     * values for the plane equation constants (A,B,D) and (E,F,H) such</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>     * that {u,v}=0 for the top-left of the TexturePaint's anchor</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>     * rectangle and {u,v}=1 for the bottom-right of the anchor rectangle.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>     * We can easily make the texture image repeat for {u,v} values</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>     * outside the range [0,1] by specifying the GL_REPEAT texture wrap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>     * mode.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>     * Calculating the plane equation constants is surprisingly simple.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>     * We can think of it as an inverse matrix operation that takes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>     * device space coordinates and transforms them into user space</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>     * coordinates that correspond to a location relative to the anchor</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>     * rectangle.  First, we translate and scale the current user space</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>     * transform by applying the anchor rectangle bounds.  We then take</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>     * the inverse of this affine transform.  The rows of the resulting</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>     * inverse matrix correlate nicely to the plane equation constants</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>     * we were seeking.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>    private static void setTexturePaint(RenderQueue rq,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>                                        SunGraphics2D sg2d,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>                                        TexturePaint paint,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>                                        boolean useMask)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>        BufferedImage bi = paint.getImage();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>        SurfaceData dstData = sg2d.surfaceData;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>        SurfaceData srcData =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>            dstData.getSourceSurfaceData(bi, SunGraphics2D.TRANSFORM_ISIDENT,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>                                         CompositeType.SrcOver, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>        boolean filter =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>            (sg2d.interpolationType !=</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>             AffineTransformOp.TYPE_NEAREST_NEIGHBOR);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>        // calculate plane equation constants</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>        AffineTransform at = (AffineTransform)sg2d.transform.clone();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>        Rectangle2D anchor = paint.getAnchorRect();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>        at.translate(anchor.getX(), anchor.getY());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>        at.scale(anchor.getWidth(), anchor.getHeight());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>        double xp0, xp1, xp3, yp0, yp1, yp3;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>            at.invert();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>            xp0 = at.getScaleX();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>            xp1 = at.getShearX();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>            xp3 = at.getTranslateX();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>            yp0 = at.getShearY();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>            yp1 = at.getScaleY();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>            yp3 = at.getTranslateY();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>        } catch (java.awt.geom.NoninvertibleTransformException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>            xp0 = xp1 = xp3 = yp0 = yp1 = yp3 = 0.0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>        // assert rq.lock.isHeldByCurrentThread();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>        rq.ensureCapacityAndAlignment(68, 12);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>        RenderBuffer buf = rq.getBuffer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>        buf.putInt(SET_TEXTURE_PAINT);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>        buf.putInt(useMask ? 1 : 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>        buf.putInt(filter ? 1 : 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>        buf.putLong(srcData.getNativeOps());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>        buf.putDouble(xp0).putDouble(xp1).putDouble(xp3);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>        buf.putDouble(yp0).putDouble(yp1).putDouble(yp3);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>/****************** Shared MultipleGradientPaint support ********************/</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>     * The maximum number of gradient &quot;stops&quot; supported by our native</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>     * fragment shader implementations.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>     * This value has been empirically determined and capped to allow</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>     * our native shaders to run on all shader-level graphics hardware,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>     * even on the older, more limited GPUs.  Even the oldest Nvidia</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>     * hardware could handle 16, or even 32 fractions without any problem.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>     * But the first-generation boards from ATI would fall back into</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>     * software mode (which is unusably slow) for values larger than 12;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>     * it appears that those boards do not have enough native registers</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>     * to support the number of array accesses required by our gradient</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>     * shaders.  So for now we will cap this value at 12, but we can</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>     * re-evaluate this in the future as hardware becomes more capable.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>    @Native public static final int MULTI_MAX_FRACTIONS = 12;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>     * Helper function to convert a color component in sRGB space to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>     * linear RGB space.  Copied directly from the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>     * MultipleGradientPaintContext class.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>    public static int convertSRGBtoLinearRGB(int color) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>        float input, output;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>        input = color / 255.0f;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>        if (input &lt;= 0.04045f) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>            output = input / 12.92f;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>            output = (float)Math.pow((input + 0.055) / 1.055, 2.4);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>        return Math.round(output * 255.0f);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>     * Helper function to convert a (non-premultiplied) Color in sRGB</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>     * space to an IntArgbPre pixel value, optionally in linear RGB space.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>     * Based on the PixelConverter.ArgbPre.rgbToPixel() method.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>    private static int colorToIntArgbPrePixel(Color c, boolean linear) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>        int rgb = c.getRGB();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>        if (!linear &amp;&amp; ((rgb &gt;&gt; 24) == -1)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>            return rgb;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>        int a = rgb &gt;&gt;&gt; 24;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>        int r = (rgb &gt;&gt; 16) &amp; 0xff;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>        int g = (rgb &gt;&gt;  8) &amp; 0xff;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>        int b = (rgb      ) &amp; 0xff;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>        if (linear) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>            r = convertSRGBtoLinearRGB(r);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>            g = convertSRGBtoLinearRGB(g);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>            b = convertSRGBtoLinearRGB(b);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>        int a2 = a + (a &gt;&gt; 7);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>        r = (r * a2) &gt;&gt; 8;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>        g = (g * a2) &gt;&gt; 8;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>        b = (b * a2) &gt;&gt; 8;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>        return ((a &lt;&lt; 24) | (r &lt;&lt; 16) | (g &lt;&lt; 8) | (b));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>     * Converts the given array of Color objects into an int array</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>     * containing IntArgbPre pixel values.  If the linear parameter</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>     * is true, the Color values will be converted into a linear RGB</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>     * color space before being returned.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>    private static int[] convertToIntArgbPrePixels(Color[] colors,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>                                                   boolean linear)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>        int[] pixels = new int[colors.length];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; colors.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>            pixels[i] = colorToIntArgbPrePixel(colors[i], linear);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>        return pixels;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>/********************** LinearGradientPaint support *************************/</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>     * This method uses techniques that are nearly identical to those</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>     * employed in setGradientPaint() above.  The primary difference</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>     * is that at the native level we use a fragment shader to manually</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>     * apply the plane equation constants to the current fragment position</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>     * to calculate the gradient position in the range [0,1] (the native</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>     * code for GradientPaint does the same, except that it uses OpenGL's</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>     * automatic texture coordinate generation facilities).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>     * One other minor difference worth mentioning is that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>     * setGradientPaint() calculates the plane equation constants</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>     * such that the gradient end points are positioned at 0.25 and 0.75</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>     * (for reasons discussed in the comments for that method).  In</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>     * contrast, for LinearGradientPaint we setup the equation constants</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>     * such that the gradient end points fall at 0.0 and 1.0.  The</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>     * reason for this difference is that in the fragment shader we</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>     * have more control over how the gradient values are interpreted</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>     * (depending on the paint's CycleMethod).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>    private static void setLinearGradientPaint(RenderQueue rq,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>                                               SunGraphics2D sg2d,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>                                               LinearGradientPaint paint,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>                                               boolean useMask)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>        boolean linear =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>            (paint.getColorSpace() == ColorSpaceType.LINEAR_RGB);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>        Color[] colors = paint.getColors();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>        int numStops = colors.length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>        Point2D pt1 = paint.getStartPoint();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>        Point2D pt2 = paint.getEndPoint();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>        AffineTransform at = paint.getTransform();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>        at.preConcatenate(sg2d.transform);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>        if (!linear &amp;&amp; numStops == 2 &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>            paint.getCycleMethod() != CycleMethod.REPEAT)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>        {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>            // delegate to the optimized two-color gradient codepath</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>            boolean isCyclic =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>                (paint.getCycleMethod() != CycleMethod.NO_CYCLE);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>            setGradientPaint(rq, at,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>                             colors[0], colors[1],</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>                             pt1, pt2,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>                             isCyclic, useMask);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>        int cycleMethod = paint.getCycleMethod().ordinal();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>        float[] fractions = paint.getFractions();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>        int[] pixels = convertToIntArgbPrePixels(colors, linear);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>        // calculate plane equation constants</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>        double x = pt1.getX();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>        double y = pt1.getY();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>        at.translate(x, y);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>        // now gradient point 1 is at the origin</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>        x = pt2.getX() - x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>        y = pt2.getY() - y;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>        double len = Math.sqrt(x * x + y * y);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>        at.rotate(x, y);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>        // now gradient point 2 is on the positive x-axis</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>        at.scale(len, 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>        // now gradient point 1 is at (0.0, 0), point 2 is at (1.0, 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>        float p0, p1, p3;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>            at.invert();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>            p0 = (float)at.getScaleX();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>            p1 = (float)at.getShearX();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>            p3 = (float)at.getTranslateX();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>        } catch (java.awt.geom.NoninvertibleTransformException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>            p0 = p1 = p3 = 0.0f;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>        // assert rq.lock.isHeldByCurrentThread();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>        rq.ensureCapacity(20 + 12 + (numStops*4*2));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>        RenderBuffer buf = rq.getBuffer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>        buf.putInt(SET_LINEAR_GRADIENT_PAINT);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>        buf.putInt(useMask ? 1 : 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>        buf.putInt(linear  ? 1 : 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>        buf.putInt(cycleMethod);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>        buf.putInt(numStops);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>        buf.putFloat(p0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>        buf.putFloat(p1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>        buf.putFloat(p3);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>        buf.put(fractions);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>        buf.put(pixels);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>/********************** RadialGradientPaint support *************************/</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>     * This method calculates six m** values and a focusX value that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>     * are used by the native fragment shader.  These techniques are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>     * based on a whitepaper by Daniel Rice on radial gradient performance</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>     * (attached to the bug report for 6521533).  One can refer to that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>     * document for the complete set of formulas and calculations, but</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>     * the basic goal is to compose a transform that will convert an</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>     * (x,y) position in device space into a &quot;u&quot; value that represents</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>     * the relative distance to the gradient focus point.  The resulting</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>     * value can be used to look up the appropriate color by linearly</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>     * interpolating between the two nearest colors in the gradient.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>    private static void setRadialGradientPaint(RenderQueue rq,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>                                               SunGraphics2D sg2d,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>                                               RadialGradientPaint paint,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>                                               boolean useMask)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>        boolean linear =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>            (paint.getColorSpace() == ColorSpaceType.LINEAR_RGB);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>        int cycleMethod = paint.getCycleMethod().ordinal();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>        float[] fractions = paint.getFractions();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>        Color[] colors = paint.getColors();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>        int numStops = colors.length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>        int[] pixels = convertToIntArgbPrePixels(colors, linear);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>        Point2D center = paint.getCenterPoint();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>        Point2D focus = paint.getFocusPoint();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>        float radius = paint.getRadius();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>        // save original (untransformed) center and focus points</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>        double cx = center.getX();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>        double cy = center.getY();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>        double fx = focus.getX();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>        double fy = focus.getY();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>        // transform from gradient coords to device coords</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>        AffineTransform at = paint.getTransform();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>        at.preConcatenate(sg2d.transform);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>        focus = at.transform(focus, focus);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>        // transform unit circle to gradient coords; we start with the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>        // unit circle (center=(0,0), focus on positive x-axis, radius=1)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>        // and then transform into gradient space</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>        at.translate(cx, cy);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>        at.rotate(fx - cx, fy - cy);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>        at.scale(radius, radius);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>        // invert to get mapping from device coords to unit circle</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>            at.invert();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>            at.setToScale(0.0, 0.0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>        focus = at.transform(focus, focus);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>        // clamp the focus point so that it does not rest on, or outside</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>        // of, the circumference of the gradient circle</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>        fx = Math.min(focus.getX(), 0.99);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>        // assert rq.lock.isHeldByCurrentThread();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>        rq.ensureCapacity(20 + 28 + (numStops*4*2));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>        RenderBuffer buf = rq.getBuffer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>        buf.putInt(SET_RADIAL_GRADIENT_PAINT);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>        buf.putInt(useMask ? 1 : 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>        buf.putInt(linear  ? 1 : 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>        buf.putInt(numStops);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>        buf.putInt(cycleMethod);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>        buf.putFloat((float)at.getScaleX());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>        buf.putFloat((float)at.getShearX());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>        buf.putFloat((float)at.getTranslateX());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>        buf.putFloat((float)at.getShearY());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>        buf.putFloat((float)at.getScaleY());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>        buf.putFloat((float)at.getTranslateY());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>        buf.putFloat((float)fx);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>        buf.put(fractions);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>        buf.put(pixels);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

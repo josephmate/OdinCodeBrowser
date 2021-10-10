@@ -3,702 +3,2787 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2000, 2012, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package com.sun.jndi.dns;
-
-import java.io.IOException;
-import java.net.DatagramSocket;
-import java.net.DatagramPacket;
-import java.net.InetAddress;
-import java.net.Socket;
-import javax.naming.*;
-
-import java.util.Collections;
-import java.util.Map;
-import java.util.HashMap;
-import java.util.Set;
-import java.util.HashSet;
-
-// Some of this code began life as part of sun.javaos.net.DnsClient
-// originally by sritchie@eng 1/96.  It was first hacked up for JNDI
-// use by caveh@eng 6/97.
-
-
-/**
- * The DnsClient class performs DNS client operations in support of DnsContext.
- *
- */
-
-public class DnsClient {
-
-    // DNS packet header field offsets
-    private static final int IDENT_OFFSET = 0;
-    private static final int FLAGS_OFFSET = 2;
-    private static final int NUMQ_OFFSET  = 4;
-    private static final int NUMANS_OFFSET = 6;
-    private static final int NUMAUTH_OFFSET = 8;
-    private static final int NUMADD_OFFSET = 10;
-    private static final int DNS_HDR_SIZE = 12;
-
-    // DNS response codes
-    private static final int NO_ERROR       = 0;
-    private static final int FORMAT_ERROR   = 1;
-    private static final int SERVER_FAILURE = 2;
-    private static final int NAME_ERROR     = 3;
-    private static final int NOT_IMPL       = 4;
-    private static final int REFUSED        = 5;
-
-    private static final String[] rcodeDescription = {
-        &quot;No error&quot;,
-        &quot;DNS format error&quot;,
-        &quot;DNS server failure&quot;,
-        &quot;DNS name not found&quot;,
-        &quot;DNS operation not supported&quot;,
-        &quot;DNS service refused&quot;
-    };
-
-    private static final int DEFAULT_PORT = 53;
-    private InetAddress[] servers;
-    private int[] serverPorts;
-    private int timeout;                // initial timeout on UDP queries in ms
-    private int retries;                // number of UDP retries
-
-    private DatagramSocket udpSocket;
-
-    // Requests sent
-    private Set&lt;Integer&gt; reqs;
-
-    // Responses received
-    private Map&lt;Integer, byte[]&gt; resps;
-
-    //-------------------------------------------------------------------------
-
-    /*
-     * Each server is of the form &quot;server[:port]&quot;.  IPv6 literal host names
-     * include delimiting brackets.
-     * &quot;timeout&quot; is the initial timeout interval (in ms) for UDP queries,
-     * and &quot;retries&quot; gives the number of retries per server.
-     */
-    public DnsClient(String[] servers, int timeout, int retries)
-            throws NamingException {
-        this.timeout = timeout;
-        this.retries = retries;
-        try {
-            udpSocket = new DatagramSocket();
-        } catch (java.net.SocketException e) {
-            NamingException ne = new ConfigurationException();
-            ne.setRootCause(e);
-            throw ne;
-        }
-
-        this.servers = new InetAddress[servers.length];
-        serverPorts = new int[servers.length];
-
-        for (int i = 0; i &lt; servers.length; i++) {
-
-            // Is optional port given?
-            int colon = servers[i].indexOf(':',
-                                           servers[i].indexOf(']') + 1);
-
-            serverPorts[i] = (colon &lt; 0)
-                ? DEFAULT_PORT
-                : Integer.parseInt(servers[i].substring(colon + 1));
-            String server = (colon &lt; 0)
-                ? servers[i]
-                : servers[i].substring(0, colon);
-            try {
-                this.servers[i] = InetAddress.getByName(server);
-            } catch (java.net.UnknownHostException e) {
-                NamingException ne = new ConfigurationException(
-                        &quot;Unknown DNS server: &quot; + server);
-                ne.setRootCause(e);
-                throw ne;
-            }
-        }
-        reqs = Collections.synchronizedSet(new HashSet&lt;Integer&gt;());
-        resps = Collections.synchronizedMap(new HashMap&lt;Integer, byte[]&gt;());
-    }
-
-    protected void finalize() {
-        close();
-    }
-
-    // A lock to access the request and response queues in tandem.
-    private Object queuesLock = new Object();
-
-    public void close() {
-        udpSocket.close();
-        synchronized (queuesLock) {
-            reqs.clear();
-            resps.clear();
-        }
-    }
-
-
-    private int ident = 0;              // used to set the msg ID field
-    private Object identLock = new Object();
-
-    /*
-     * If recursion is true, recursion is requested on the query.
-     * If auth is true, only authoritative responses are accepted; other
-     * responses throw NameNotFoundException.
-     */
-    ResourceRecords query(DnsName fqdn, int qclass, int qtype,
-                          boolean recursion, boolean auth)
-            throws NamingException {
-
-        int xid;
-        synchronized (identLock) {
-            ident = 0xFFFF &amp; (ident + 1);
-            xid = ident;
-        }
-
-        // enqueue the outstanding request
-        reqs.add(xid);
-
-        Packet pkt = makeQueryPacket(fqdn, xid, qclass, qtype, recursion);
-
-        Exception caughtException = null;
-        boolean[] doNotRetry = new boolean[servers.length];
-
-        //
-        // The UDP retry strategy is to try the 1st server, and then
-        // each server in order. If no answer, double the timeout
-        // and try each server again.
-        //
-        for (int retry = 0; retry &lt; retries; retry++) {
-
-            // Try each name server.
-            for (int i = 0; i &lt; servers.length; i++) {
-                if (doNotRetry[i]) {
-                    continue;
-                }
-
-                // send the request packet and wait for a response.
-                try {
-                    if (debug) {
-                        dprint(&quot;SEND ID (&quot; + (retry + 1) + &quot;): &quot; + xid);
-                    }
-
-                    byte[] msg = null;
-                    msg = doUdpQuery(pkt, servers[i], serverPorts[i],
-                                        retry, xid);
-                    //
-                    // If the matching response is not got within the
-                    // given timeout, check if the response was enqueued
-                    // by some other thread, if not proceed with the next
-                    // server or retry.
-                    //
-                    if (msg == null) {
-                        if (resps.size() &gt; 0) {
-                            msg = lookupResponse(xid);
-                        }
-                        if (msg == null) { // try next server or retry
-                            continue;
-                        }
-                    }
-                    Header hdr = new Header(msg, msg.length);
-
-                    if (auth &amp;&amp; !hdr.authoritative) {
-                        caughtException = new NameNotFoundException(
-                                &quot;DNS response not authoritative&quot;);
-                        doNotRetry[i] = true;
-                        continue;
-                    }
-                    if (hdr.truncated) {    // message is truncated -- try TCP
-
-                        // Try each server, starting with the one that just
-                        // provided the truncated message.
-                        for (int j = 0; j &lt; servers.length; j++) {
-                            int ij = (i + j) % servers.length;
-                            if (doNotRetry[ij]) {
-                                continue;
-                            }
-                            try {
-                                Tcp tcp =
-                                    new Tcp(servers[ij], serverPorts[ij]);
-                                byte[] msg2;
-                                try {
-                                    msg2 = doTcpQuery(tcp, pkt);
-                                } finally {
-                                    tcp.close();
-                                }
-                                Header hdr2 = new Header(msg2, msg2.length);
-                                if (hdr2.query) {
-                                    throw new CommunicationException(
-                                        &quot;DNS error: expecting response&quot;);
-                                }
-                                checkResponseCode(hdr2);
-
-                                if (!auth || hdr2.authoritative) {
-                                    // Got a valid response
-                                    hdr = hdr2;
-                                    msg = msg2;
-                                    break;
-                                } else {
-                                    doNotRetry[ij] = true;
-                                }
-                            } catch (Exception e) {
-                                // Try next server, or use UDP response
-                            }
-                        } // servers
-                    }
-                    return new ResourceRecords(msg, msg.length, hdr, false);
-
-                } catch (IOException e) {
-                    if (debug) {
-                        dprint(&quot;Caught IOException:&quot; + e);
-                    }
-                    if (caughtException == null) {
-                        caughtException = e;
-                    }
-                    // Use reflection to allow pre-1.4 compilation.
-                    // This won't be needed much longer.
-                    if (e.getClass().getName().equals(
-                            &quot;java.net.PortUnreachableException&quot;)) {
-                        doNotRetry[i] = true;
-                    }
-                } catch (NameNotFoundException e) {
-                    throw e;
-                } catch (CommunicationException e) {
-                    if (caughtException == null) {
-                        caughtException = e;
-                    }
-                } catch (NamingException e) {
-                    if (caughtException == null) {
-                        caughtException = e;
-                    }
-                    doNotRetry[i] = true;
-                }
-            } // servers
-        } // retries
-
-        reqs.remove(xid);
-        if (caughtException instanceof NamingException) {
-            throw (NamingException) caughtException;
-        }
-        // A network timeout or other error occurred.
-        NamingException ne = new CommunicationException(&quot;DNS error&quot;);
-        ne.setRootCause(caughtException);
-        throw ne;
-    }
-
-    ResourceRecords queryZone(DnsName zone, int qclass, boolean recursion)
-            throws NamingException {
-
-        int xid;
-        synchronized (identLock) {
-            ident = 0xFFFF &amp; (ident + 1);
-            xid = ident;
-        }
-        Packet pkt = makeQueryPacket(zone, xid, qclass,
-                                     ResourceRecord.QTYPE_AXFR, recursion);
-        Exception caughtException = null;
-
-        // Try each name server.
-        for (int i = 0; i &lt; servers.length; i++) {
-            try {
-                Tcp tcp = new Tcp(servers[i], serverPorts[i]);
-                byte[] msg;
-                try {
-                    msg = doTcpQuery(tcp, pkt);
-                    Header hdr = new Header(msg, msg.length);
-                    // Check only rcode as per
-                    // draft-ietf-dnsext-axfr-clarify-04
-                    checkResponseCode(hdr);
-                    ResourceRecords rrs =
-                        new ResourceRecords(msg, msg.length, hdr, true);
-                    if (rrs.getFirstAnsType() != ResourceRecord.TYPE_SOA) {
-                        throw new CommunicationException(
-                                &quot;DNS error: zone xfer doesn't begin with SOA&quot;);
-                    }
-
-                    if (rrs.answer.size() == 1 ||
-                            rrs.getLastAnsType() != ResourceRecord.TYPE_SOA) {
-                        // The response is split into multiple DNS messages.
-                        do {
-                            msg = continueTcpQuery(tcp);
-                            if (msg == null) {
-                                throw new CommunicationException(
-                                        &quot;DNS error: incomplete zone transfer&quot;);
-                            }
-                            hdr = new Header(msg, msg.length);
-                            checkResponseCode(hdr);
-                            rrs.add(msg, msg.length, hdr);
-                        } while (rrs.getLastAnsType() !=
-                                 ResourceRecord.TYPE_SOA);
-                    }
-
-                    // Delete the duplicate SOA record.
-                    rrs.answer.removeElementAt(rrs.answer.size() - 1);
-                    return rrs;
-
-                } finally {
-                    tcp.close();
-                }
-
-            } catch (IOException e) {
-                caughtException = e;
-            } catch (NameNotFoundException e) {
-                throw e;
-            } catch (NamingException e) {
-                caughtException = e;
-            }
-        }
-        if (caughtException instanceof NamingException) {
-            throw (NamingException) caughtException;
-        }
-        NamingException ne = new CommunicationException(
-                &quot;DNS error during zone transfer&quot;);
-        ne.setRootCause(caughtException);
-        throw ne;
-    }
-
-
-    /**
-     * Tries to retreive an UDP packet matching the given xid
-     * received within the timeout.
-     * If a packet with different xid is received, the received packet
-     * is enqueued with the corresponding xid in 'resps'.
-     */
-    private byte[] doUdpQuery(Packet pkt, InetAddress server,
-                                     int port, int retry, int xid)
-            throws IOException, NamingException {
-
-        int minTimeout = 50; // msec after which there are no retries.
-
-        synchronized (udpSocket) {
-            DatagramPacket opkt = new DatagramPacket(
-                    pkt.getData(), pkt.length(), server, port);
-            DatagramPacket ipkt = new DatagramPacket(new byte[8000], 8000);
-            udpSocket.connect(server, port);
-            int pktTimeout = (timeout * (1 &lt;&lt; retry));
-            try {
-                udpSocket.send(opkt);
-
-                // timeout remaining after successive 'receive()'
-                int timeoutLeft = pktTimeout;
-                int cnt = 0;
-                do {
-                    if (debug) {
-                       cnt++;
-                        dprint(&quot;Trying RECEIVE(&quot; +
-                                cnt + &quot;) retry(&quot; + (retry + 1) +
-                                &quot;) for:&quot; + xid  + &quot;    sock-timeout:&quot; +
-                                timeoutLeft + &quot; ms.&quot;);
-                    }
-                    udpSocket.setSoTimeout(timeoutLeft);
-                    long start = System.currentTimeMillis();
-                    udpSocket.receive(ipkt);
-                    long end = System.currentTimeMillis();
-
-                    byte[] data = new byte[ipkt.getLength()];
-                    data = ipkt.getData();
-                    if (isMatchResponse(data, xid)) {
-                        return data;
-                    }
-                    timeoutLeft = pktTimeout - ((int) (end - start));
-                } while (timeoutLeft &gt; minTimeout);
-
-            } finally {
-                udpSocket.disconnect();
-            }
-            return null; // no matching packet received within the timeout
-        }
-    }
-
-    /*
-     * Sends a TCP query, and returns the first DNS message in the response.
-     */
-    private byte[] doTcpQuery(Tcp tcp, Packet pkt) throws IOException {
-
-        int len = pkt.length();
-        // Send 2-byte message length, then send message.
-        tcp.out.write(len &gt;&gt; 8);
-        tcp.out.write(len);
-        tcp.out.write(pkt.getData(), 0, len);
-        tcp.out.flush();
-
-        byte[] msg = continueTcpQuery(tcp);
-        if (msg == null) {
-            throw new IOException(&quot;DNS error: no response&quot;);
-        }
-        return msg;
-    }
-
-    /*
-     * Returns the next DNS message from the TCP socket, or null on EOF.
-     */
-    private byte[] continueTcpQuery(Tcp tcp) throws IOException {
-
-        int lenHi = tcp.in.read();      // high-order byte of response length
-        if (lenHi == -1) {
-            return null;        // EOF
-        }
-        int lenLo = tcp.in.read();      // low-order byte of response length
-        if (lenLo == -1) {
-            throw new IOException(&quot;Corrupted DNS response: bad length&quot;);
-        }
-        int len = (lenHi &lt;&lt; 8) | lenLo;
-        byte[] msg = new byte[len];
-        int pos = 0;                    // next unfilled position in msg
-        while (len &gt; 0) {
-            int n = tcp.in.read(msg, pos, len);
-            if (n == -1) {
-                throw new IOException(
-                        &quot;Corrupted DNS response: too little data&quot;);
-            }
-            len -= n;
-            pos += n;
-        }
-        return msg;
-    }
-
-    private Packet makeQueryPacket(DnsName fqdn, int xid,
-                                   int qclass, int qtype, boolean recursion) {
-        int qnameLen = fqdn.getOctets();
-        int pktLen = DNS_HDR_SIZE + qnameLen + 4;
-        Packet pkt = new Packet(pktLen);
-
-        short flags = recursion ? Header.RD_BIT : 0;
-
-        pkt.putShort(xid, IDENT_OFFSET);
-        pkt.putShort(flags, FLAGS_OFFSET);
-        pkt.putShort(1, NUMQ_OFFSET);
-        pkt.putShort(0, NUMANS_OFFSET);
-        pkt.putInt(0, NUMAUTH_OFFSET);
-
-        makeQueryName(fqdn, pkt, DNS_HDR_SIZE);
-        pkt.putShort(qtype, DNS_HDR_SIZE + qnameLen);
-        pkt.putShort(qclass, DNS_HDR_SIZE + qnameLen + 2);
-
-        return pkt;
-    }
-
-    // Builds a query name in pkt according to the RFC spec.
-    private void makeQueryName(DnsName fqdn, Packet pkt, int off) {
-
-        // Loop through labels, least-significant first.
-        for (int i = fqdn.size() - 1; i &gt;= 0; i--) {
-            String label = fqdn.get(i);
-            int len = label.length();
-
-            pkt.putByte(len, off++);
-            for (int j = 0; j &lt; len; j++) {
-                pkt.putByte(label.charAt(j), off++);
-            }
-        }
-        if (!fqdn.hasRootLabel()) {
-            pkt.putByte(0, off);
-        }
-    }
-
-    //-------------------------------------------------------------------------
-
-    private byte[] lookupResponse(Integer xid) throws NamingException {
-        //
-        // Check the queued responses: some other thread in between
-        // received the response for this request.
-        //
-        if (debug) {
-            dprint(&quot;LOOKUP for: &quot; + xid +
-                &quot;\tResponse Q:&quot; + resps);
-        }
-        byte[] pkt;
-        if ((pkt = resps.get(xid)) != null) {
-            checkResponseCode(new Header(pkt, pkt.length));
-            synchronized (queuesLock) {
-                resps.remove(xid);
-                reqs.remove(xid);
-            }
-
-            if (debug) {
-                dprint(&quot;FOUND (&quot; + Thread.currentThread() +
-                    &quot;) for:&quot; + xid);
-            }
-        }
-        return pkt;
-    }
-
-    /*
-     * Checks the header of an incoming DNS response.
-     * Returns true if it matches the given xid and throws a naming
-     * exception, if appropriate, based on the response code.
-     */
-    private boolean isMatchResponse(byte[] pkt, int xid)
-                throws NamingException {
-
-        Header hdr = new Header(pkt, pkt.length);
-        if (hdr.query) {
-            throw new CommunicationException(&quot;DNS error: expecting response&quot;);
-        }
-
-        if (!reqs.contains(xid)) { // already received, ignore the response
-            return false;
-        }
-
-        // common case- the request sent matches the subsequent response read
-        if (hdr.xid == xid) {
-            if (debug) {
-                dprint(&quot;XID MATCH:&quot; + xid);
-            }
-
-            checkResponseCode(hdr);
-            // remove the response for the xid if received by some other thread.
-            synchronized (queuesLock) {
-                resps.remove(xid);
-                reqs.remove(xid);
-            }
-            return true;
-        }
-
-        //
-        // xid mis-match: enqueue the response, it may belong to some other
-        // thread that has not yet had a chance to read its response.
-        // enqueue only the first response, responses for retries are ignored.
-        //
-        synchronized (queuesLock) {
-            if (reqs.contains(hdr.xid)) { // enqueue only the first response
-                resps.put(hdr.xid, pkt);
-            }
-        }
-
-        if (debug) {
-            dprint(&quot;NO-MATCH SEND ID:&quot; +
-                                xid + &quot; RECVD ID:&quot; + hdr.xid +
-                                &quot;    Response Q:&quot; + resps +
-                                &quot;    Reqs size:&quot; + reqs.size());
-        }
-        return false;
-    }
-
-    /*
-     * Throws an exception if appropriate for the response code of a
-     * given header.
-     */
-    private void checkResponseCode(Header hdr) throws NamingException {
-
-        int rcode = hdr.rcode;
-        if (rcode == NO_ERROR) {
-            return;
-        }
-        String msg = (rcode &lt; rcodeDescription.length)
-            ? rcodeDescription[rcode]
-            : &quot;DNS error&quot;;
-        msg += &quot; [response code &quot; + rcode + &quot;]&quot;;
-
-        switch (rcode) {
-        case SERVER_FAILURE:
-            throw new ServiceUnavailableException(msg);
-        case NAME_ERROR:
-            throw new NameNotFoundException(msg);
-        case NOT_IMPL:
-        case REFUSED:
-            throw new OperationNotSupportedException(msg);
-        case FORMAT_ERROR:
-        default:
-            throw new NamingException(msg);
-        }
-    }
-
-    //-------------------------------------------------------------------------
-
-    private static final boolean debug = false;
-
-    private static void dprint(String mess) {
-        if (debug) {
-            System.err.println(&quot;DNS: &quot; + mess);
-        }
-    }
-
-}
-
-class Tcp {
-
-    private Socket sock;
-    java.io.InputStream in;
-    java.io.OutputStream out;
-
-    Tcp(InetAddress server, int port) throws IOException {
-        sock = new Socket(server, port);
-        sock.setTcpNoDelay(true);
-        out = new java.io.BufferedOutputStream(sock.getOutputStream());
-        in = new java.io.BufferedInputStream(sock.getInputStream());
-    }
-
-    void close() throws IOException {
-        sock.close();
-    }
-}
-
-/*
- * javaos emulation -cj
- */
-class Packet {
-        byte buf[];
-
-        Packet(int len) {
-                buf = new byte[len];
-        }
-
-        Packet(byte data[], int len) {
-                buf = new byte[len];
-                System.arraycopy(data, 0, buf, 0, len);
-        }
-
-        void putInt(int x, int off) {
-                buf[off + 0] = (byte)(x &gt;&gt; 24);
-                buf[off + 1] = (byte)(x &gt;&gt; 16);
-                buf[off + 2] = (byte)(x &gt;&gt; 8);
-                buf[off + 3] = (byte)x;
-        }
-
-        void putShort(int x, int off) {
-                buf[off + 0] = (byte)(x &gt;&gt; 8);
-                buf[off + 1] = (byte)x;
-        }
-
-        void putByte(int x, int off) {
-                buf[off] = (byte)x;
-        }
-
-        void putBytes(byte src[], int src_offset, int dst_offset, int len) {
-                System.arraycopy(src, src_offset, buf, dst_offset, len);
-        }
-
-        int length() {
-                return buf.length;
-        }
-
-        byte[] getData() {
-                return buf;
-        }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2000, 2012, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package com.sun.jndi.dns;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.io.IOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.net.DatagramSocket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.net.DatagramPacket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.net.InetAddress;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.net.Socket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import javax.naming.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import java.util.Collections;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.util.Map;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import java.util.HashMap;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import java.util.Set;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import java.util.HashSet;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre>// Some of this code began life as part of sun.javaos.net.DnsClient</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>// originally by sritchie@eng 1/96.  It was first hacked up for JNDI</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>// use by caveh@eng 6/97.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre> * The DnsClient class performs DNS client operations in support of DnsContext.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>public class DnsClient {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre>    // DNS packet header field offsets</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre>    private static final int IDENT_OFFSET = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>    private static final int FLAGS_OFFSET = 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre>    private static final int NUMQ_OFFSET  = 4;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>    private static final int NUMANS_OFFSET = 6;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>    private static final int NUMAUTH_OFFSET = 8;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre>    private static final int NUMADD_OFFSET = 10;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>    private static final int DNS_HDR_SIZE = 12;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre>    // DNS response codes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>    private static final int NO_ERROR       = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>    private static final int FORMAT_ERROR   = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>    private static final int SERVER_FAILURE = 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>    private static final int NAME_ERROR     = 3;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>    private static final int NOT_IMPL       = 4;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>    private static final int REFUSED        = 5;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>    private static final String[] rcodeDescription = {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>        &quot;No error&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>        &quot;DNS format error&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>        &quot;DNS server failure&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>        &quot;DNS name not found&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>        &quot;DNS operation not supported&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>        &quot;DNS service refused&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>    };</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>    private static final int DEFAULT_PORT = 53;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>    private InetAddress[] servers;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>    private int[] serverPorts;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>    private int timeout;                // initial timeout on UDP queries in ms</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>    private int retries;                // number of UDP retries</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>    private DatagramSocket udpSocket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>    // Requests sent</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>    private Set&lt;Integer&gt; reqs;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>    // Responses received</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>    private Map&lt;Integer, byte[]&gt; resps;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>    //-------------------------------------------------------------------------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>     * Each server is of the form &quot;server[:port]&quot;.  IPv6 literal host names</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>     * include delimiting brackets.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>     * &quot;timeout&quot; is the initial timeout interval (in ms) for UDP queries,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>     * and &quot;retries&quot; gives the number of retries per server.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>    public DnsClient(String[] servers, int timeout, int retries)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>        this.timeout = timeout;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>        this.retries = retries;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>            udpSocket = new DatagramSocket();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>        } catch (java.net.SocketException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>            NamingException ne = new ConfigurationException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>            ne.setRootCause(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>            throw ne;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>        this.servers = new InetAddress[servers.length];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>        serverPorts = new int[servers.length];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; servers.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>            // Is optional port given?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>            int colon = servers[i].indexOf(':',</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>                                           servers[i].indexOf(']') + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>            serverPorts[i] = (colon &lt; 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>                ? DEFAULT_PORT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>                : Integer.parseInt(servers[i].substring(colon + 1));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>            String server = (colon &lt; 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>                ? servers[i]</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>                : servers[i].substring(0, colon);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>                this.servers[i] = InetAddress.getByName(server);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>            } catch (java.net.UnknownHostException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>                NamingException ne = new ConfigurationException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>                        &quot;Unknown DNS server: &quot; + server);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>                ne.setRootCause(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>                throw ne;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>        reqs = Collections.synchronizedSet(new HashSet&lt;Integer&gt;());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>        resps = Collections.synchronizedMap(new HashMap&lt;Integer, byte[]&gt;());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>    protected void finalize() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>        close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>    // A lock to access the request and response queues in tandem.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>    private Object queuesLock = new Object();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>    public void close() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>        udpSocket.close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>        synchronized (queuesLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>            reqs.clear();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>            resps.clear();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>    private int ident = 0;              // used to set the msg ID field</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>    private Object identLock = new Object();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>     * If recursion is true, recursion is requested on the query.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>     * If auth is true, only authoritative responses are accepted; other</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>     * responses throw NameNotFoundException.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>    ResourceRecords query(DnsName fqdn, int qclass, int qtype,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>                          boolean recursion, boolean auth)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>        int xid;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>        synchronized (identLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>            ident = 0xFFFF &amp; (ident + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>            xid = ident;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>        // enqueue the outstanding request</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>        reqs.add(xid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>        Packet pkt = makeQueryPacket(fqdn, xid, qclass, qtype, recursion);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>        Exception caughtException = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>        boolean[] doNotRetry = new boolean[servers.length];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>        // The UDP retry strategy is to try the 1st server, and then</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>        // each server in order. If no answer, double the timeout</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>        // and try each server again.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>        for (int retry = 0; retry &lt; retries; retry++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>            // Try each name server.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>            for (int i = 0; i &lt; servers.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>                if (doNotRetry[i]) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>                    continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>                // send the request packet and wait for a response.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>                    if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>                        dprint(&quot;SEND ID (&quot; + (retry + 1) + &quot;): &quot; + xid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>                    byte[] msg = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>                    msg = doUdpQuery(pkt, servers[i], serverPorts[i],</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>                                        retry, xid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>                    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>                    // If the matching response is not got within the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>                    // given timeout, check if the response was enqueued</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>                    // by some other thread, if not proceed with the next</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>                    // server or retry.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>                    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>                    if (msg == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>                        if (resps.size() &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>                            msg = lookupResponse(xid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>                        if (msg == null) { // try next server or retry</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>                            continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>                    Header hdr = new Header(msg, msg.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>                    if (auth &amp;&amp; !hdr.authoritative) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>                        caughtException = new NameNotFoundException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>                                &quot;DNS response not authoritative&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>                        doNotRetry[i] = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>                        continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>                    if (hdr.truncated) {    // message is truncated -- try TCP</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>                        // Try each server, starting with the one that just</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>                        // provided the truncated message.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>                        for (int j = 0; j &lt; servers.length; j++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>                            int ij = (i + j) % servers.length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>                            if (doNotRetry[ij]) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>                                continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>                            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>                                Tcp tcp =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>                                    new Tcp(servers[ij], serverPorts[ij]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>                                byte[] msg2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>                                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>                                    msg2 = doTcpQuery(tcp, pkt);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>                                } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>                                    tcp.close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>                                Header hdr2 = new Header(msg2, msg2.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>                                if (hdr2.query) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>                                    throw new CommunicationException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>                                        &quot;DNS error: expecting response&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>                                checkResponseCode(hdr2);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>                                if (!auth || hdr2.authoritative) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>                                    // Got a valid response</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>                                    hdr = hdr2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>                                    msg = msg2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>                                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>                                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>                                    doNotRetry[ij] = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>                            } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>                                // Try next server, or use UDP response</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>                        } // servers</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>                    return new ResourceRecords(msg, msg.length, hdr, false);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>                } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>                    if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>                        dprint(&quot;Caught IOException:&quot; + e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>                    if (caughtException == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>                        caughtException = e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>                    // Use reflection to allow pre-1.4 compilation.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>                    // This won't be needed much longer.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>                    if (e.getClass().getName().equals(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>                            &quot;java.net.PortUnreachableException&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>                        doNotRetry[i] = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>                } catch (NameNotFoundException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>                    throw e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>                } catch (CommunicationException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>                    if (caughtException == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>                        caughtException = e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>                } catch (NamingException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>                    if (caughtException == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>                        caughtException = e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>                    doNotRetry[i] = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>            } // servers</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>        } // retries</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>        reqs.remove(xid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>        if (caughtException instanceof NamingException) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>            throw (NamingException) caughtException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>        // A network timeout or other error occurred.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>        NamingException ne = new CommunicationException(&quot;DNS error&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>        ne.setRootCause(caughtException);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>        throw ne;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>    ResourceRecords queryZone(DnsName zone, int qclass, boolean recursion)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>        int xid;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>        synchronized (identLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>            ident = 0xFFFF &amp; (ident + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>            xid = ident;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>        Packet pkt = makeQueryPacket(zone, xid, qclass,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>                                     ResourceRecord.QTYPE_AXFR, recursion);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>        Exception caughtException = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>        // Try each name server.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; servers.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>                Tcp tcp = new Tcp(servers[i], serverPorts[i]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>                byte[] msg;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>                    msg = doTcpQuery(tcp, pkt);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>                    Header hdr = new Header(msg, msg.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>                    // Check only rcode as per</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>                    // draft-ietf-dnsext-axfr-clarify-04</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>                    checkResponseCode(hdr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>                    ResourceRecords rrs =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>                        new ResourceRecords(msg, msg.length, hdr, true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>                    if (rrs.getFirstAnsType() != ResourceRecord.TYPE_SOA) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>                        throw new CommunicationException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>                                &quot;DNS error: zone xfer doesn't begin with SOA&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>                    if (rrs.answer.size() == 1 ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>                            rrs.getLastAnsType() != ResourceRecord.TYPE_SOA) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>                        // The response is split into multiple DNS messages.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>                        do {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>                            msg = continueTcpQuery(tcp);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>                            if (msg == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>                                throw new CommunicationException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>                                        &quot;DNS error: incomplete zone transfer&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>                            hdr = new Header(msg, msg.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>                            checkResponseCode(hdr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>                            rrs.add(msg, msg.length, hdr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>                        } while (rrs.getLastAnsType() !=</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>                                 ResourceRecord.TYPE_SOA);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>                    // Delete the duplicate SOA record.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>                    rrs.answer.removeElementAt(rrs.answer.size() - 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>                    return rrs;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>                } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>                    tcp.close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>            } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>                caughtException = e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>            } catch (NameNotFoundException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>                throw e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>            } catch (NamingException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>                caughtException = e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>        if (caughtException instanceof NamingException) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>            throw (NamingException) caughtException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>        NamingException ne = new CommunicationException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>                &quot;DNS error during zone transfer&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>        ne.setRootCause(caughtException);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>        throw ne;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>     * Tries to retreive an UDP packet matching the given xid</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>     * received within the timeout.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>     * If a packet with different xid is received, the received packet</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>     * is enqueued with the corresponding xid in 'resps'.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>    private byte[] doUdpQuery(Packet pkt, InetAddress server,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>                                     int port, int retry, int xid)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>            throws IOException, NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>        int minTimeout = 50; // msec after which there are no retries.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>        synchronized (udpSocket) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>            DatagramPacket opkt = new DatagramPacket(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>                    pkt.getData(), pkt.length(), server, port);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>            DatagramPacket ipkt = new DatagramPacket(new byte[8000], 8000);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>            udpSocket.connect(server, port);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>            int pktTimeout = (timeout * (1 &lt;&lt; retry));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>                udpSocket.send(opkt);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>                // timeout remaining after successive 'receive()'</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>                int timeoutLeft = pktTimeout;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>                int cnt = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>                do {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>                    if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>                       cnt++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>                        dprint(&quot;Trying RECEIVE(&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>                                cnt + &quot;) retry(&quot; + (retry + 1) +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>                                &quot;) for:&quot; + xid  + &quot;    sock-timeout:&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>                                timeoutLeft + &quot; ms.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>                    udpSocket.setSoTimeout(timeoutLeft);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>                    long start = System.currentTimeMillis();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>                    udpSocket.receive(ipkt);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>                    long end = System.currentTimeMillis();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>                    byte[] data = new byte[ipkt.getLength()];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>                    data = ipkt.getData();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>                    if (isMatchResponse(data, xid)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>                        return data;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>                    timeoutLeft = pktTimeout - ((int) (end - start));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>                } while (timeoutLeft &gt; minTimeout);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>            } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>                udpSocket.disconnect();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>            return null; // no matching packet received within the timeout</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>     * Sends a TCP query, and returns the first DNS message in the response.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>    private byte[] doTcpQuery(Tcp tcp, Packet pkt) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>        int len = pkt.length();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>        // Send 2-byte message length, then send message.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>        tcp.out.write(len &gt;&gt; 8);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>        tcp.out.write(len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>        tcp.out.write(pkt.getData(), 0, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>        tcp.out.flush();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>        byte[] msg = continueTcpQuery(tcp);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>        if (msg == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>            throw new IOException(&quot;DNS error: no response&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>        return msg;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>     * Returns the next DNS message from the TCP socket, or null on EOF.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>    private byte[] continueTcpQuery(Tcp tcp) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>        int lenHi = tcp.in.read();      // high-order byte of response length</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>        if (lenHi == -1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>            return null;        // EOF</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>        int lenLo = tcp.in.read();      // low-order byte of response length</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>        if (lenLo == -1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>            throw new IOException(&quot;Corrupted DNS response: bad length&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>        int len = (lenHi &lt;&lt; 8) | lenLo;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>        byte[] msg = new byte[len];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>        int pos = 0;                    // next unfilled position in msg</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>        while (len &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>            int n = tcp.in.read(msg, pos, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>            if (n == -1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>                throw new IOException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>                        &quot;Corrupted DNS response: too little data&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>            len -= n;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>            pos += n;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>        return msg;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>    private Packet makeQueryPacket(DnsName fqdn, int xid,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>                                   int qclass, int qtype, boolean recursion) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>        int qnameLen = fqdn.getOctets();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>        int pktLen = DNS_HDR_SIZE + qnameLen + 4;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>        Packet pkt = new Packet(pktLen);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>        short flags = recursion ? Header.RD_BIT : 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>        pkt.putShort(xid, IDENT_OFFSET);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>        pkt.putShort(flags, FLAGS_OFFSET);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>        pkt.putShort(1, NUMQ_OFFSET);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>        pkt.putShort(0, NUMANS_OFFSET);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>        pkt.putInt(0, NUMAUTH_OFFSET);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>        makeQueryName(fqdn, pkt, DNS_HDR_SIZE);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>        pkt.putShort(qtype, DNS_HDR_SIZE + qnameLen);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>        pkt.putShort(qclass, DNS_HDR_SIZE + qnameLen + 2);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>        return pkt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>    // Builds a query name in pkt according to the RFC spec.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>    private void makeQueryName(DnsName fqdn, Packet pkt, int off) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>        // Loop through labels, least-significant first.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>        for (int i = fqdn.size() - 1; i &gt;= 0; i--) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>            String label = fqdn.get(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>            int len = label.length();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>            pkt.putByte(len, off++);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>            for (int j = 0; j &lt; len; j++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>                pkt.putByte(label.charAt(j), off++);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>        if (!fqdn.hasRootLabel()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>            pkt.putByte(0, off);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>    //-------------------------------------------------------------------------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>    private byte[] lookupResponse(Integer xid) throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>        // Check the queued responses: some other thread in between</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>        // received the response for this request.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>        if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>            dprint(&quot;LOOKUP for: &quot; + xid +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>                &quot;\tResponse Q:&quot; + resps);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>        byte[] pkt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>        if ((pkt = resps.get(xid)) != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>            checkResponseCode(new Header(pkt, pkt.length));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>            synchronized (queuesLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>                resps.remove(xid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>                reqs.remove(xid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>            if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>                dprint(&quot;FOUND (&quot; + Thread.currentThread() +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>                    &quot;) for:&quot; + xid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>        return pkt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>     * Checks the header of an incoming DNS response.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>     * Returns true if it matches the given xid and throws a naming</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre>     * exception, if appropriate, based on the response code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>    private boolean isMatchResponse(byte[] pkt, int xid)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>                throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>        Header hdr = new Header(pkt, pkt.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>        if (hdr.query) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>            throw new CommunicationException(&quot;DNS error: expecting response&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>        if (!reqs.contains(xid)) { // already received, ignore the response</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>            return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>        // common case- the request sent matches the subsequent response read</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>        if (hdr.xid == xid) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>            if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>                dprint(&quot;XID MATCH:&quot; + xid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>            checkResponseCode(hdr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre>            // remove the response for the xid if received by some other thread.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>            synchronized (queuesLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>                resps.remove(xid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>                reqs.remove(xid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre>            return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>        // xid mis-match: enqueue the response, it may belong to some other</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>        // thread that has not yet had a chance to read its response.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>        // enqueue only the first response, responses for retries are ignored.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>        synchronized (queuesLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>            if (reqs.contains(hdr.xid)) { // enqueue only the first response</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>                resps.put(hdr.xid, pkt);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>        if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>            dprint(&quot;NO-MATCH SEND ID:&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>                                xid + &quot; RECVD ID:&quot; + hdr.xid +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>                                &quot;    Response Q:&quot; + resps +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>                                &quot;    Reqs size:&quot; + reqs.size());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre>        return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>     * Throws an exception if appropriate for the response code of a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>     * given header.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>    private void checkResponseCode(Header hdr) throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>        int rcode = hdr.rcode;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>        if (rcode == NO_ERROR) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>        String msg = (rcode &lt; rcodeDescription.length)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>            ? rcodeDescription[rcode]</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre>            : &quot;DNS error&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>        msg += &quot; [response code &quot; + rcode + &quot;]&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>        switch (rcode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre>        case SERVER_FAILURE:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>            throw new ServiceUnavailableException(msg);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>        case NAME_ERROR:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>            throw new NameNotFoundException(msg);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>        case NOT_IMPL:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>        case REFUSED:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>            throw new OperationNotSupportedException(msg);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>        case FORMAT_ERROR:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>        default:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>            throw new NamingException(msg);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>    //-------------------------------------------------------------------------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre>    private static final boolean debug = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>    private static void dprint(String mess) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>        if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre>            System.err.println(&quot;DNS: &quot; + mess);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>class Tcp {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre>    private Socket sock;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>    java.io.InputStream in;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>    java.io.OutputStream out;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>    Tcp(InetAddress server, int port) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>        sock = new Socket(server, port);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>        sock.setTcpNoDelay(true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>        out = new java.io.BufferedOutputStream(sock.getOutputStream());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>        in = new java.io.BufferedInputStream(sock.getInputStream());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>    void close() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>        sock.close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre> * javaos emulation -cj</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre>class Packet {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre>        byte buf[];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre>        Packet(int len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>                buf = new byte[len];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre>        Packet(byte data[], int len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>                buf = new byte[len];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre>                System.arraycopy(data, 0, buf, 0, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>        void putInt(int x, int off) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre>                buf[off + 0] = (byte)(x &gt;&gt; 24);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>                buf[off + 1] = (byte)(x &gt;&gt; 16);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>                buf[off + 2] = (byte)(x &gt;&gt; 8);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre>                buf[off + 3] = (byte)x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>        void putShort(int x, int off) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>                buf[off + 0] = (byte)(x &gt;&gt; 8);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre>                buf[off + 1] = (byte)x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>        void putByte(int x, int off) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>                buf[off] = (byte)x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre>        void putBytes(byte src[], int src_offset, int dst_offset, int len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>                System.arraycopy(src, src_offset, buf, dst_offset, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre>        int length() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>                return buf.length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre>        byte[] getData() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>                return buf;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

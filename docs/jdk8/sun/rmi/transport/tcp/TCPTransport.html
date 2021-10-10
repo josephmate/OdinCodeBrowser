@@ -3,878 +3,3491 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-package sun.rmi.transport.tcp;
-
-import java.lang.ref.Reference;
-import java.lang.ref.SoftReference;
-import java.lang.ref.WeakReference;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.UndeclaredThrowableException;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.net.InetAddress;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.rmi.RemoteException;
-import java.rmi.server.ExportException;
-import java.rmi.server.LogStream;
-import java.rmi.server.RMIFailureHandler;
-import java.rmi.server.RMISocketFactory;
-import java.rmi.server.RemoteCall;
-import java.rmi.server.ServerNotActiveException;
-import java.rmi.server.UID;
-import java.security.AccessControlContext;
-import java.security.AccessController;
-import java.util.ArrayList;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.WeakHashMap;
-import java.util.logging.Level;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import sun.rmi.runtime.Log;
-import sun.rmi.runtime.NewThreadAction;
-import sun.rmi.transport.Channel;
-import sun.rmi.transport.Connection;
-import sun.rmi.transport.DGCAckHandler;
-import sun.rmi.transport.Endpoint;
-import sun.rmi.transport.StreamRemoteCall;
-import sun.rmi.transport.Target;
-import sun.rmi.transport.Transport;
-import sun.rmi.transport.TransportConstants;
-import sun.rmi.transport.proxy.HttpReceiveSocket;
-import sun.security.action.GetIntegerAction;
-import sun.security.action.GetLongAction;
-import sun.security.action.GetPropertyAction;
-
-/**
- * TCPTransport is the socket-based implementation of the RMI Transport
- * abstraction.
- *
- * @author Ann Wollrath
- * @author Peter Jones
- */
-@SuppressWarnings(&quot;deprecation&quot;)
-public class TCPTransport extends Transport {
-
-    /* tcp package log */
-    static final Log tcpLog = Log.getLog(&quot;sun.rmi.transport.tcp&quot;, &quot;tcp&quot;,
-        LogStream.parseLevel(AccessController.doPrivileged(
-            new GetPropertyAction(&quot;sun.rmi.transport.tcp.logLevel&quot;))));
-
-    /** maximum number of connection handler threads */
-    private static final int maxConnectionThreads =     // default no limit
-        AccessController.doPrivileged(
-            new GetIntegerAction(&quot;sun.rmi.transport.tcp.maxConnectionThreads&quot;,
-                                 Integer.MAX_VALUE));
-
-    /** keep alive time for idle connection handler threads */
-    private static final long threadKeepAliveTime =     // default 1 minute
-        AccessController.doPrivileged(
-            new GetLongAction(&quot;sun.rmi.transport.tcp.threadKeepAliveTime&quot;,
-                              60000));
-
-    /** thread pool for connection handlers */
-    private static final ExecutorService connectionThreadPool =
-        new ThreadPoolExecutor(0, maxConnectionThreads,
-            threadKeepAliveTime, TimeUnit.MILLISECONDS,
-            new SynchronousQueue&lt;Runnable&gt;(),
-            new ThreadFactory() {
-                public Thread newThread(Runnable runnable) {
-                    return AccessController.doPrivileged(new NewThreadAction(
-                        runnable, &quot;TCP Connection(idle)&quot;, true, true));
-                }
-            });
-
-    /** total connections handled */
-    private static final AtomicInteger connectionCount = new AtomicInteger(0);
-
-    /** client host for the current thread's connection */
-    private static final ThreadLocal&lt;ConnectionHandler&gt;
-        threadConnectionHandler = new ThreadLocal&lt;&gt;();
-
-    /** endpoints for this transport */
-    private final LinkedList&lt;TCPEndpoint&gt; epList;
-    /** number of objects exported on this transport */
-    private int exportCount = 0;
-    /** server socket for this transport */
-    private ServerSocket server = null;
-    /** table mapping endpoints to channels */
-    private final Map&lt;TCPEndpoint,Reference&lt;TCPChannel&gt;&gt; channelTable =
-        new WeakHashMap&lt;&gt;();
-
-    static final RMISocketFactory defaultSocketFactory =
-        RMISocketFactory.getDefaultSocketFactory();
-
-    /** number of milliseconds in accepted-connection timeout.
-     * Warning: this should be greater than 15 seconds (the client-side
-     * timeout), and defaults to 2 hours.
-     * The maximum representable value is slightly more than 24 days
-     * and 20 hours.
-     */
-    private static final int connectionReadTimeout =    // default 2 hours
-        AccessController.doPrivileged(
-            new GetIntegerAction(&quot;sun.rmi.transport.tcp.readTimeout&quot;,
-                                 2 * 3600 * 1000));
-
-    /**
-     * Constructs a TCPTransport.
-     */
-    TCPTransport(LinkedList&lt;TCPEndpoint&gt; epList)  {
-        // assert ((epList.size() != null) &amp;&amp; (epList.size() &gt;= 1))
-        this.epList = epList;
-        if (tcpLog.isLoggable(Log.BRIEF)) {
-            tcpLog.log(Log.BRIEF, &quot;Version = &quot; +
-                TransportConstants.Version + &quot;, ep = &quot; + getEndpoint());
-        }
-    }
-
-    /**
-     * Closes all cached connections in every channel subordinated to this
-     * transport.  Currently, this only closes outgoing connections.
-     */
-    public void shedConnectionCaches() {
-        List&lt;TCPChannel&gt; channels;
-        synchronized (channelTable) {
-            channels = new ArrayList&lt;TCPChannel&gt;(channelTable.values().size());
-            for (Reference&lt;TCPChannel&gt; ref : channelTable.values()) {
-                TCPChannel ch = ref.get();
-                if (ch != null) {
-                    channels.add(ch);
-                }
-            }
-        }
-        for (TCPChannel channel : channels) {
-            channel.shedCache();
-        }
-    }
-
-    /**
-     * Returns a &lt;I&gt;Channel&lt;/I&gt; that generates connections to the
-     * endpoint &lt;I&gt;ep&lt;/I&gt;. A Channel is an object that creates and
-     * manages connections of a particular type to some particular
-     * address space.
-     * @param ep the endpoint to which connections will be generated.
-     * @return the channel or null if the transport cannot
-     * generate connections to this endpoint
-     */
-    public TCPChannel getChannel(Endpoint ep) {
-        TCPChannel ch = null;
-        if (ep instanceof TCPEndpoint) {
-            synchronized (channelTable) {
-                Reference&lt;TCPChannel&gt; ref = channelTable.get(ep);
-                if (ref != null) {
-                    ch = ref.get();
-                }
-                if (ch == null) {
-                    TCPEndpoint tcpEndpoint = (TCPEndpoint) ep;
-                    ch = new TCPChannel(this, tcpEndpoint);
-                    channelTable.put(tcpEndpoint,
-                                     new WeakReference&lt;TCPChannel&gt;(ch));
-                }
-            }
-        }
-        return ch;
-    }
-
-    /**
-     * Removes the &lt;I&gt;Channel&lt;/I&gt; that generates connections to the
-     * endpoint &lt;I&gt;ep&lt;/I&gt;.
-     */
-    public void free(Endpoint ep) {
-        if (ep instanceof TCPEndpoint) {
-            synchronized (channelTable) {
-                Reference&lt;TCPChannel&gt; ref = channelTable.remove(ep);
-                if (ref != null) {
-                    TCPChannel channel = ref.get();
-                    if (channel != null) {
-                        channel.shedCache();
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * Export the object so that it can accept incoming calls.
-     */
-    public void exportObject(Target target) throws RemoteException {
-        /*
-         * Ensure that a server socket is listening, and count this
-         * export while synchronized to prevent the server socket from
-         * being closed due to concurrent unexports.
-         */
-        synchronized (this) {
-            listen();
-            exportCount++;
-        }
-
-        /*
-         * Try to add the Target to the exported object table; keep
-         * counting this export (to keep server socket open) only if
-         * that succeeds.
-         */
-        boolean ok = false;
-        try {
-            super.exportObject(target);
-            ok = true;
-        } finally {
-            if (!ok) {
-                synchronized (this) {
-                    decrementExportCount();
-                }
-            }
-        }
-    }
-
-    protected synchronized void targetUnexported() {
-        decrementExportCount();
-    }
-
-    /**
-     * Decrements the count of exported objects, closing the current
-     * server socket if the count reaches zero.
-     **/
-    private void decrementExportCount() {
-        assert Thread.holdsLock(this);
-        exportCount--;
-        if (exportCount == 0 &amp;&amp; getEndpoint().getListenPort() != 0) {
-            ServerSocket ss = server;
-            server = null;
-            try {
-                ss.close();
-            } catch (IOException e) {
-            }
-        }
-    }
-
-    /**
-     * Verify that the current access control context has permission to
-     * accept the connection being dispatched by the current thread.
-     */
-    protected void checkAcceptPermission(AccessControlContext acc) {
-        SecurityManager sm = System.getSecurityManager();
-        if (sm == null) {
-            return;
-        }
-        ConnectionHandler h = threadConnectionHandler.get();
-        if (h == null) {
-            throw new Error(
-                &quot;checkAcceptPermission not in ConnectionHandler thread&quot;);
-        }
-        h.checkAcceptPermission(sm, acc);
-    }
-
-    private TCPEndpoint getEndpoint() {
-        synchronized (epList) {
-            return epList.getLast();
-        }
-    }
-
-    /**
-     * Listen on transport's endpoint.
-     */
-    private void listen() throws RemoteException {
-        assert Thread.holdsLock(this);
-        TCPEndpoint ep = getEndpoint();
-        int port = ep.getPort();
-
-        if (server == null) {
-            if (tcpLog.isLoggable(Log.BRIEF)) {
-                tcpLog.log(Log.BRIEF,
-                    &quot;(port &quot; + port + &quot;) create server socket&quot;);
-            }
-
-            try {
-                server = ep.newServerSocket();
-                /*
-                 * Don't retry ServerSocket if creation fails since
-                 * &quot;port in use&quot; will cause export to hang if an
-                 * RMIFailureHandler is not installed.
-                 */
-                Thread t = AccessController.doPrivileged(
-                    new NewThreadAction(new AcceptLoop(server),
-                                        &quot;TCP Accept-&quot; + port, true));
-                t.start();
-            } catch (java.net.BindException e) {
-                throw new ExportException(&quot;Port already in use: &quot; + port, e);
-            } catch (IOException e) {
-                throw new ExportException(&quot;Listen failed on port: &quot; + port, e);
-            }
-
-        } else {
-            // otherwise verify security access to existing server socket
-            SecurityManager sm = System.getSecurityManager();
-            if (sm != null) {
-                sm.checkListen(port);
-            }
-        }
-    }
-
-    /**
-     * Worker for accepting connections from a server socket.
-     **/
-    private class AcceptLoop implements Runnable {
-
-        private final ServerSocket serverSocket;
-
-        // state for throttling loop on exceptions (local to accept thread)
-        private long lastExceptionTime = 0L;
-        private int recentExceptionCount;
-
-        AcceptLoop(ServerSocket serverSocket) {
-            this.serverSocket = serverSocket;
-        }
-
-        public void run() {
-            try {
-                executeAcceptLoop();
-            } finally {
-                try {
-                    /*
-                     * Only one accept loop is started per server
-                     * socket, so after no more connections will be
-                     * accepted, ensure that the server socket is no
-                     * longer listening.
-                     */
-                    serverSocket.close();
-                } catch (IOException e) {
-                }
-            }
-        }
-
-        /**
-         * Accepts connections from the server socket and executes
-         * handlers for them in the thread pool.
-         **/
-        private void executeAcceptLoop() {
-            if (tcpLog.isLoggable(Log.BRIEF)) {
-                tcpLog.log(Log.BRIEF, &quot;listening on port &quot; +
-                           getEndpoint().getPort());
-            }
-
-            while (true) {
-                Socket socket = null;
-                try {
-                    socket = serverSocket.accept();
-
-                    /*
-                     * Find client host name (or &quot;0.0.0.0&quot; if unknown)
-                     */
-                    InetAddress clientAddr = socket.getInetAddress();
-                    String clientHost = (clientAddr != null
-                                         ? clientAddr.getHostAddress()
-                                         : &quot;0.0.0.0&quot;);
-
-                    /*
-                     * Execute connection handler in the thread pool,
-                     * which uses non-system threads.
-                     */
-                    try {
-                        connectionThreadPool.execute(
-                            new ConnectionHandler(socket, clientHost));
-                    } catch (RejectedExecutionException e) {
-                        closeSocket(socket);
-                        tcpLog.log(Log.BRIEF,
-                                   &quot;rejected connection from &quot; + clientHost);
-                    }
-
-                } catch (Throwable t) {
-                    try {
-                        /*
-                         * If the server socket has been closed, such
-                         * as because there are no more exported
-                         * objects, then we expect accept to throw an
-                         * exception, so just terminate normally.
-                         */
-                        if (serverSocket.isClosed()) {
-                            break;
-                        }
-
-                        try {
-                            if (tcpLog.isLoggable(Level.WARNING)) {
-                                tcpLog.log(Level.WARNING,
-                                           &quot;accept loop for &quot; + serverSocket +
-                                           &quot; throws&quot;, t);
-                            }
-                        } catch (Throwable tt) {
-                        }
-                    } finally {
-                        /*
-                         * Always close the accepted socket (if any)
-                         * if an exception occurs, but only after
-                         * logging an unexpected exception.
-                         */
-                        if (socket != null) {
-                            closeSocket(socket);
-                        }
-                    }
-
-                    /*
-                     * In case we're running out of file descriptors,
-                     * release resources held in caches.
-                     */
-                    if (!(t instanceof SecurityException)) {
-                        try {
-                            TCPEndpoint.shedConnectionCaches();
-                        } catch (Throwable tt) {
-                        }
-                    }
-
-                    /*
-                     * A NoClassDefFoundError can occur if no file
-                     * descriptors are available, in which case this
-                     * loop should not terminate.
-                     */
-                    if (t instanceof Exception ||
-                        t instanceof OutOfMemoryError ||
-                        t instanceof NoClassDefFoundError)
-                    {
-                        if (!continueAfterAcceptFailure(t)) {
-                            return;
-                        }
-                        // continue loop
-                    } else if (t instanceof Error) {
-                        throw (Error) t;
-                    } else {
-                        throw new UndeclaredThrowableException(t);
-                    }
-                }
-            }
-        }
-
-        /**
-         * Returns true if the accept loop should continue after the
-         * specified exception has been caught, or false if the accept
-         * loop should terminate (closing the server socket).  If
-         * there is an RMIFailureHandler, this method returns the
-         * result of passing the specified exception to it; otherwise,
-         * this method always returns true, after sleeping to throttle
-         * the accept loop if necessary.
-         **/
-        private boolean continueAfterAcceptFailure(Throwable t) {
-            RMIFailureHandler fh = RMISocketFactory.getFailureHandler();
-            if (fh != null) {
-                return fh.failure(t instanceof Exception ? (Exception) t :
-                                  new InvocationTargetException(t));
-            } else {
-                throttleLoopOnException();
-                return true;
-            }
-        }
-
-        /**
-         * Throttles the accept loop after an exception has been
-         * caught: if a burst of 10 exceptions in 5 seconds occurs,
-         * then wait for 10 seconds to curb busy CPU usage.
-         **/
-        private void throttleLoopOnException() {
-            long now = System.currentTimeMillis();
-            if (lastExceptionTime == 0L || (now - lastExceptionTime) &gt; 5000) {
-                // last exception was long ago (or this is the first)
-                lastExceptionTime = now;
-                recentExceptionCount = 0;
-            } else {
-                // exception burst window was started recently
-                if (++recentExceptionCount &gt;= 10) {
-                    try {
-                        Thread.sleep(10000);
-                    } catch (InterruptedException ignore) {
-                    }
-                }
-            }
-        }
-    }
-
-    /** close socket and eat exception */
-    private static void closeSocket(Socket sock) {
-        try {
-            sock.close();
-        } catch (IOException ex) {
-            // eat exception
-        }
-    }
-
-    /**
-     * handleMessages decodes transport operations and handles messages
-     * appropriately.  If an exception occurs during message handling,
-     * the socket is closed.
-     */
-    void handleMessages(Connection conn, boolean persistent) {
-        int port = getEndpoint().getPort();
-
-        try {
-            DataInputStream in = new DataInputStream(conn.getInputStream());
-            do {
-                int op = in.read();     // transport op
-                if (op == -1) {
-                    if (tcpLog.isLoggable(Log.BRIEF)) {
-                        tcpLog.log(Log.BRIEF, &quot;(port &quot; +
-                            port + &quot;) connection closed&quot;);
-                    }
-                    break;
-                }
-
-                if (tcpLog.isLoggable(Log.BRIEF)) {
-                    tcpLog.log(Log.BRIEF, &quot;(port &quot; + port +
-                        &quot;) op = &quot; + op);
-                }
-
-                switch (op) {
-                case TransportConstants.Call:
-                    // service incoming RMI call
-                    RemoteCall call = new StreamRemoteCall(conn);
-                    if (serviceCall(call) == false)
-                        return;
-                    break;
-
-                case TransportConstants.Ping:
-                    // send ack for ping
-                    DataOutputStream out =
-                        new DataOutputStream(conn.getOutputStream());
-                    out.writeByte(TransportConstants.PingAck);
-                    conn.releaseOutputStream();
-                    break;
-
-                case TransportConstants.DGCAck:
-                    DGCAckHandler.received(UID.read(in));
-                    break;
-
-                default:
-                    throw new IOException(&quot;unknown transport op &quot; + op);
-                }
-            } while (persistent);
-
-        } catch (IOException e) {
-            // exception during processing causes connection to close (below)
-            if (tcpLog.isLoggable(Log.BRIEF)) {
-                tcpLog.log(Log.BRIEF, &quot;(port &quot; + port +
-                    &quot;) exception: &quot;, e);
-            }
-        } finally {
-            try {
-                conn.close();
-            } catch (IOException ex) {
-                // eat exception
-            }
-        }
-    }
-
-    /**
-     * Returns the client host for the current thread's connection.  Throws
-     * ServerNotActiveException if no connection is active for this thread.
-     */
-    public static String getClientHost() throws ServerNotActiveException {
-        ConnectionHandler h = threadConnectionHandler.get();
-        if (h != null) {
-            return h.getClientHost();
-        } else {
-            throw new ServerNotActiveException(&quot;not in a remote call&quot;);
-        }
-    }
-
-    /**
-     * Services messages on accepted connection
-     */
-    private class ConnectionHandler implements Runnable {
-
-        /** int value of &quot;POST&quot; in ASCII (Java's specified data formats
-         *  make this once-reviled tactic again socially acceptable) */
-        private static final int POST = 0x504f5354;
-
-        /** most recently accept-authorized AccessControlContext */
-        private AccessControlContext okContext;
-        /** cache of accept-authorized AccessControlContexts */
-        private Map&lt;AccessControlContext,
-                    Reference&lt;AccessControlContext&gt;&gt; authCache;
-        /** security manager which authorized contexts in authCache */
-        private SecurityManager cacheSecurityManager = null;
-
-        private Socket socket;
-        private String remoteHost;
-
-        ConnectionHandler(Socket socket, String remoteHost) {
-            this.socket = socket;
-            this.remoteHost = remoteHost;
-        }
-
-        String getClientHost() {
-            return remoteHost;
-        }
-
-        /**
-         * Verify that the given AccessControlContext has permission to
-         * accept this connection.
-         */
-        void checkAcceptPermission(SecurityManager sm,
-                                   AccessControlContext acc)
-        {
-            /*
-             * Note: no need to synchronize on cache-related fields, since this
-             * method only gets called from the ConnectionHandler's thread.
-             */
-            if (sm != cacheSecurityManager) {
-                okContext = null;
-                authCache = new WeakHashMap&lt;AccessControlContext,
-                                            Reference&lt;AccessControlContext&gt;&gt;();
-                cacheSecurityManager = sm;
-            }
-            if (acc.equals(okContext) || authCache.containsKey(acc)) {
-                return;
-            }
-            InetAddress addr = socket.getInetAddress();
-            String host = (addr != null) ? addr.getHostAddress() : &quot;*&quot;;
-
-            sm.checkAccept(host, socket.getPort());
-
-            authCache.put(acc, new SoftReference&lt;AccessControlContext&gt;(acc));
-            okContext = acc;
-        }
-
-        public void run() {
-            Thread t = Thread.currentThread();
-            String name = t.getName();
-            try {
-                t.setName(&quot;RMI TCP Connection(&quot; +
-                          connectionCount.incrementAndGet() +
-                          &quot;)-&quot; + remoteHost);
-                run0();
-            } finally {
-                t.setName(name);
-            }
-        }
-
-        private void run0() {
-            TCPEndpoint endpoint = getEndpoint();
-            int port = endpoint.getPort();
-
-            threadConnectionHandler.set(this);
-
-            // set socket to disable Nagle's algorithm (always send
-            // immediately)
-            // TBD: should this be left up to socket factory instead?
-            try {
-                socket.setTcpNoDelay(true);
-            } catch (Exception e) {
-                // if we fail to set this, ignore and proceed anyway
-            }
-            // set socket to timeout after excessive idle time
-            try {
-                if (connectionReadTimeout &gt; 0)
-                    socket.setSoTimeout(connectionReadTimeout);
-            } catch (Exception e) {
-                // too bad, continue anyway
-            }
-
-            try {
-                InputStream sockIn = socket.getInputStream();
-                InputStream bufIn = sockIn.markSupported()
-                        ? sockIn
-                        : new BufferedInputStream(sockIn);
-
-                // Read magic (or HTTP wrapper)
-                bufIn.mark(4);
-                DataInputStream in = new DataInputStream(bufIn);
-                int magic = in.readInt();
-
-                if (magic == POST) {
-                    tcpLog.log(Log.BRIEF, &quot;decoding HTTP-wrapped call&quot;);
-
-                    // It's really a HTTP-wrapped request.  Repackage
-                    // the socket in a HttpReceiveSocket, reinitialize
-                    // sockIn and in, and reread magic.
-                    bufIn.reset();      // unread &quot;POST&quot;
-
-                    try {
-                        socket = new HttpReceiveSocket(socket, bufIn, null);
-                        remoteHost = &quot;0.0.0.0&quot;;
-                        sockIn = socket.getInputStream();
-                        bufIn = new BufferedInputStream(sockIn);
-                        in = new DataInputStream(bufIn);
-                        magic = in.readInt();
-
-                    } catch (IOException e) {
-                        throw new RemoteException(&quot;Error HTTP-unwrapping call&quot;,
-                                                  e);
-                    }
-                }
-                // bufIn's mark will invalidate itself when it overflows
-                // so it doesn't have to be turned off
-
-                // read and verify transport header
-                short version = in.readShort();
-                if (magic != TransportConstants.Magic ||
-                    version != TransportConstants.Version) {
-                    // protocol mismatch detected...
-                    // just close socket: this would recurse if we marshal an
-                    // exception to the client and the protocol at other end
-                    // doesn't match.
-                    closeSocket(socket);
-                    return;
-                }
-
-                OutputStream sockOut = socket.getOutputStream();
-                BufferedOutputStream bufOut =
-                    new BufferedOutputStream(sockOut);
-                DataOutputStream out = new DataOutputStream(bufOut);
-
-                int remotePort = socket.getPort();
-
-                if (tcpLog.isLoggable(Log.BRIEF)) {
-                    tcpLog.log(Log.BRIEF, &quot;accepted socket from [&quot; +
-                                     remoteHost + &quot;:&quot; + remotePort + &quot;]&quot;);
-                }
-
-                TCPEndpoint ep;
-                TCPChannel ch;
-                TCPConnection conn;
-
-                // send ack (or nack) for protocol
-                byte protocol = in.readByte();
-                switch (protocol) {
-                case TransportConstants.SingleOpProtocol:
-                    // no ack for protocol
-
-                    // create dummy channel for receiving messages
-                    ep = new TCPEndpoint(remoteHost, socket.getLocalPort(),
-                                         endpoint.getClientSocketFactory(),
-                                         endpoint.getServerSocketFactory());
-                    ch = new TCPChannel(TCPTransport.this, ep);
-                    conn = new TCPConnection(ch, socket, bufIn, bufOut);
-
-                    // read input messages
-                    handleMessages(conn, false);
-                    break;
-
-                case TransportConstants.StreamProtocol:
-                    // send ack
-                    out.writeByte(TransportConstants.ProtocolAck);
-
-                    // suggest endpoint (in case client doesn't know host name)
-                    if (tcpLog.isLoggable(Log.VERBOSE)) {
-                        tcpLog.log(Log.VERBOSE, &quot;(port &quot; + port +
-                            &quot;) &quot; + &quot;suggesting &quot; + remoteHost + &quot;:&quot; +
-                            remotePort);
-                    }
-
-                    out.writeUTF(remoteHost);
-                    out.writeInt(remotePort);
-                    out.flush();
-
-                    // read and discard (possibly bogus) endpoint
-                    // REMIND: would be faster to read 2 bytes then skip N+4
-                    String clientHost = in.readUTF();
-                    int    clientPort = in.readInt();
-                    if (tcpLog.isLoggable(Log.VERBOSE)) {
-                        tcpLog.log(Log.VERBOSE, &quot;(port &quot; + port +
-                            &quot;) client using &quot; + clientHost + &quot;:&quot; + clientPort);
-                    }
-
-                    // create dummy channel for receiving messages
-                    // (why not use clientHost and clientPort?)
-                    ep = new TCPEndpoint(remoteHost, socket.getLocalPort(),
-                                         endpoint.getClientSocketFactory(),
-                                         endpoint.getServerSocketFactory());
-                    ch = new TCPChannel(TCPTransport.this, ep);
-                    conn = new TCPConnection(ch, socket, bufIn, bufOut);
-
-                    // read input messages
-                    handleMessages(conn, true);
-                    break;
-
-                case TransportConstants.MultiplexProtocol:
-                    if (tcpLog.isLoggable(Log.VERBOSE)) {
-                        tcpLog.log(Log.VERBOSE, &quot;(port &quot; + port +
-                            &quot;) accepting multiplex protocol&quot;);
-                    }
-
-                    // send ack
-                    out.writeByte(TransportConstants.ProtocolAck);
-
-                    // suggest endpoint (in case client doesn't already have one)
-                    if (tcpLog.isLoggable(Log.VERBOSE)) {
-                        tcpLog.log(Log.VERBOSE, &quot;(port &quot; + port +
-                            &quot;) suggesting &quot; + remoteHost + &quot;:&quot; + remotePort);
-                    }
-
-                    out.writeUTF(remoteHost);
-                    out.writeInt(remotePort);
-                    out.flush();
-
-                    // read endpoint client has decided to use
-                    ep = new TCPEndpoint(in.readUTF(), in.readInt(),
-                                         endpoint.getClientSocketFactory(),
-                                         endpoint.getServerSocketFactory());
-                    if (tcpLog.isLoggable(Log.VERBOSE)) {
-                        tcpLog.log(Log.VERBOSE, &quot;(port &quot; +
-                            port + &quot;) client using &quot; +
-                            ep.getHost() + &quot;:&quot; + ep.getPort());
-                    }
-
-                    ConnectionMultiplexer multiplexer;
-                    synchronized (channelTable) {
-                        // create or find channel for this endpoint
-                        ch = getChannel(ep);
-                        multiplexer =
-                            new ConnectionMultiplexer(ch, bufIn, sockOut,
-                                                      false);
-                        ch.useMultiplexer(multiplexer);
-                    }
-                    multiplexer.run();
-                    break;
-
-                default:
-                    // protocol not understood, send nack and close socket
-                    out.writeByte(TransportConstants.ProtocolNack);
-                    out.flush();
-                    break;
-                }
-
-            } catch (IOException e) {
-                // socket in unknown state: destroy socket
-                tcpLog.log(Log.BRIEF, &quot;terminated with exception:&quot;, e);
-            } finally {
-                closeSocket(socket);
-            }
-        }
-    }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre>package sun.rmi.transport.tcp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre>import java.lang.ref.Reference;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.lang.ref.SoftReference;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.lang.ref.WeakReference;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.lang.reflect.InvocationTargetException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.lang.reflect.UndeclaredThrowableException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.io.DataInputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.io.DataOutputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.io.IOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import java.io.InputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.io.OutputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import java.io.BufferedInputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import java.io.BufferedOutputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import java.net.InetAddress;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre>import java.net.ServerSocket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre>import java.net.Socket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>import java.rmi.RemoteException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>import java.rmi.server.ExportException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre>import java.rmi.server.LogStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre>import java.rmi.server.RMIFailureHandler;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>import java.rmi.server.RMISocketFactory;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre>import java.rmi.server.RemoteCall;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre>import java.rmi.server.ServerNotActiveException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre>import java.rmi.server.UID;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre>import java.security.AccessControlContext;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>import java.security.AccessController;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre>import java.util.ArrayList;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre>import java.util.LinkedList;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre>import java.util.List;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>import java.util.Map;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre>import java.util.WeakHashMap;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>import java.util.logging.Level;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>import java.util.concurrent.ExecutorService;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre>import java.util.concurrent.RejectedExecutionException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>import java.util.concurrent.SynchronousQueue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>import java.util.concurrent.ThreadFactory;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre>import java.util.concurrent.ThreadPoolExecutor;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>import java.util.concurrent.TimeUnit;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>import java.util.concurrent.atomic.AtomicInteger;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>import sun.rmi.runtime.Log;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>import sun.rmi.runtime.NewThreadAction;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>import sun.rmi.transport.Channel;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>import sun.rmi.transport.Connection;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>import sun.rmi.transport.DGCAckHandler;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>import sun.rmi.transport.Endpoint;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>import sun.rmi.transport.StreamRemoteCall;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>import sun.rmi.transport.Target;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>import sun.rmi.transport.Transport;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>import sun.rmi.transport.TransportConstants;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>import sun.rmi.transport.proxy.HttpReceiveSocket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>import sun.security.action.GetIntegerAction;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>import sun.security.action.GetLongAction;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>import sun.security.action.GetPropertyAction;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre> * TCPTransport is the socket-based implementation of the RMI Transport</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre> * abstraction.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre> * @author Ann Wollrath</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre> * @author Peter Jones</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>@SuppressWarnings(&quot;deprecation&quot;)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>public class TCPTransport extends Transport {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>    /* tcp package log */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>    static final Log tcpLog = Log.getLog(&quot;sun.rmi.transport.tcp&quot;, &quot;tcp&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>        LogStream.parseLevel(AccessController.doPrivileged(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>            new GetPropertyAction(&quot;sun.rmi.transport.tcp.logLevel&quot;))));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>    /** maximum number of connection handler threads */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>    private static final int maxConnectionThreads =     // default no limit</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>        AccessController.doPrivileged(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>            new GetIntegerAction(&quot;sun.rmi.transport.tcp.maxConnectionThreads&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>                                 Integer.MAX_VALUE));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>    /** keep alive time for idle connection handler threads */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>    private static final long threadKeepAliveTime =     // default 1 minute</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>        AccessController.doPrivileged(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>            new GetLongAction(&quot;sun.rmi.transport.tcp.threadKeepAliveTime&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>                              60000));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>    /** thread pool for connection handlers */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>    private static final ExecutorService connectionThreadPool =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>        new ThreadPoolExecutor(0, maxConnectionThreads,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>            threadKeepAliveTime, TimeUnit.MILLISECONDS,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>            new SynchronousQueue&lt;Runnable&gt;(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>            new ThreadFactory() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>                public Thread newThread(Runnable runnable) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>                    return AccessController.doPrivileged(new NewThreadAction(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>                        runnable, &quot;TCP Connection(idle)&quot;, true, true));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>            });</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>    /** total connections handled */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>    private static final AtomicInteger connectionCount = new AtomicInteger(0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>    /** client host for the current thread's connection */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>    private static final ThreadLocal&lt;ConnectionHandler&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>        threadConnectionHandler = new ThreadLocal&lt;&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>    /** endpoints for this transport */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>    private final LinkedList&lt;TCPEndpoint&gt; epList;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>    /** number of objects exported on this transport */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>    private int exportCount = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>    /** server socket for this transport */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>    private ServerSocket server = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>    /** table mapping endpoints to channels */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>    private final Map&lt;TCPEndpoint,Reference&lt;TCPChannel&gt;&gt; channelTable =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>        new WeakHashMap&lt;&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>    static final RMISocketFactory defaultSocketFactory =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>        RMISocketFactory.getDefaultSocketFactory();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>    /** number of milliseconds in accepted-connection timeout.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>     * Warning: this should be greater than 15 seconds (the client-side</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>     * timeout), and defaults to 2 hours.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>     * The maximum representable value is slightly more than 24 days</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>     * and 20 hours.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>    private static final int connectionReadTimeout =    // default 2 hours</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>        AccessController.doPrivileged(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>            new GetIntegerAction(&quot;sun.rmi.transport.tcp.readTimeout&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>                                 2 * 3600 * 1000));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>     * Constructs a TCPTransport.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>    TCPTransport(LinkedList&lt;TCPEndpoint&gt; epList)  {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>        // assert ((epList.size() != null) &amp;&amp; (epList.size() &gt;= 1))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>        this.epList = epList;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>        if (tcpLog.isLoggable(Log.BRIEF)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>            tcpLog.log(Log.BRIEF, &quot;Version = &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>                TransportConstants.Version + &quot;, ep = &quot; + getEndpoint());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>     * Closes all cached connections in every channel subordinated to this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>     * transport.  Currently, this only closes outgoing connections.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>    public void shedConnectionCaches() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>        List&lt;TCPChannel&gt; channels;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>        synchronized (channelTable) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>            channels = new ArrayList&lt;TCPChannel&gt;(channelTable.values().size());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>            for (Reference&lt;TCPChannel&gt; ref : channelTable.values()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>                TCPChannel ch = ref.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>                if (ch != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>                    channels.add(ch);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>        for (TCPChannel channel : channels) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>            channel.shedCache();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>     * Returns a &lt;I&gt;Channel&lt;/I&gt; that generates connections to the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>     * endpoint &lt;I&gt;ep&lt;/I&gt;. A Channel is an object that creates and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>     * manages connections of a particular type to some particular</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>     * address space.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>     * @param ep the endpoint to which connections will be generated.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>     * @return the channel or null if the transport cannot</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>     * generate connections to this endpoint</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>    public TCPChannel getChannel(Endpoint ep) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>        TCPChannel ch = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>        if (ep instanceof TCPEndpoint) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>            synchronized (channelTable) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>                Reference&lt;TCPChannel&gt; ref = channelTable.get(ep);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>                if (ref != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>                    ch = ref.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>                if (ch == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>                    TCPEndpoint tcpEndpoint = (TCPEndpoint) ep;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>                    ch = new TCPChannel(this, tcpEndpoint);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>                    channelTable.put(tcpEndpoint,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>                                     new WeakReference&lt;TCPChannel&gt;(ch));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>        return ch;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>     * Removes the &lt;I&gt;Channel&lt;/I&gt; that generates connections to the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>     * endpoint &lt;I&gt;ep&lt;/I&gt;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>    public void free(Endpoint ep) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>        if (ep instanceof TCPEndpoint) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>            synchronized (channelTable) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>                Reference&lt;TCPChannel&gt; ref = channelTable.remove(ep);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>                if (ref != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>                    TCPChannel channel = ref.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>                    if (channel != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>                        channel.shedCache();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>     * Export the object so that it can accept incoming calls.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>    public void exportObject(Target target) throws RemoteException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>         * Ensure that a server socket is listening, and count this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>         * export while synchronized to prevent the server socket from</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>         * being closed due to concurrent unexports.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>        synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>            listen();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>            exportCount++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>         * Try to add the Target to the exported object table; keep</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>         * counting this export (to keep server socket open) only if</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>         * that succeeds.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>        boolean ok = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>            super.exportObject(target);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>            ok = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>        } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>            if (!ok) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>                synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>                    decrementExportCount();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>    protected synchronized void targetUnexported() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>        decrementExportCount();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>     * Decrements the count of exported objects, closing the current</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>     * server socket if the count reaches zero.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>     **/</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>    private void decrementExportCount() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>        assert Thread.holdsLock(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>        exportCount--;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>        if (exportCount == 0 &amp;&amp; getEndpoint().getListenPort() != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>            ServerSocket ss = server;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>            server = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>                ss.close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>            } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>     * Verify that the current access control context has permission to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>     * accept the connection being dispatched by the current thread.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>    protected void checkAcceptPermission(AccessControlContext acc) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>        SecurityManager sm = System.getSecurityManager();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>        if (sm == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>        ConnectionHandler h = threadConnectionHandler.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>        if (h == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>            throw new Error(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>                &quot;checkAcceptPermission not in ConnectionHandler thread&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>        h.checkAcceptPermission(sm, acc);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>    private TCPEndpoint getEndpoint() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>        synchronized (epList) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>            return epList.getLast();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>     * Listen on transport's endpoint.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>    private void listen() throws RemoteException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>        assert Thread.holdsLock(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>        TCPEndpoint ep = getEndpoint();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>        int port = ep.getPort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>        if (server == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>            if (tcpLog.isLoggable(Log.BRIEF)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>                tcpLog.log(Log.BRIEF,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>                    &quot;(port &quot; + port + &quot;) create server socket&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>                server = ep.newServerSocket();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>                /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>                 * Don't retry ServerSocket if creation fails since</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>                 * &quot;port in use&quot; will cause export to hang if an</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>                 * RMIFailureHandler is not installed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>                 */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>                Thread t = AccessController.doPrivileged(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>                    new NewThreadAction(new AcceptLoop(server),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>                                        &quot;TCP Accept-&quot; + port, true));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>                t.start();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>            } catch (java.net.BindException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>                throw new ExportException(&quot;Port already in use: &quot; + port, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>            } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>                throw new ExportException(&quot;Listen failed on port: &quot; + port, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>            // otherwise verify security access to existing server socket</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>            SecurityManager sm = System.getSecurityManager();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>            if (sm != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>                sm.checkListen(port);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>     * Worker for accepting connections from a server socket.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>     **/</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>    private class AcceptLoop implements Runnable {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>        private final ServerSocket serverSocket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>        // state for throttling loop on exceptions (local to accept thread)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>        private long lastExceptionTime = 0L;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>        private int recentExceptionCount;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>        AcceptLoop(ServerSocket serverSocket) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>            this.serverSocket = serverSocket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>        public void run() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>                executeAcceptLoop();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>            } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>                    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>                     * Only one accept loop is started per server</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>                     * socket, so after no more connections will be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>                     * accepted, ensure that the server socket is no</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>                     * longer listening.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>                     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>                    serverSocket.close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>                } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>         * Accepts connections from the server socket and executes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>         * handlers for them in the thread pool.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>         **/</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>        private void executeAcceptLoop() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>            if (tcpLog.isLoggable(Log.BRIEF)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>                tcpLog.log(Log.BRIEF, &quot;listening on port &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>                           getEndpoint().getPort());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>            while (true) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>                Socket socket = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>                    socket = serverSocket.accept();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>                    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>                     * Find client host name (or &quot;0.0.0.0&quot; if unknown)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>                     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>                    InetAddress clientAddr = socket.getInetAddress();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>                    String clientHost = (clientAddr != null</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>                                         ? clientAddr.getHostAddress()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>                                         : &quot;0.0.0.0&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>                    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>                     * Execute connection handler in the thread pool,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>                     * which uses non-system threads.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>                     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>                    try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>                        connectionThreadPool.execute(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>                            new ConnectionHandler(socket, clientHost));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>                    } catch (RejectedExecutionException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>                        closeSocket(socket);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>                        tcpLog.log(Log.BRIEF,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>                                   &quot;rejected connection from &quot; + clientHost);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>                } catch (Throwable t) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>                    try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>                        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>                         * If the server socket has been closed, such</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>                         * as because there are no more exported</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>                         * objects, then we expect accept to throw an</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>                         * exception, so just terminate normally.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>                         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>                        if (serverSocket.isClosed()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>                            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>                        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>                            if (tcpLog.isLoggable(Level.WARNING)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>                                tcpLog.log(Level.WARNING,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>                                           &quot;accept loop for &quot; + serverSocket +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>                                           &quot; throws&quot;, t);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>                        } catch (Throwable tt) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>                    } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>                        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>                         * Always close the accepted socket (if any)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>                         * if an exception occurs, but only after</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>                         * logging an unexpected exception.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>                         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>                        if (socket != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>                            closeSocket(socket);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>                    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>                     * In case we're running out of file descriptors,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>                     * release resources held in caches.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>                     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>                    if (!(t instanceof SecurityException)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>                        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>                            TCPEndpoint.shedConnectionCaches();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>                        } catch (Throwable tt) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>                    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>                     * A NoClassDefFoundError can occur if no file</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>                     * descriptors are available, in which case this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>                     * loop should not terminate.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>                     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>                    if (t instanceof Exception ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>                        t instanceof OutOfMemoryError ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>                        t instanceof NoClassDefFoundError)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>                    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>                        if (!continueAfterAcceptFailure(t)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>                            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>                        // continue loop</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>                    } else if (t instanceof Error) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>                        throw (Error) t;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>                    } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>                        throw new UndeclaredThrowableException(t);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>         * Returns true if the accept loop should continue after the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>         * specified exception has been caught, or false if the accept</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>         * loop should terminate (closing the server socket).  If</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>         * there is an RMIFailureHandler, this method returns the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>         * result of passing the specified exception to it; otherwise,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>         * this method always returns true, after sleeping to throttle</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>         * the accept loop if necessary.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>         **/</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>        private boolean continueAfterAcceptFailure(Throwable t) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>            RMIFailureHandler fh = RMISocketFactory.getFailureHandler();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>            if (fh != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>                return fh.failure(t instanceof Exception ? (Exception) t :</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>                                  new InvocationTargetException(t));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>                throttleLoopOnException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>                return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>         * Throttles the accept loop after an exception has been</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>         * caught: if a burst of 10 exceptions in 5 seconds occurs,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>         * then wait for 10 seconds to curb busy CPU usage.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>         **/</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>        private void throttleLoopOnException() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>            long now = System.currentTimeMillis();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>            if (lastExceptionTime == 0L || (now - lastExceptionTime) &gt; 5000) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre>                // last exception was long ago (or this is the first)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>                lastExceptionTime = now;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>                recentExceptionCount = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>                // exception burst window was started recently</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>                if (++recentExceptionCount &gt;= 10) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>                    try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>                        Thread.sleep(10000);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>                    } catch (InterruptedException ignore) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>    /** close socket and eat exception */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>    private static void closeSocket(Socket sock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>            sock.close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>        } catch (IOException ex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>            // eat exception</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>     * handleMessages decodes transport operations and handles messages</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>     * appropriately.  If an exception occurs during message handling,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>     * the socket is closed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>    void handleMessages(Connection conn, boolean persistent) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>        int port = getEndpoint().getPort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>            DataInputStream in = new DataInputStream(conn.getInputStream());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>            do {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>                int op = in.read();     // transport op</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>                if (op == -1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>                    if (tcpLog.isLoggable(Log.BRIEF)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>                        tcpLog.log(Log.BRIEF, &quot;(port &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>                            port + &quot;) connection closed&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>                if (tcpLog.isLoggable(Log.BRIEF)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>                    tcpLog.log(Log.BRIEF, &quot;(port &quot; + port +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>                        &quot;) op = &quot; + op);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>                switch (op) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>                case TransportConstants.Call:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>                    // service incoming RMI call</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>                    RemoteCall call = new StreamRemoteCall(conn);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>                    if (serviceCall(call) == false)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>                        return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>                case TransportConstants.Ping:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>                    // send ack for ping</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>                    DataOutputStream out =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre>                        new DataOutputStream(conn.getOutputStream());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>                    out.writeByte(TransportConstants.PingAck);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre>                    conn.releaseOutputStream();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>                case TransportConstants.DGCAck:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>                    DGCAckHandler.received(UID.read(in));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre>                default:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>                    throw new IOException(&quot;unknown transport op &quot; + op);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>            } while (persistent);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>        } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>            // exception during processing causes connection to close (below)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>            if (tcpLog.isLoggable(Log.BRIEF)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>                tcpLog.log(Log.BRIEF, &quot;(port &quot; + port +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>                    &quot;) exception: &quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>        } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>                conn.close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>            } catch (IOException ex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>                // eat exception</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>     * Returns the client host for the current thread's connection.  Throws</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>     * ServerNotActiveException if no connection is active for this thread.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>    public static String getClientHost() throws ServerNotActiveException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>        ConnectionHandler h = threadConnectionHandler.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>        if (h != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>            return h.getClientHost();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>            throw new ServerNotActiveException(&quot;not in a remote call&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>     * Services messages on accepted connection</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>    private class ConnectionHandler implements Runnable {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>        /** int value of &quot;POST&quot; in ASCII (Java's specified data formats</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>         *  make this once-reviled tactic again socially acceptable) */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>        private static final int POST = 0x504f5354;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>        /** most recently accept-authorized AccessControlContext */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>        private AccessControlContext okContext;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>        /** cache of accept-authorized AccessControlContexts */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>        private Map&lt;AccessControlContext,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>                    Reference&lt;AccessControlContext&gt;&gt; authCache;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>        /** security manager which authorized contexts in authCache */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>        private SecurityManager cacheSecurityManager = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>        private Socket socket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre>        private String remoteHost;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>        ConnectionHandler(Socket socket, String remoteHost) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>            this.socket = socket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>            this.remoteHost = remoteHost;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>        String getClientHost() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre>            return remoteHost;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>         * Verify that the given AccessControlContext has permission to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre>         * accept this connection.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>        void checkAcceptPermission(SecurityManager sm,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre>                                   AccessControlContext acc)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>        {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>            /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>             * Note: no need to synchronize on cache-related fields, since this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>             * method only gets called from the ConnectionHandler's thread.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>             */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre>            if (sm != cacheSecurityManager) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>                okContext = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>                authCache = new WeakHashMap&lt;AccessControlContext,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>                                            Reference&lt;AccessControlContext&gt;&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>                cacheSecurityManager = sm;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>            if (acc.equals(okContext) || authCache.containsKey(acc)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre>            InetAddress addr = socket.getInetAddress();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre>            String host = (addr != null) ? addr.getHostAddress() : &quot;*&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>            sm.checkAccept(host, socket.getPort());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>            authCache.put(acc, new SoftReference&lt;AccessControlContext&gt;(acc));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>            okContext = acc;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>        public void run() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre>            Thread t = Thread.currentThread();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>            String name = t.getName();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>                t.setName(&quot;RMI TCP Connection(&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre>                          connectionCount.incrementAndGet() +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>                          &quot;)-&quot; + remoteHost);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>                run0();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre>            } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>                t.setName(name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre>        private void run0() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre>            TCPEndpoint endpoint = getEndpoint();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre>            int port = endpoint.getPort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>            threadConnectionHandler.set(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre>            // set socket to disable Nagle's algorithm (always send</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre>            // immediately)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>            // TBD: should this be left up to socket factory instead?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre>                socket.setTcpNoDelay(true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre>            } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>                // if we fail to set this, ignore and proceed anyway</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre>            // set socket to timeout after excessive idle time</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>                if (connectionReadTimeout &gt; 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre>                    socket.setSoTimeout(connectionReadTimeout);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>            } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre>                // too bad, continue anyway</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>                InputStream sockIn = socket.getInputStream();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre>                InputStream bufIn = sockIn.markSupported()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre>                        ? sockIn</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>                        : new BufferedInputStream(sockIn);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre>                // Read magic (or HTTP wrapper)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>                bufIn.mark(4);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>                DataInputStream in = new DataInputStream(bufIn);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre>                int magic = in.readInt();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>                if (magic == POST) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre>                    tcpLog.log(Log.BRIEF, &quot;decoding HTTP-wrapped call&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>                    // It's really a HTTP-wrapped request.  Repackage</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre>                    // the socket in a HttpReceiveSocket, reinitialize</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre>                    // sockIn and in, and reread magic.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre>                    bufIn.reset();      // unread &quot;POST&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre>                    try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="719" href="#"></a></td>
+<td><pre>                        socket = new HttpReceiveSocket(socket, bufIn, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="720" href="#"></a></td>
+<td><pre>                        remoteHost = &quot;0.0.0.0&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="721" href="#"></a></td>
+<td><pre>                        sockIn = socket.getInputStream();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="722" href="#"></a></td>
+<td><pre>                        bufIn = new BufferedInputStream(sockIn);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="723" href="#"></a></td>
+<td><pre>                        in = new DataInputStream(bufIn);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="724" href="#"></a></td>
+<td><pre>                        magic = in.readInt();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="725" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="726" href="#"></a></td>
+<td><pre>                    } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="727" href="#"></a></td>
+<td><pre>                        throw new RemoteException(&quot;Error HTTP-unwrapping call&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="728" href="#"></a></td>
+<td><pre>                                                  e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="729" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="730" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="731" href="#"></a></td>
+<td><pre>                // bufIn's mark will invalidate itself when it overflows</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="732" href="#"></a></td>
+<td><pre>                // so it doesn't have to be turned off</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="733" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="734" href="#"></a></td>
+<td><pre>                // read and verify transport header</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="735" href="#"></a></td>
+<td><pre>                short version = in.readShort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="736" href="#"></a></td>
+<td><pre>                if (magic != TransportConstants.Magic ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="737" href="#"></a></td>
+<td><pre>                    version != TransportConstants.Version) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="738" href="#"></a></td>
+<td><pre>                    // protocol mismatch detected...</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="739" href="#"></a></td>
+<td><pre>                    // just close socket: this would recurse if we marshal an</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="740" href="#"></a></td>
+<td><pre>                    // exception to the client and the protocol at other end</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="741" href="#"></a></td>
+<td><pre>                    // doesn't match.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="742" href="#"></a></td>
+<td><pre>                    closeSocket(socket);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="743" href="#"></a></td>
+<td><pre>                    return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="744" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="745" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="746" href="#"></a></td>
+<td><pre>                OutputStream sockOut = socket.getOutputStream();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="747" href="#"></a></td>
+<td><pre>                BufferedOutputStream bufOut =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="748" href="#"></a></td>
+<td><pre>                    new BufferedOutputStream(sockOut);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="749" href="#"></a></td>
+<td><pre>                DataOutputStream out = new DataOutputStream(bufOut);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="750" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="751" href="#"></a></td>
+<td><pre>                int remotePort = socket.getPort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="752" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="753" href="#"></a></td>
+<td><pre>                if (tcpLog.isLoggable(Log.BRIEF)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="754" href="#"></a></td>
+<td><pre>                    tcpLog.log(Log.BRIEF, &quot;accepted socket from [&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="755" href="#"></a></td>
+<td><pre>                                     remoteHost + &quot;:&quot; + remotePort + &quot;]&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="756" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="757" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="758" href="#"></a></td>
+<td><pre>                TCPEndpoint ep;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="759" href="#"></a></td>
+<td><pre>                TCPChannel ch;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="760" href="#"></a></td>
+<td><pre>                TCPConnection conn;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="761" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="762" href="#"></a></td>
+<td><pre>                // send ack (or nack) for protocol</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="763" href="#"></a></td>
+<td><pre>                byte protocol = in.readByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="764" href="#"></a></td>
+<td><pre>                switch (protocol) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="765" href="#"></a></td>
+<td><pre>                case TransportConstants.SingleOpProtocol:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="766" href="#"></a></td>
+<td><pre>                    // no ack for protocol</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="767" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="768" href="#"></a></td>
+<td><pre>                    // create dummy channel for receiving messages</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="769" href="#"></a></td>
+<td><pre>                    ep = new TCPEndpoint(remoteHost, socket.getLocalPort(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="770" href="#"></a></td>
+<td><pre>                                         endpoint.getClientSocketFactory(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="771" href="#"></a></td>
+<td><pre>                                         endpoint.getServerSocketFactory());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="772" href="#"></a></td>
+<td><pre>                    ch = new TCPChannel(TCPTransport.this, ep);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="773" href="#"></a></td>
+<td><pre>                    conn = new TCPConnection(ch, socket, bufIn, bufOut);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="774" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="775" href="#"></a></td>
+<td><pre>                    // read input messages</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="776" href="#"></a></td>
+<td><pre>                    handleMessages(conn, false);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="777" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="778" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="779" href="#"></a></td>
+<td><pre>                case TransportConstants.StreamProtocol:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="780" href="#"></a></td>
+<td><pre>                    // send ack</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="781" href="#"></a></td>
+<td><pre>                    out.writeByte(TransportConstants.ProtocolAck);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="782" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="783" href="#"></a></td>
+<td><pre>                    // suggest endpoint (in case client doesn't know host name)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="784" href="#"></a></td>
+<td><pre>                    if (tcpLog.isLoggable(Log.VERBOSE)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="785" href="#"></a></td>
+<td><pre>                        tcpLog.log(Log.VERBOSE, &quot;(port &quot; + port +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="786" href="#"></a></td>
+<td><pre>                            &quot;) &quot; + &quot;suggesting &quot; + remoteHost + &quot;:&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="787" href="#"></a></td>
+<td><pre>                            remotePort);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="788" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="789" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="790" href="#"></a></td>
+<td><pre>                    out.writeUTF(remoteHost);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="791" href="#"></a></td>
+<td><pre>                    out.writeInt(remotePort);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="792" href="#"></a></td>
+<td><pre>                    out.flush();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="793" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="794" href="#"></a></td>
+<td><pre>                    // read and discard (possibly bogus) endpoint</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="795" href="#"></a></td>
+<td><pre>                    // REMIND: would be faster to read 2 bytes then skip N+4</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="796" href="#"></a></td>
+<td><pre>                    String clientHost = in.readUTF();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="797" href="#"></a></td>
+<td><pre>                    int    clientPort = in.readInt();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="798" href="#"></a></td>
+<td><pre>                    if (tcpLog.isLoggable(Log.VERBOSE)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="799" href="#"></a></td>
+<td><pre>                        tcpLog.log(Log.VERBOSE, &quot;(port &quot; + port +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="800" href="#"></a></td>
+<td><pre>                            &quot;) client using &quot; + clientHost + &quot;:&quot; + clientPort);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="801" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="802" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="803" href="#"></a></td>
+<td><pre>                    // create dummy channel for receiving messages</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="804" href="#"></a></td>
+<td><pre>                    // (why not use clientHost and clientPort?)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="805" href="#"></a></td>
+<td><pre>                    ep = new TCPEndpoint(remoteHost, socket.getLocalPort(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="806" href="#"></a></td>
+<td><pre>                                         endpoint.getClientSocketFactory(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="807" href="#"></a></td>
+<td><pre>                                         endpoint.getServerSocketFactory());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="808" href="#"></a></td>
+<td><pre>                    ch = new TCPChannel(TCPTransport.this, ep);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="809" href="#"></a></td>
+<td><pre>                    conn = new TCPConnection(ch, socket, bufIn, bufOut);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="810" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="811" href="#"></a></td>
+<td><pre>                    // read input messages</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="812" href="#"></a></td>
+<td><pre>                    handleMessages(conn, true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="813" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="814" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="815" href="#"></a></td>
+<td><pre>                case TransportConstants.MultiplexProtocol:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="816" href="#"></a></td>
+<td><pre>                    if (tcpLog.isLoggable(Log.VERBOSE)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="817" href="#"></a></td>
+<td><pre>                        tcpLog.log(Log.VERBOSE, &quot;(port &quot; + port +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="818" href="#"></a></td>
+<td><pre>                            &quot;) accepting multiplex protocol&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="819" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="820" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="821" href="#"></a></td>
+<td><pre>                    // send ack</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="822" href="#"></a></td>
+<td><pre>                    out.writeByte(TransportConstants.ProtocolAck);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="823" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="824" href="#"></a></td>
+<td><pre>                    // suggest endpoint (in case client doesn't already have one)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="825" href="#"></a></td>
+<td><pre>                    if (tcpLog.isLoggable(Log.VERBOSE)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="826" href="#"></a></td>
+<td><pre>                        tcpLog.log(Log.VERBOSE, &quot;(port &quot; + port +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="827" href="#"></a></td>
+<td><pre>                            &quot;) suggesting &quot; + remoteHost + &quot;:&quot; + remotePort);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="828" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="829" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="830" href="#"></a></td>
+<td><pre>                    out.writeUTF(remoteHost);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="831" href="#"></a></td>
+<td><pre>                    out.writeInt(remotePort);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="832" href="#"></a></td>
+<td><pre>                    out.flush();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="833" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="834" href="#"></a></td>
+<td><pre>                    // read endpoint client has decided to use</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="835" href="#"></a></td>
+<td><pre>                    ep = new TCPEndpoint(in.readUTF(), in.readInt(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="836" href="#"></a></td>
+<td><pre>                                         endpoint.getClientSocketFactory(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="837" href="#"></a></td>
+<td><pre>                                         endpoint.getServerSocketFactory());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="838" href="#"></a></td>
+<td><pre>                    if (tcpLog.isLoggable(Log.VERBOSE)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="839" href="#"></a></td>
+<td><pre>                        tcpLog.log(Log.VERBOSE, &quot;(port &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="840" href="#"></a></td>
+<td><pre>                            port + &quot;) client using &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="841" href="#"></a></td>
+<td><pre>                            ep.getHost() + &quot;:&quot; + ep.getPort());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="842" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="843" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="844" href="#"></a></td>
+<td><pre>                    ConnectionMultiplexer multiplexer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="845" href="#"></a></td>
+<td><pre>                    synchronized (channelTable) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="846" href="#"></a></td>
+<td><pre>                        // create or find channel for this endpoint</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="847" href="#"></a></td>
+<td><pre>                        ch = getChannel(ep);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="848" href="#"></a></td>
+<td><pre>                        multiplexer =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="849" href="#"></a></td>
+<td><pre>                            new ConnectionMultiplexer(ch, bufIn, sockOut,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="850" href="#"></a></td>
+<td><pre>                                                      false);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="851" href="#"></a></td>
+<td><pre>                        ch.useMultiplexer(multiplexer);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="852" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="853" href="#"></a></td>
+<td><pre>                    multiplexer.run();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="854" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="855" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="856" href="#"></a></td>
+<td><pre>                default:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="857" href="#"></a></td>
+<td><pre>                    // protocol not understood, send nack and close socket</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="858" href="#"></a></td>
+<td><pre>                    out.writeByte(TransportConstants.ProtocolNack);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="859" href="#"></a></td>
+<td><pre>                    out.flush();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="860" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="861" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="862" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="863" href="#"></a></td>
+<td><pre>            } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="864" href="#"></a></td>
+<td><pre>                // socket in unknown state: destroy socket</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="865" href="#"></a></td>
+<td><pre>                tcpLog.log(Log.BRIEF, &quot;terminated with exception:&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="866" href="#"></a></td>
+<td><pre>            } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="867" href="#"></a></td>
+<td><pre>                closeSocket(socket);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="868" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="869" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="870" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="871" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

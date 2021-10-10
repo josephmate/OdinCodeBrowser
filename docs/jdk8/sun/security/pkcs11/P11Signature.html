@@ -3,782 +3,3107 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2003, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package sun.security.pkcs11;
-
-import java.io.IOException;
-import java.math.BigInteger;
-import java.nio.ByteBuffer;
-
-import java.security.*;
-import java.security.interfaces.*;
-import sun.nio.ch.DirectBuffer;
-
-import sun.security.util.*;
-import sun.security.x509.AlgorithmId;
-
-import sun.security.rsa.RSASignature;
-import sun.security.rsa.RSAPadding;
-
-import sun.security.pkcs11.wrapper.*;
-import static sun.security.pkcs11.wrapper.PKCS11Constants.*;
-import sun.security.util.KeyUtil;
-
-/**
- * Signature implementation class. This class currently supports the
- * following algorithms:
- *
- * . DSA
- *   . NONEwithDSA (RawDSA)
- *   . SHA1withDSA
- * . RSA:
- *   . MD2withRSA
- *   . MD5withRSA
- *   . SHA1withRSA
- *   . SHA224withRSA
- *   . SHA256withRSA
- *   . SHA384withRSA
- *   . SHA512withRSA
- * . ECDSA
- *   . NONEwithECDSA
- *   . SHA1withECDSA
- *   . SHA224withECDSA
- *   . SHA256withECDSA
- *   . SHA384withECDSA
- *   . SHA512withECDSA
- *
- * Note that the underlying PKCS#11 token may support complete signature
- * algorithm (e.g. CKM_DSA_SHA1, CKM_MD5_RSA_PKCS), or it may just
- * implement the signature algorithm without hashing (e.g. CKM_DSA, CKM_PKCS),
- * or it may only implement the raw public key operation (CKM_RSA_X_509).
- * This class uses what is available and adds whatever extra processing
- * is needed.
- *
- * @author  Andreas Sterbenz
- * @since   1.5
- */
-final class P11Signature extends SignatureSpi {
-
-    // token instance
-    private final Token token;
-
-    // algorithm name
-    private final String algorithm;
-
-    // name of the key algorithm, currently either RSA or DSA
-    private final String keyAlgorithm;
-
-    // mechanism id
-    private final long mechanism;
-
-    // digest algorithm OID, if we encode RSA signature ourselves
-    private final ObjectIdentifier digestOID;
-
-    // type, one of T_* below
-    private final int type;
-
-    // key instance used, if init*() was called
-    private P11Key p11Key;
-
-    // message digest, if we do the digesting ourselves
-    private final MessageDigest md;
-
-    // associated session, if any
-    private Session session;
-
-    // mode, one of M_* below
-    private int mode;
-
-    // flag indicating whether an operation is initialized
-    private boolean initialized;
-
-    // buffer, for update(byte) or DSA
-    private final byte[] buffer;
-
-    // total number of bytes processed in current operation
-    private int bytesProcessed;
-
-    // constant for signing mode
-    private final static int M_SIGN   = 1;
-    // constant for verification mode
-    private final static int M_VERIFY = 2;
-
-    // constant for type digesting, we do the hashing ourselves
-    private final static int T_DIGEST = 1;
-    // constant for type update, token does everything
-    private final static int T_UPDATE = 2;
-    // constant for type raw, used with RawDSA and NONEwithECDSA only
-    private final static int T_RAW    = 3;
-
-    // XXX PKCS#11 v2.20 says &quot;should not be longer than 1024 bits&quot;,
-    // but this is a little arbitrary
-    private final static int RAW_ECDSA_MAX = 128;
-
-    P11Signature(Token token, String algorithm, long mechanism)
-            throws NoSuchAlgorithmException, PKCS11Exception {
-        super();
-        this.token = token;
-        this.algorithm = algorithm;
-        this.mechanism = mechanism;
-        byte[] buffer = null;
-        ObjectIdentifier digestOID = null;
-        MessageDigest md = null;
-        switch ((int)mechanism) {
-        case (int)CKM_MD2_RSA_PKCS:
-        case (int)CKM_MD5_RSA_PKCS:
-        case (int)CKM_SHA1_RSA_PKCS:
-        case (int)CKM_SHA224_RSA_PKCS:
-        case (int)CKM_SHA256_RSA_PKCS:
-        case (int)CKM_SHA384_RSA_PKCS:
-        case (int)CKM_SHA512_RSA_PKCS:
-            keyAlgorithm = &quot;RSA&quot;;
-            type = T_UPDATE;
-            buffer = new byte[1];
-            break;
-        case (int)CKM_DSA_SHA1:
-            keyAlgorithm = &quot;DSA&quot;;
-            type = T_UPDATE;
-            buffer = new byte[1];
-            break;
-        case (int)CKM_ECDSA_SHA1:
-            keyAlgorithm = &quot;EC&quot;;
-            type = T_UPDATE;
-            buffer = new byte[1];
-            break;
-        case (int)CKM_DSA:
-            keyAlgorithm = &quot;DSA&quot;;
-            if (algorithm.equals(&quot;DSA&quot;)) {
-                type = T_DIGEST;
-                md = MessageDigest.getInstance(&quot;SHA-1&quot;);
-            } else if (algorithm.equals(&quot;RawDSA&quot;)) {
-                type = T_RAW;
-                buffer = new byte[20];
-            } else {
-                throw new ProviderException(algorithm);
-            }
-            break;
-        case (int)CKM_ECDSA:
-            keyAlgorithm = &quot;EC&quot;;
-            if (algorithm.equals(&quot;NONEwithECDSA&quot;)) {
-                type = T_RAW;
-                buffer = new byte[RAW_ECDSA_MAX];
-            } else {
-                String digestAlg;
-                if (algorithm.equals(&quot;SHA1withECDSA&quot;)) {
-                    digestAlg = &quot;SHA-1&quot;;
-                } else if (algorithm.equals(&quot;SHA224withECDSA&quot;)) {
-                    digestAlg = &quot;SHA-224&quot;;
-                } else if (algorithm.equals(&quot;SHA256withECDSA&quot;)) {
-                    digestAlg = &quot;SHA-256&quot;;
-                } else if (algorithm.equals(&quot;SHA384withECDSA&quot;)) {
-                    digestAlg = &quot;SHA-384&quot;;
-                } else if (algorithm.equals(&quot;SHA512withECDSA&quot;)) {
-                    digestAlg = &quot;SHA-512&quot;;
-                } else {
-                    throw new ProviderException(algorithm);
-                }
-                type = T_DIGEST;
-                md = MessageDigest.getInstance(digestAlg);
-            }
-            break;
-        case (int)CKM_RSA_PKCS:
-        case (int)CKM_RSA_X_509:
-            keyAlgorithm = &quot;RSA&quot;;
-            type = T_DIGEST;
-            if (algorithm.equals(&quot;MD5withRSA&quot;)) {
-                md = MessageDigest.getInstance(&quot;MD5&quot;);
-                digestOID = AlgorithmId.MD5_oid;
-            } else if (algorithm.equals(&quot;SHA1withRSA&quot;)) {
-                md = MessageDigest.getInstance(&quot;SHA-1&quot;);
-                digestOID = AlgorithmId.SHA_oid;
-            } else if (algorithm.equals(&quot;MD2withRSA&quot;)) {
-                md = MessageDigest.getInstance(&quot;MD2&quot;);
-                digestOID = AlgorithmId.MD2_oid;
-            } else if (algorithm.equals(&quot;SHA224withRSA&quot;)) {
-                md = MessageDigest.getInstance(&quot;SHA-224&quot;);
-                digestOID = AlgorithmId.SHA224_oid;
-            } else if (algorithm.equals(&quot;SHA256withRSA&quot;)) {
-                md = MessageDigest.getInstance(&quot;SHA-256&quot;);
-                digestOID = AlgorithmId.SHA256_oid;
-            } else if (algorithm.equals(&quot;SHA384withRSA&quot;)) {
-                md = MessageDigest.getInstance(&quot;SHA-384&quot;);
-                digestOID = AlgorithmId.SHA384_oid;
-            } else if (algorithm.equals(&quot;SHA512withRSA&quot;)) {
-                md = MessageDigest.getInstance(&quot;SHA-512&quot;);
-                digestOID = AlgorithmId.SHA512_oid;
-            } else {
-                throw new ProviderException(&quot;Unknown signature: &quot; + algorithm);
-            }
-            break;
-        default:
-            throw new ProviderException(&quot;Unknown mechanism: &quot; + mechanism);
-        }
-        this.buffer = buffer;
-        this.digestOID = digestOID;
-        this.md = md;
-    }
-
-    private void ensureInitialized() {
-        token.ensureValid();
-        if (initialized == false) {
-            initialize();
-        }
-    }
-
-    private void cancelOperation() {
-        token.ensureValid();
-        if (initialized == false) {
-            return;
-        }
-        initialized = false;
-        if ((session == null) || (token.explicitCancel == false)) {
-            return;
-        }
-        if (session.hasObjects() == false) {
-            session = token.killSession(session);
-            return;
-        }
-        // &quot;cancel&quot; operation by finishing it
-        // XXX make sure all this always works correctly
-        if (mode == M_SIGN) {
-            try {
-                if (type == T_UPDATE) {
-                    token.p11.C_SignFinal(session.id(), 0);
-                } else {
-                    byte[] digest;
-                    if (type == T_DIGEST) {
-                        digest = md.digest();
-                    } else { // T_RAW
-                        digest = buffer;
-                    }
-                    token.p11.C_Sign(session.id(), digest);
-                }
-            } catch (PKCS11Exception e) {
-                throw new ProviderException(&quot;cancel failed&quot;, e);
-            }
-        } else { // M_VERIFY
-            try {
-                byte[] signature;
-                if (keyAlgorithm.equals(&quot;DSA&quot;)) {
-                    signature = new byte[40];
-                } else {
-                    signature = new byte[(p11Key.length() + 7) &gt;&gt; 3];
-                }
-                if (type == T_UPDATE) {
-                    token.p11.C_VerifyFinal(session.id(), signature);
-                } else {
-                    byte[] digest;
-                    if (type == T_DIGEST) {
-                        digest = md.digest();
-                    } else { // T_RAW
-                        digest = buffer;
-                    }
-                    token.p11.C_Verify(session.id(), digest, signature);
-                }
-            } catch (PKCS11Exception e) {
-                // will fail since the signature is incorrect
-                // XXX check error code
-            }
-        }
-    }
-
-    // assumes current state is initialized == false
-    private void initialize() {
-        try {
-            if (session == null) {
-                session = token.getOpSession();
-            }
-            if (mode == M_SIGN) {
-                token.p11.C_SignInit(session.id(),
-                        new CK_MECHANISM(mechanism), p11Key.keyID);
-            } else {
-                token.p11.C_VerifyInit(session.id(),
-                        new CK_MECHANISM(mechanism), p11Key.keyID);
-            }
-            initialized = true;
-        } catch (PKCS11Exception e) {
-            throw new ProviderException(&quot;Initialization failed&quot;, e);
-        }
-        if (bytesProcessed != 0) {
-            bytesProcessed = 0;
-            if (md != null) {
-                md.reset();
-            }
-        }
-    }
-
-    private void checkKeySize(String keyAlgo, Key key)
-        throws InvalidKeyException {
-        CK_MECHANISM_INFO mechInfo = null;
-        try {
-            mechInfo = token.getMechanismInfo(mechanism);
-        } catch (PKCS11Exception e) {
-            // should not happen, ignore for now.
-        }
-        if (mechInfo == null) {
-            // skip the check if no native info available
-            return;
-        }
-        int minKeySize = (int) mechInfo.ulMinKeySize;
-        int maxKeySize = (int) mechInfo.ulMaxKeySize;
-
-        int keySize = 0;
-        if (key instanceof P11Key) {
-            keySize = ((P11Key) key).length();
-        } else {
-            if (keyAlgo.equals(&quot;RSA&quot;)) {
-                keySize = ((RSAKey) key).getModulus().bitLength();
-            } else if (keyAlgo.equals(&quot;DSA&quot;)) {
-                keySize = ((DSAKey) key).getParams().getP().bitLength();
-            } else if (keyAlgo.equals(&quot;EC&quot;)) {
-                keySize = ((ECKey) key).getParams().getCurve().getField().getFieldSize();
-            } else {
-                throw new ProviderException(&quot;Error: unsupported algo &quot; + keyAlgo);
-            }
-        }
-        if ((minKeySize != -1) &amp;&amp; (keySize &lt; minKeySize)) {
-            throw new InvalidKeyException(keyAlgo +
-                &quot; key must be at least &quot; + minKeySize + &quot; bits&quot;);
-        }
-        if ((maxKeySize != -1) &amp;&amp; (keySize &gt; maxKeySize)) {
-            throw new InvalidKeyException(keyAlgo +
-                &quot; key must be at most &quot; + maxKeySize + &quot; bits&quot;);
-        }
-        if (keyAlgo.equals(&quot;RSA&quot;)) {
-            checkRSAKeyLength(keySize);
-        }
-    }
-
-    private void checkRSAKeyLength(int len) throws InvalidKeyException {
-        RSAPadding padding;
-        try {
-            padding = RSAPadding.getInstance
-                (RSAPadding.PAD_BLOCKTYPE_1, (len + 7) &gt;&gt; 3);
-        } catch (InvalidAlgorithmParameterException iape) {
-            throw new InvalidKeyException(iape.getMessage());
-        }
-        int maxDataSize = padding.getMaxDataSize();
-        int encodedLength;
-        if (algorithm.equals(&quot;MD5withRSA&quot;) ||
-            algorithm.equals(&quot;MD2withRSA&quot;)) {
-            encodedLength = 34;
-        } else if (algorithm.equals(&quot;SHA1withRSA&quot;)) {
-            encodedLength = 35;
-        } else if (algorithm.equals(&quot;SHA224withRSA&quot;)) {
-            encodedLength = 47;
-        } else if (algorithm.equals(&quot;SHA256withRSA&quot;)) {
-            encodedLength = 51;
-        } else if (algorithm.equals(&quot;SHA384withRSA&quot;)) {
-            encodedLength = 67;
-        } else if (algorithm.equals(&quot;SHA512withRSA&quot;)) {
-            encodedLength = 83;
-        } else {
-            throw new ProviderException(&quot;Unknown signature algo: &quot; + algorithm);
-        }
-        if (encodedLength &gt; maxDataSize) {
-            throw new InvalidKeyException
-                (&quot;Key is too short for this signature algorithm&quot;);
-        }
-    }
-
-    // see JCA spec
-    protected void engineInitVerify(PublicKey publicKey)
-            throws InvalidKeyException {
-        if (publicKey == null) {
-            throw new InvalidKeyException(&quot;Key must not be null&quot;);
-        }
-        // Need to check key length whenever a new key is set
-        if (publicKey != p11Key) {
-            checkKeySize(keyAlgorithm, publicKey);
-        }
-        cancelOperation();
-        mode = M_VERIFY;
-        p11Key = P11KeyFactory.convertKey(token, publicKey, keyAlgorithm);
-        initialize();
-    }
-
-    // see JCA spec
-    protected void engineInitSign(PrivateKey privateKey)
-            throws InvalidKeyException {
-        if (privateKey == null) {
-            throw new InvalidKeyException(&quot;Key must not be null&quot;);
-        }
-        // Need to check RSA key length whenever a new key is set
-        if (privateKey != p11Key) {
-            checkKeySize(keyAlgorithm, privateKey);
-        }
-        cancelOperation();
-        mode = M_SIGN;
-        p11Key = P11KeyFactory.convertKey(token, privateKey, keyAlgorithm);
-        initialize();
-    }
-
-    // see JCA spec
-    protected void engineUpdate(byte b) throws SignatureException {
-        ensureInitialized();
-        switch (type) {
-        case T_UPDATE:
-            buffer[0] = b;
-            engineUpdate(buffer, 0, 1);
-            break;
-        case T_DIGEST:
-            md.update(b);
-            bytesProcessed++;
-            break;
-        case T_RAW:
-            if (bytesProcessed &gt;= buffer.length) {
-                bytesProcessed = buffer.length + 1;
-                return;
-            }
-            buffer[bytesProcessed++] = b;
-            break;
-        default:
-            throw new ProviderException(&quot;Internal error&quot;);
-        }
-    }
-
-    // see JCA spec
-    protected void engineUpdate(byte[] b, int ofs, int len)
-            throws SignatureException {
-        ensureInitialized();
-        if (len == 0) {
-            return;
-        }
-        switch (type) {
-        case T_UPDATE:
-            try {
-                if (mode == M_SIGN) {
-                    token.p11.C_SignUpdate(session.id(), 0, b, ofs, len);
-                } else {
-                    token.p11.C_VerifyUpdate(session.id(), 0, b, ofs, len);
-                }
-                bytesProcessed += len;
-            } catch (PKCS11Exception e) {
-                throw new ProviderException(e);
-            }
-            break;
-        case T_DIGEST:
-            md.update(b, ofs, len);
-            bytesProcessed += len;
-            break;
-        case T_RAW:
-            if (bytesProcessed + len &gt; buffer.length) {
-                bytesProcessed = buffer.length + 1;
-                return;
-            }
-            System.arraycopy(b, ofs, buffer, bytesProcessed, len);
-            bytesProcessed += len;
-            break;
-        default:
-            throw new ProviderException(&quot;Internal error&quot;);
-        }
-    }
-
-    // see JCA spec
-    protected void engineUpdate(ByteBuffer byteBuffer) {
-        ensureInitialized();
-        int len = byteBuffer.remaining();
-        if (len &lt;= 0) {
-            return;
-        }
-        switch (type) {
-        case T_UPDATE:
-            if (byteBuffer instanceof DirectBuffer == false) {
-                // cannot do better than default impl
-                super.engineUpdate(byteBuffer);
-                return;
-            }
-            long addr = ((DirectBuffer)byteBuffer).address();
-            int ofs = byteBuffer.position();
-            try {
-                if (mode == M_SIGN) {
-                    token.p11.C_SignUpdate
-                        (session.id(), addr + ofs, null, 0, len);
-                } else {
-                    token.p11.C_VerifyUpdate
-                        (session.id(), addr + ofs, null, 0, len);
-                }
-                bytesProcessed += len;
-                byteBuffer.position(ofs + len);
-            } catch (PKCS11Exception e) {
-                throw new ProviderException(&quot;Update failed&quot;, e);
-            }
-            break;
-        case T_DIGEST:
-            md.update(byteBuffer);
-            bytesProcessed += len;
-            break;
-        case T_RAW:
-            if (bytesProcessed + len &gt; buffer.length) {
-                bytesProcessed = buffer.length + 1;
-                return;
-            }
-            byteBuffer.get(buffer, bytesProcessed, len);
-            bytesProcessed += len;
-            break;
-        default:
-            throw new ProviderException(&quot;Internal error&quot;);
-        }
-    }
-
-    // see JCA spec
-    protected byte[] engineSign() throws SignatureException {
-        ensureInitialized();
-        try {
-            byte[] signature;
-            if (type == T_UPDATE) {
-                int len = keyAlgorithm.equals(&quot;DSA&quot;) ? 40 : 0;
-                signature = token.p11.C_SignFinal(session.id(), len);
-            } else {
-                byte[] digest;
-                if (type == T_DIGEST) {
-                    digest = md.digest();
-                } else { // T_RAW
-                    if (mechanism == CKM_DSA) {
-                        if (bytesProcessed != buffer.length) {
-                            throw new SignatureException
-                            (&quot;Data for RawDSA must be exactly 20 bytes long&quot;);
-                        }
-                        digest = buffer;
-                    } else { // CKM_ECDSA
-                        if (bytesProcessed &gt; buffer.length) {
-                            throw new SignatureException(&quot;Data for NONEwithECDSA&quot;
-                            + &quot; must be at most &quot; + RAW_ECDSA_MAX + &quot; bytes long&quot;);
-                        }
-                        digest = new byte[bytesProcessed];
-                        System.arraycopy(buffer, 0, digest, 0, bytesProcessed);
-                    }
-                }
-                if (keyAlgorithm.equals(&quot;RSA&quot;) == false) {
-                    // DSA and ECDSA
-                    signature = token.p11.C_Sign(session.id(), digest);
-                } else { // RSA
-                    byte[] data = encodeSignature(digest);
-                    if (mechanism == CKM_RSA_X_509) {
-                        data = pkcs1Pad(data);
-                    }
-                    signature = token.p11.C_Sign(session.id(), data);
-                }
-            }
-            if (keyAlgorithm.equals(&quot;RSA&quot;) == false) {
-                return dsaToASN1(signature);
-            } else {
-                return signature;
-            }
-        } catch (PKCS11Exception e) {
-            throw new ProviderException(e);
-        } finally {
-            initialized = false;
-            session = token.releaseSession(session);
-        }
-    }
-
-    // see JCA spec
-    protected boolean engineVerify(byte[] signature) throws SignatureException {
-        ensureInitialized();
-        try {
-            if (keyAlgorithm.equals(&quot;DSA&quot;)) {
-                signature = asn1ToDSA(signature);
-            } else if (keyAlgorithm.equals(&quot;EC&quot;)) {
-                signature = asn1ToECDSA(signature);
-            }
-            if (type == T_UPDATE) {
-                token.p11.C_VerifyFinal(session.id(), signature);
-            } else {
-                byte[] digest;
-                if (type == T_DIGEST) {
-                    digest = md.digest();
-                } else { // T_RAW
-                    if (mechanism == CKM_DSA) {
-                        if (bytesProcessed != buffer.length) {
-                            throw new SignatureException
-                            (&quot;Data for RawDSA must be exactly 20 bytes long&quot;);
-                        }
-                        digest = buffer;
-                    } else {
-                        if (bytesProcessed &gt; buffer.length) {
-                            throw new SignatureException(&quot;Data for NONEwithECDSA&quot;
-                            + &quot; must be at most &quot; + RAW_ECDSA_MAX + &quot; bytes long&quot;);
-                        }
-                        digest = new byte[bytesProcessed];
-                        System.arraycopy(buffer, 0, digest, 0, bytesProcessed);
-                    }
-                }
-                if (keyAlgorithm.equals(&quot;RSA&quot;) == false) {
-                    // DSA and ECDSA
-                    token.p11.C_Verify(session.id(), digest, signature);
-                } else { // RSA
-                    byte[] data = encodeSignature(digest);
-                    if (mechanism == CKM_RSA_X_509) {
-                        data = pkcs1Pad(data);
-                    }
-                    token.p11.C_Verify(session.id(), data, signature);
-                }
-            }
-            return true;
-        } catch (PKCS11Exception e) {
-            long errorCode = e.getErrorCode();
-            if (errorCode == CKR_SIGNATURE_INVALID) {
-                return false;
-            }
-            if (errorCode == CKR_SIGNATURE_LEN_RANGE) {
-                // return false rather than throwing an exception
-                return false;
-            }
-            // ECF bug?
-            if (errorCode == CKR_DATA_LEN_RANGE) {
-                return false;
-            }
-            throw new ProviderException(e);
-        } finally {
-            // XXX we should not release the session if we abort above
-            // before calling C_Verify
-            initialized = false;
-            session = token.releaseSession(session);
-        }
-    }
-
-    private byte[] pkcs1Pad(byte[] data) {
-        try {
-            int len = (p11Key.length() + 7) &gt;&gt; 3;
-            RSAPadding padding = RSAPadding.getInstance
-                                        (RSAPadding.PAD_BLOCKTYPE_1, len);
-            byte[] padded = padding.pad(data);
-            return padded;
-        } catch (GeneralSecurityException e) {
-            throw new ProviderException(e);
-        }
-    }
-
-    private byte[] encodeSignature(byte[] digest) throws SignatureException {
-        try {
-            return RSASignature.encodeSignature(digestOID, digest);
-        } catch (IOException e) {
-            throw new SignatureException(&quot;Invalid encoding&quot;, e);
-        }
-    }
-
-//    private static byte[] decodeSignature(byte[] signature) throws IOException {
-//      return RSASignature.decodeSignature(digestOID, signature);
-//    }
-
-    // For DSA and ECDSA signatures, PKCS#11 represents them as a simple
-    // byte array that contains the concatenation of r and s.
-    // For DSA, r and s are always exactly 20 bytes long.
-    // For ECDSA, r and s are of variable length, but we know that each
-    // occupies half of the array.
-    private static byte[] dsaToASN1(byte[] signature) {
-        int n = signature.length &gt;&gt; 1;
-        BigInteger r = new BigInteger(1, P11Util.subarray(signature, 0, n));
-        BigInteger s = new BigInteger(1, P11Util.subarray(signature, n, n));
-        try {
-            DerOutputStream outseq = new DerOutputStream(100);
-            outseq.putInteger(r);
-            outseq.putInteger(s);
-            DerValue result = new DerValue(DerValue.tag_Sequence,
-                                           outseq.toByteArray());
-            return result.toByteArray();
-        } catch (java.io.IOException e) {
-            throw new RuntimeException(&quot;Internal error&quot;, e);
-        }
-    }
-
-    private static byte[] asn1ToDSA(byte[] signature) throws SignatureException {
-        try {
-            DerInputStream in = new DerInputStream(signature);
-            DerValue[] values = in.getSequence(2);
-            BigInteger r = values[0].getPositiveBigInteger();
-            BigInteger s = values[1].getPositiveBigInteger();
-            byte[] br = toByteArray(r, 20);
-            byte[] bs = toByteArray(s, 20);
-            if ((br == null) || (bs == null)) {
-                throw new SignatureException(&quot;Out of range value for R or S&quot;);
-            }
-            return P11Util.concat(br, bs);
-        } catch (SignatureException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new SignatureException(&quot;invalid encoding for signature&quot;, e);
-        }
-    }
-
-    private byte[] asn1ToECDSA(byte[] signature) throws SignatureException {
-        try {
-            DerInputStream in = new DerInputStream(signature);
-            DerValue[] values = in.getSequence(2);
-            BigInteger r = values[0].getPositiveBigInteger();
-            BigInteger s = values[1].getPositiveBigInteger();
-            // trim leading zeroes
-            byte[] br = KeyUtil.trimZeroes(r.toByteArray());
-            byte[] bs = KeyUtil.trimZeroes(s.toByteArray());
-            int k = Math.max(br.length, bs.length);
-            // r and s each occupy half the array
-            byte[] res = new byte[k &lt;&lt; 1];
-            System.arraycopy(br, 0, res, k - br.length, br.length);
-            System.arraycopy(bs, 0, res, res.length - bs.length, bs.length);
-            return res;
-        } catch (Exception e) {
-            throw new SignatureException(&quot;invalid encoding for signature&quot;, e);
-        }
-    }
-
-    private static byte[] toByteArray(BigInteger bi, int len) {
-        byte[] b = bi.toByteArray();
-        int n = b.length;
-        if (n == len) {
-            return b;
-        }
-        if ((n == len + 1) &amp;&amp; (b[0] == 0)) {
-            byte[] t = new byte[len];
-            System.arraycopy(b, 1, t, 0, len);
-            return t;
-        }
-        if (n &gt; len) {
-            return null;
-        }
-        // must be smaller
-        byte[] t = new byte[len];
-        System.arraycopy(b, 0, t, (len - n), n);
-        return t;
-    }
-
-    // see JCA spec
-    protected void engineSetParameter(String param, Object value)
-            throws InvalidParameterException {
-        throw new UnsupportedOperationException(&quot;setParameter() not supported&quot;);
-    }
-
-    // see JCA spec
-    protected Object engineGetParameter(String param)
-            throws InvalidParameterException {
-        throw new UnsupportedOperationException(&quot;getParameter() not supported&quot;);
-    }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2003, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package sun.security.pkcs11;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.io.IOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.math.BigInteger;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.nio.ByteBuffer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.security.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.security.interfaces.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import sun.nio.ch.DirectBuffer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import sun.security.util.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import sun.security.x509.AlgorithmId;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import sun.security.rsa.RSASignature;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre>import sun.security.rsa.RSAPadding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>import sun.security.pkcs11.wrapper.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>import static sun.security.pkcs11.wrapper.PKCS11Constants.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre>import sun.security.util.KeyUtil;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre> * Signature implementation class. This class currently supports the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre> * following algorithms:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre> * . DSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre> *   . NONEwithDSA (RawDSA)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre> *   . SHA1withDSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre> * . RSA:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre> *   . MD2withRSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre> *   . MD5withRSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre> *   . SHA1withRSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre> *   . SHA224withRSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre> *   . SHA256withRSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre> *   . SHA384withRSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre> *   . SHA512withRSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre> * . ECDSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre> *   . NONEwithECDSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre> *   . SHA1withECDSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre> *   . SHA224withECDSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre> *   . SHA256withECDSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre> *   . SHA384withECDSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre> *   . SHA512withECDSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre> * Note that the underlying PKCS#11 token may support complete signature</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre> * algorithm (e.g. CKM_DSA_SHA1, CKM_MD5_RSA_PKCS), or it may just</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre> * implement the signature algorithm without hashing (e.g. CKM_DSA, CKM_PKCS),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre> * or it may only implement the raw public key operation (CKM_RSA_X_509).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre> * This class uses what is available and adds whatever extra processing</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre> * is needed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre> * @author  Andreas Sterbenz</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre> * @since   1.5</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>final class P11Signature extends SignatureSpi {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>    // token instance</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>    private final Token token;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>    // algorithm name</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>    private final String algorithm;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>    // name of the key algorithm, currently either RSA or DSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>    private final String keyAlgorithm;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>    // mechanism id</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>    private final long mechanism;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>    // digest algorithm OID, if we encode RSA signature ourselves</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>    private final ObjectIdentifier digestOID;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>    // type, one of T_* below</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>    private final int type;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>    // key instance used, if init*() was called</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>    private P11Key p11Key;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>    // message digest, if we do the digesting ourselves</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>    private final MessageDigest md;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>    // associated session, if any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>    private Session session;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>    // mode, one of M_* below</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>    private int mode;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>    // flag indicating whether an operation is initialized</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>    private boolean initialized;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>    // buffer, for update(byte) or DSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>    private final byte[] buffer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>    // total number of bytes processed in current operation</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>    private int bytesProcessed;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>    // constant for signing mode</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>    private final static int M_SIGN   = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>    // constant for verification mode</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>    private final static int M_VERIFY = 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>    // constant for type digesting, we do the hashing ourselves</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>    private final static int T_DIGEST = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>    // constant for type update, token does everything</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>    private final static int T_UPDATE = 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>    // constant for type raw, used with RawDSA and NONEwithECDSA only</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>    private final static int T_RAW    = 3;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>    // XXX PKCS#11 v2.20 says &quot;should not be longer than 1024 bits&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>    // but this is a little arbitrary</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>    private final static int RAW_ECDSA_MAX = 128;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>    P11Signature(Token token, String algorithm, long mechanism)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>            throws NoSuchAlgorithmException, PKCS11Exception {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>        super();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>        this.token = token;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>        this.algorithm = algorithm;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>        this.mechanism = mechanism;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>        byte[] buffer = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>        ObjectIdentifier digestOID = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>        MessageDigest md = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>        switch ((int)mechanism) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>        case (int)CKM_MD2_RSA_PKCS:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>        case (int)CKM_MD5_RSA_PKCS:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>        case (int)CKM_SHA1_RSA_PKCS:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>        case (int)CKM_SHA224_RSA_PKCS:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>        case (int)CKM_SHA256_RSA_PKCS:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>        case (int)CKM_SHA384_RSA_PKCS:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>        case (int)CKM_SHA512_RSA_PKCS:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>            keyAlgorithm = &quot;RSA&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>            type = T_UPDATE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>            buffer = new byte[1];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>        case (int)CKM_DSA_SHA1:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>            keyAlgorithm = &quot;DSA&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>            type = T_UPDATE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>            buffer = new byte[1];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>        case (int)CKM_ECDSA_SHA1:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>            keyAlgorithm = &quot;EC&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>            type = T_UPDATE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>            buffer = new byte[1];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>        case (int)CKM_DSA:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>            keyAlgorithm = &quot;DSA&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>            if (algorithm.equals(&quot;DSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>                type = T_DIGEST;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>                md = MessageDigest.getInstance(&quot;SHA-1&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>            } else if (algorithm.equals(&quot;RawDSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>                type = T_RAW;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>                buffer = new byte[20];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>                throw new ProviderException(algorithm);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>        case (int)CKM_ECDSA:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>            keyAlgorithm = &quot;EC&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>            if (algorithm.equals(&quot;NONEwithECDSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>                type = T_RAW;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>                buffer = new byte[RAW_ECDSA_MAX];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>                String digestAlg;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>                if (algorithm.equals(&quot;SHA1withECDSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>                    digestAlg = &quot;SHA-1&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>                } else if (algorithm.equals(&quot;SHA224withECDSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>                    digestAlg = &quot;SHA-224&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>                } else if (algorithm.equals(&quot;SHA256withECDSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>                    digestAlg = &quot;SHA-256&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>                } else if (algorithm.equals(&quot;SHA384withECDSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>                    digestAlg = &quot;SHA-384&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>                } else if (algorithm.equals(&quot;SHA512withECDSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>                    digestAlg = &quot;SHA-512&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>                    throw new ProviderException(algorithm);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>                type = T_DIGEST;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>                md = MessageDigest.getInstance(digestAlg);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>        case (int)CKM_RSA_PKCS:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>        case (int)CKM_RSA_X_509:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>            keyAlgorithm = &quot;RSA&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>            type = T_DIGEST;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>            if (algorithm.equals(&quot;MD5withRSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>                md = MessageDigest.getInstance(&quot;MD5&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>                digestOID = AlgorithmId.MD5_oid;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>            } else if (algorithm.equals(&quot;SHA1withRSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>                md = MessageDigest.getInstance(&quot;SHA-1&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>                digestOID = AlgorithmId.SHA_oid;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>            } else if (algorithm.equals(&quot;MD2withRSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>                md = MessageDigest.getInstance(&quot;MD2&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>                digestOID = AlgorithmId.MD2_oid;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>            } else if (algorithm.equals(&quot;SHA224withRSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>                md = MessageDigest.getInstance(&quot;SHA-224&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>                digestOID = AlgorithmId.SHA224_oid;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>            } else if (algorithm.equals(&quot;SHA256withRSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>                md = MessageDigest.getInstance(&quot;SHA-256&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>                digestOID = AlgorithmId.SHA256_oid;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>            } else if (algorithm.equals(&quot;SHA384withRSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>                md = MessageDigest.getInstance(&quot;SHA-384&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>                digestOID = AlgorithmId.SHA384_oid;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>            } else if (algorithm.equals(&quot;SHA512withRSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>                md = MessageDigest.getInstance(&quot;SHA-512&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>                digestOID = AlgorithmId.SHA512_oid;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>                throw new ProviderException(&quot;Unknown signature: &quot; + algorithm);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>        default:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>            throw new ProviderException(&quot;Unknown mechanism: &quot; + mechanism);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>        this.buffer = buffer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>        this.digestOID = digestOID;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>        this.md = md;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>    private void ensureInitialized() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>        token.ensureValid();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>        if (initialized == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>            initialize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>    private void cancelOperation() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>        token.ensureValid();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>        if (initialized == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>        initialized = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>        if ((session == null) || (token.explicitCancel == false)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>        if (session.hasObjects() == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>            session = token.killSession(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>        // &quot;cancel&quot; operation by finishing it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>        // XXX make sure all this always works correctly</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>        if (mode == M_SIGN) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>                if (type == T_UPDATE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>                    token.p11.C_SignFinal(session.id(), 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>                    byte[] digest;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>                    if (type == T_DIGEST) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>                        digest = md.digest();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>                    } else { // T_RAW</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>                        digest = buffer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>                    token.p11.C_Sign(session.id(), digest);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>            } catch (PKCS11Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>                throw new ProviderException(&quot;cancel failed&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>        } else { // M_VERIFY</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>                byte[] signature;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>                if (keyAlgorithm.equals(&quot;DSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>                    signature = new byte[40];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>                    signature = new byte[(p11Key.length() + 7) &gt;&gt; 3];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>                if (type == T_UPDATE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>                    token.p11.C_VerifyFinal(session.id(), signature);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>                    byte[] digest;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>                    if (type == T_DIGEST) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>                        digest = md.digest();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>                    } else { // T_RAW</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>                        digest = buffer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>                    token.p11.C_Verify(session.id(), digest, signature);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>            } catch (PKCS11Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>                // will fail since the signature is incorrect</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>                // XXX check error code</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>    // assumes current state is initialized == false</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>    private void initialize() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>            if (session == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>                session = token.getOpSession();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>            if (mode == M_SIGN) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>                token.p11.C_SignInit(session.id(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>                        new CK_MECHANISM(mechanism), p11Key.keyID);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>                token.p11.C_VerifyInit(session.id(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>                        new CK_MECHANISM(mechanism), p11Key.keyID);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>            initialized = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>        } catch (PKCS11Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>            throw new ProviderException(&quot;Initialization failed&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>        if (bytesProcessed != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>            bytesProcessed = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>            if (md != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>                md.reset();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>    private void checkKeySize(String keyAlgo, Key key)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>        throws InvalidKeyException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>        CK_MECHANISM_INFO mechInfo = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>            mechInfo = token.getMechanismInfo(mechanism);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>        } catch (PKCS11Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>            // should not happen, ignore for now.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>        if (mechInfo == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>            // skip the check if no native info available</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>        int minKeySize = (int) mechInfo.ulMinKeySize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>        int maxKeySize = (int) mechInfo.ulMaxKeySize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>        int keySize = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>        if (key instanceof P11Key) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>            keySize = ((P11Key) key).length();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>            if (keyAlgo.equals(&quot;RSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>                keySize = ((RSAKey) key).getModulus().bitLength();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>            } else if (keyAlgo.equals(&quot;DSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>                keySize = ((DSAKey) key).getParams().getP().bitLength();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>            } else if (keyAlgo.equals(&quot;EC&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>                keySize = ((ECKey) key).getParams().getCurve().getField().getFieldSize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>                throw new ProviderException(&quot;Error: unsupported algo &quot; + keyAlgo);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>        if ((minKeySize != -1) &amp;&amp; (keySize &lt; minKeySize)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>            throw new InvalidKeyException(keyAlgo +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>                &quot; key must be at least &quot; + minKeySize + &quot; bits&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>        if ((maxKeySize != -1) &amp;&amp; (keySize &gt; maxKeySize)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>            throw new InvalidKeyException(keyAlgo +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>                &quot; key must be at most &quot; + maxKeySize + &quot; bits&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>        if (keyAlgo.equals(&quot;RSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>            checkRSAKeyLength(keySize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>    private void checkRSAKeyLength(int len) throws InvalidKeyException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>        RSAPadding padding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>            padding = RSAPadding.getInstance</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>                (RSAPadding.PAD_BLOCKTYPE_1, (len + 7) &gt;&gt; 3);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>        } catch (InvalidAlgorithmParameterException iape) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>            throw new InvalidKeyException(iape.getMessage());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>        int maxDataSize = padding.getMaxDataSize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>        int encodedLength;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>        if (algorithm.equals(&quot;MD5withRSA&quot;) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>            algorithm.equals(&quot;MD2withRSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>            encodedLength = 34;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>        } else if (algorithm.equals(&quot;SHA1withRSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>            encodedLength = 35;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>        } else if (algorithm.equals(&quot;SHA224withRSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>            encodedLength = 47;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>        } else if (algorithm.equals(&quot;SHA256withRSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>            encodedLength = 51;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>        } else if (algorithm.equals(&quot;SHA384withRSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>            encodedLength = 67;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>        } else if (algorithm.equals(&quot;SHA512withRSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>            encodedLength = 83;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>            throw new ProviderException(&quot;Unknown signature algo: &quot; + algorithm);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>        if (encodedLength &gt; maxDataSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>            throw new InvalidKeyException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>                (&quot;Key is too short for this signature algorithm&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>    // see JCA spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>    protected void engineInitVerify(PublicKey publicKey)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>            throws InvalidKeyException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>        if (publicKey == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>            throw new InvalidKeyException(&quot;Key must not be null&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>        // Need to check key length whenever a new key is set</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>        if (publicKey != p11Key) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>            checkKeySize(keyAlgorithm, publicKey);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>        cancelOperation();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>        mode = M_VERIFY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>        p11Key = P11KeyFactory.convertKey(token, publicKey, keyAlgorithm);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>        initialize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>    // see JCA spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>    protected void engineInitSign(PrivateKey privateKey)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>            throws InvalidKeyException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>        if (privateKey == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>            throw new InvalidKeyException(&quot;Key must not be null&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>        // Need to check RSA key length whenever a new key is set</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>        if (privateKey != p11Key) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>            checkKeySize(keyAlgorithm, privateKey);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>        cancelOperation();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>        mode = M_SIGN;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>        p11Key = P11KeyFactory.convertKey(token, privateKey, keyAlgorithm);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>        initialize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>    // see JCA spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>    protected void engineUpdate(byte b) throws SignatureException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>        ensureInitialized();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>        switch (type) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>        case T_UPDATE:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>            buffer[0] = b;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>            engineUpdate(buffer, 0, 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>        case T_DIGEST:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>            md.update(b);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>            bytesProcessed++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>        case T_RAW:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>            if (bytesProcessed &gt;= buffer.length) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>                bytesProcessed = buffer.length + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>            buffer[bytesProcessed++] = b;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>        default:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>            throw new ProviderException(&quot;Internal error&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>    // see JCA spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>    protected void engineUpdate(byte[] b, int ofs, int len)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>            throws SignatureException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>        ensureInitialized();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>        if (len == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>        switch (type) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>        case T_UPDATE:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>                if (mode == M_SIGN) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>                    token.p11.C_SignUpdate(session.id(), 0, b, ofs, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>                    token.p11.C_VerifyUpdate(session.id(), 0, b, ofs, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>                bytesProcessed += len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>            } catch (PKCS11Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>                throw new ProviderException(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>        case T_DIGEST:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>            md.update(b, ofs, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>            bytesProcessed += len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>        case T_RAW:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>            if (bytesProcessed + len &gt; buffer.length) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>                bytesProcessed = buffer.length + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>            System.arraycopy(b, ofs, buffer, bytesProcessed, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>            bytesProcessed += len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>        default:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>            throw new ProviderException(&quot;Internal error&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>    // see JCA spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>    protected void engineUpdate(ByteBuffer byteBuffer) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>        ensureInitialized();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>        int len = byteBuffer.remaining();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>        if (len &lt;= 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>        switch (type) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre>        case T_UPDATE:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>            if (byteBuffer instanceof DirectBuffer == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>                // cannot do better than default impl</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>                super.engineUpdate(byteBuffer);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>            long addr = ((DirectBuffer)byteBuffer).address();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>            int ofs = byteBuffer.position();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>                if (mode == M_SIGN) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>                    token.p11.C_SignUpdate</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>                        (session.id(), addr + ofs, null, 0, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>                    token.p11.C_VerifyUpdate</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>                        (session.id(), addr + ofs, null, 0, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>                bytesProcessed += len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>                byteBuffer.position(ofs + len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>            } catch (PKCS11Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>                throw new ProviderException(&quot;Update failed&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>        case T_DIGEST:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>            md.update(byteBuffer);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>            bytesProcessed += len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>        case T_RAW:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>            if (bytesProcessed + len &gt; buffer.length) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>                bytesProcessed = buffer.length + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>            byteBuffer.get(buffer, bytesProcessed, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>            bytesProcessed += len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>        default:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>            throw new ProviderException(&quot;Internal error&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>    // see JCA spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>    protected byte[] engineSign() throws SignatureException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre>        ensureInitialized();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>            byte[] signature;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>            if (type == T_UPDATE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>                int len = keyAlgorithm.equals(&quot;DSA&quot;) ? 40 : 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>                signature = token.p11.C_SignFinal(session.id(), len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>                byte[] digest;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>                if (type == T_DIGEST) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>                    digest = md.digest();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>                } else { // T_RAW</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>                    if (mechanism == CKM_DSA) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>                        if (bytesProcessed != buffer.length) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>                            throw new SignatureException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>                            (&quot;Data for RawDSA must be exactly 20 bytes long&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>                        digest = buffer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>                    } else { // CKM_ECDSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>                        if (bytesProcessed &gt; buffer.length) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre>                            throw new SignatureException(&quot;Data for NONEwithECDSA&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>                            + &quot; must be at most &quot; + RAW_ECDSA_MAX + &quot; bytes long&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>                        digest = new byte[bytesProcessed];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>                        System.arraycopy(buffer, 0, digest, 0, bytesProcessed);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre>                if (keyAlgorithm.equals(&quot;RSA&quot;) == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>                    // DSA and ECDSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre>                    signature = token.p11.C_Sign(session.id(), digest);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>                } else { // RSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>                    byte[] data = encodeSignature(digest);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>                    if (mechanism == CKM_RSA_X_509) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>                        data = pkcs1Pad(data);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>                    signature = token.p11.C_Sign(session.id(), data);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>            if (keyAlgorithm.equals(&quot;RSA&quot;) == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>                return dsaToASN1(signature);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>                return signature;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>        } catch (PKCS11Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>            throw new ProviderException(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>        } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre>            initialized = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre>            session = token.releaseSession(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>    // see JCA spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>    protected boolean engineVerify(byte[] signature) throws SignatureException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>        ensureInitialized();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>            if (keyAlgorithm.equals(&quot;DSA&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>                signature = asn1ToDSA(signature);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>            } else if (keyAlgorithm.equals(&quot;EC&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>                signature = asn1ToECDSA(signature);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>            if (type == T_UPDATE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>                token.p11.C_VerifyFinal(session.id(), signature);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>                byte[] digest;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>                if (type == T_DIGEST) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>                    digest = md.digest();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre>                } else { // T_RAW</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>                    if (mechanism == CKM_DSA) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>                        if (bytesProcessed != buffer.length) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>                            throw new SignatureException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>                            (&quot;Data for RawDSA must be exactly 20 bytes long&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>                        digest = buffer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>                    } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>                        if (bytesProcessed &gt; buffer.length) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>                            throw new SignatureException(&quot;Data for NONEwithECDSA&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>                            + &quot; must be at most &quot; + RAW_ECDSA_MAX + &quot; bytes long&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre>                        digest = new byte[bytesProcessed];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>                        System.arraycopy(buffer, 0, digest, 0, bytesProcessed);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>                if (keyAlgorithm.equals(&quot;RSA&quot;) == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>                    // DSA and ECDSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>                    token.p11.C_Verify(session.id(), digest, signature);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre>                } else { // RSA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>                    byte[] data = encodeSignature(digest);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>                    if (mechanism == CKM_RSA_X_509) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre>                        data = pkcs1Pad(data);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre>                    token.p11.C_Verify(session.id(), data, signature);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre>            return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>        } catch (PKCS11Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>            long errorCode = e.getErrorCode();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre>            if (errorCode == CKR_SIGNATURE_INVALID) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>                return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>            if (errorCode == CKR_SIGNATURE_LEN_RANGE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>                // return false rather than throwing an exception</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>                return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>            // ECF bug?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>            if (errorCode == CKR_DATA_LEN_RANGE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>                return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>            throw new ProviderException(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>        } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>            // XXX we should not release the session if we abort above</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>            // before calling C_Verify</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre>            initialized = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre>            session = token.releaseSession(session);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>    private byte[] pkcs1Pad(byte[] data) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>            int len = (p11Key.length() + 7) &gt;&gt; 3;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre>            RSAPadding padding = RSAPadding.getInstance</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>                                        (RSAPadding.PAD_BLOCKTYPE_1, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre>            byte[] padded = padding.pad(data);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>            return padded;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre>        } catch (GeneralSecurityException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>            throw new ProviderException(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre>    private byte[] encodeSignature(byte[] digest) throws SignatureException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>            return RSASignature.encodeSignature(digestOID, digest);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>        } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>            throw new SignatureException(&quot;Invalid encoding&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>//    private static byte[] decodeSignature(byte[] signature) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>//      return RSASignature.decodeSignature(digestOID, signature);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre>//    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre>    // For DSA and ECDSA signatures, PKCS#11 represents them as a simple</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>    // byte array that contains the concatenation of r and s.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre>    // For DSA, r and s are always exactly 20 bytes long.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre>    // For ECDSA, r and s are of variable length, but we know that each</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre>    // occupies half of the array.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>    private static byte[] dsaToASN1(byte[] signature) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre>        int n = signature.length &gt;&gt; 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre>        BigInteger r = new BigInteger(1, P11Util.subarray(signature, 0, n));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre>        BigInteger s = new BigInteger(1, P11Util.subarray(signature, n, n));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre>            DerOutputStream outseq = new DerOutputStream(100);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>            outseq.putInteger(r);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre>            outseq.putInteger(s);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre>            DerValue result = new DerValue(DerValue.tag_Sequence,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre>                                           outseq.toByteArray());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre>            return result.toByteArray();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>        } catch (java.io.IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre>            throw new RuntimeException(&quot;Internal error&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre>    private static byte[] asn1ToDSA(byte[] signature) throws SignatureException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>            DerInputStream in = new DerInputStream(signature);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre>            DerValue[] values = in.getSequence(2);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre>            BigInteger r = values[0].getPositiveBigInteger();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>            BigInteger s = values[1].getPositiveBigInteger();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre>            byte[] br = toByteArray(r, 20);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre>            byte[] bs = toByteArray(s, 20);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>            if ((br == null) || (bs == null)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre>                throw new SignatureException(&quot;Out of range value for R or S&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre>            return P11Util.concat(br, bs);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre>        } catch (SignatureException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre>            throw e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="719" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="720" href="#"></a></td>
+<td><pre>            throw new SignatureException(&quot;invalid encoding for signature&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="721" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="722" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="723" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="724" href="#"></a></td>
+<td><pre>    private byte[] asn1ToECDSA(byte[] signature) throws SignatureException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="725" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="726" href="#"></a></td>
+<td><pre>            DerInputStream in = new DerInputStream(signature);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="727" href="#"></a></td>
+<td><pre>            DerValue[] values = in.getSequence(2);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="728" href="#"></a></td>
+<td><pre>            BigInteger r = values[0].getPositiveBigInteger();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="729" href="#"></a></td>
+<td><pre>            BigInteger s = values[1].getPositiveBigInteger();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="730" href="#"></a></td>
+<td><pre>            // trim leading zeroes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="731" href="#"></a></td>
+<td><pre>            byte[] br = KeyUtil.trimZeroes(r.toByteArray());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="732" href="#"></a></td>
+<td><pre>            byte[] bs = KeyUtil.trimZeroes(s.toByteArray());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="733" href="#"></a></td>
+<td><pre>            int k = Math.max(br.length, bs.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="734" href="#"></a></td>
+<td><pre>            // r and s each occupy half the array</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="735" href="#"></a></td>
+<td><pre>            byte[] res = new byte[k &lt;&lt; 1];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="736" href="#"></a></td>
+<td><pre>            System.arraycopy(br, 0, res, k - br.length, br.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="737" href="#"></a></td>
+<td><pre>            System.arraycopy(bs, 0, res, res.length - bs.length, bs.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="738" href="#"></a></td>
+<td><pre>            return res;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="739" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="740" href="#"></a></td>
+<td><pre>            throw new SignatureException(&quot;invalid encoding for signature&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="741" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="742" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="743" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="744" href="#"></a></td>
+<td><pre>    private static byte[] toByteArray(BigInteger bi, int len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="745" href="#"></a></td>
+<td><pre>        byte[] b = bi.toByteArray();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="746" href="#"></a></td>
+<td><pre>        int n = b.length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="747" href="#"></a></td>
+<td><pre>        if (n == len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="748" href="#"></a></td>
+<td><pre>            return b;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="749" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="750" href="#"></a></td>
+<td><pre>        if ((n == len + 1) &amp;&amp; (b[0] == 0)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="751" href="#"></a></td>
+<td><pre>            byte[] t = new byte[len];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="752" href="#"></a></td>
+<td><pre>            System.arraycopy(b, 1, t, 0, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="753" href="#"></a></td>
+<td><pre>            return t;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="754" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="755" href="#"></a></td>
+<td><pre>        if (n &gt; len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="756" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="757" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="758" href="#"></a></td>
+<td><pre>        // must be smaller</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="759" href="#"></a></td>
+<td><pre>        byte[] t = new byte[len];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="760" href="#"></a></td>
+<td><pre>        System.arraycopy(b, 0, t, (len - n), n);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="761" href="#"></a></td>
+<td><pre>        return t;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="762" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="763" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="764" href="#"></a></td>
+<td><pre>    // see JCA spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="765" href="#"></a></td>
+<td><pre>    protected void engineSetParameter(String param, Object value)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="766" href="#"></a></td>
+<td><pre>            throws InvalidParameterException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="767" href="#"></a></td>
+<td><pre>        throw new UnsupportedOperationException(&quot;setParameter() not supported&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="768" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="769" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="770" href="#"></a></td>
+<td><pre>    // see JCA spec</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="771" href="#"></a></td>
+<td><pre>    protected Object engineGetParameter(String param)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="772" href="#"></a></td>
+<td><pre>            throws InvalidParameterException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="773" href="#"></a></td>
+<td><pre>        throw new UnsupportedOperationException(&quot;getParameter() not supported&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="774" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="775" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

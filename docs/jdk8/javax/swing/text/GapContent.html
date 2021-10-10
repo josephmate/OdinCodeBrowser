@@ -3,961 +3,3823 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 1998, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-package javax.swing.text;
-
-import java.util.Vector;
-import java.io.IOException;
-import java.io.ObjectInputStream;
-import java.io.Serializable;
-import javax.swing.undo.AbstractUndoableEdit;
-import javax.swing.undo.CannotRedoException;
-import javax.swing.undo.CannotUndoException;
-import javax.swing.undo.UndoableEdit;
-import javax.swing.SwingUtilities;
-import java.lang.ref.WeakReference;
-import java.lang.ref.ReferenceQueue;
-
-/**
- * An implementation of the AbstractDocument.Content interface
- * implemented using a gapped buffer similar to that used by emacs.
- * The underlying storage is a array of unicode characters with
- * a gap somewhere.  The gap is moved to the location of changes
- * to take advantage of common behavior where most changes are
- * in the same location.  Changes that occur at a gap boundary are
- * generally cheap and moving the gap is generally cheaper than
- * moving the array contents directly to accommodate the change.
- * &lt;p&gt;
- * The positions tracking change are also generally cheap to
- * maintain.  The Position implementations (marks) store the array
- * index and can easily calculate the sequential position from
- * the current gap location.  Changes only require update to the
- * the marks between the old and new gap boundaries when the gap
- * is moved, so generally updating the marks is pretty cheap.
- * The marks are stored sorted so they can be located quickly
- * with a binary search.  This increases the cost of adding a
- * mark, and decreases the cost of keeping the mark updated.
- *
- * @author  Timothy Prinzing
- */
-public class GapContent extends GapVector implements AbstractDocument.Content, Serializable {
-
-    /**
-     * Creates a new GapContent object.  Initial size defaults to 10.
-     */
-    public GapContent() {
-        this(10);
-    }
-
-    /**
-     * Creates a new GapContent object, with the initial
-     * size specified.  The initial size will not be allowed
-     * to go below 2, to give room for the implied break and
-     * the gap.
-     *
-     * @param initialLength the initial size
-     */
-    public GapContent(int initialLength) {
-        super(Math.max(initialLength,2));
-        char[] implied = new char[1];
-        implied[0] = '\n';
-        replace(0, 0, implied, implied.length);
-
-        marks = new MarkVector();
-        search = new MarkData(0);
-        queue = new ReferenceQueue&lt;StickyPosition&gt;();
-    }
-
-    /**
-     * Allocate an array to store items of the type
-     * appropriate (which is determined by the subclass).
-     */
-    protected Object allocateArray(int len) {
-        return new char[len];
-    }
-
-    /**
-     * Get the length of the allocated array.
-     */
-    protected int getArrayLength() {
-        char[] carray = (char[]) getArray();
-        return carray.length;
-    }
-
-    // --- AbstractDocument.Content methods -------------------------
-
-    /**
-     * Returns the length of the content.
-     *
-     * @return the length &amp;gt;= 1
-     * @see AbstractDocument.Content#length
-     */
-    public int length() {
-        int len = getArrayLength() - (getGapEnd() - getGapStart());
-        return len;
-    }
-
-    /**
-     * Inserts a string into the content.
-     *
-     * @param where the starting position &amp;gt;= 0, &amp;lt; length()
-     * @param str the non-null string to insert
-     * @return an UndoableEdit object for undoing
-     * @exception BadLocationException if the specified position is invalid
-     * @see AbstractDocument.Content#insertString
-     */
-    public UndoableEdit insertString(int where, String str) throws BadLocationException {
-        if (where &gt; length() || where &lt; 0) {
-            throw new BadLocationException(&quot;Invalid insert&quot;, length());
-        }
-        char[] chars = str.toCharArray();
-        replace(where, 0, chars, chars.length);
-        return new InsertUndo(where, str.length());
-    }
-
-    /**
-     * Removes part of the content.
-     *
-     * @param where the starting position &amp;gt;= 0, where + nitems &amp;lt; length()
-     * @param nitems the number of characters to remove &amp;gt;= 0
-     * @return an UndoableEdit object for undoing
-     * @exception BadLocationException if the specified position is invalid
-     * @see AbstractDocument.Content#remove
-     */
-    public UndoableEdit remove(int where, int nitems) throws BadLocationException {
-        if (where + nitems &gt;= length()) {
-            throw new BadLocationException(&quot;Invalid remove&quot;, length() + 1);
-        }
-        String removedString = getString(where, nitems);
-        UndoableEdit edit = new RemoveUndo(where, removedString);
-        replace(where, nitems, empty, 0);
-        return edit;
-
-    }
-
-    /**
-     * Retrieves a portion of the content.
-     *
-     * @param where the starting position &amp;gt;= 0
-     * @param len the length to retrieve &amp;gt;= 0
-     * @return a string representing the content
-     * @exception BadLocationException if the specified position is invalid
-     * @see AbstractDocument.Content#getString
-     */
-    public String getString(int where, int len) throws BadLocationException {
-        Segment s = new Segment();
-        getChars(where, len, s);
-        return new String(s.array, s.offset, s.count);
-    }
-
-    /**
-     * Retrieves a portion of the content.  If the desired content spans
-     * the gap, we copy the content.  If the desired content does not
-     * span the gap, the actual store is returned to avoid the copy since
-     * it is contiguous.
-     *
-     * @param where the starting position &amp;gt;= 0, where + len &amp;lt;= length()
-     * @param len the number of characters to retrieve &amp;gt;= 0
-     * @param chars the Segment object to return the characters in
-     * @exception BadLocationException if the specified position is invalid
-     * @see AbstractDocument.Content#getChars
-     */
-    public void getChars(int where, int len, Segment chars) throws BadLocationException {
-        int end = where + len;
-        if (where &lt; 0 || end &lt; 0) {
-            throw new BadLocationException(&quot;Invalid location&quot;, -1);
-        }
-        if (end &gt; length() || where &gt; length()) {
-            throw new BadLocationException(&quot;Invalid location&quot;, length() + 1);
-        }
-        int g0 = getGapStart();
-        int g1 = getGapEnd();
-        char[] array = (char[]) getArray();
-        if ((where + len) &lt;= g0) {
-            // below gap
-            chars.array = array;
-            chars.offset = where;
-        } else if (where &gt;= g0) {
-            // above gap
-            chars.array = array;
-            chars.offset = g1 + where - g0;
-        } else {
-            // spans the gap
-            int before = g0 - where;
-            if (chars.isPartialReturn()) {
-                // partial return allowed, return amount before the gap
-                chars.array = array;
-                chars.offset = where;
-                chars.count = before;
-                return;
-            }
-            // partial return not allowed, must copy
-            chars.array = new char[len];
-            chars.offset = 0;
-            System.arraycopy(array, where, chars.array, 0, before);
-            System.arraycopy(array, g1, chars.array, before, len - before);
-        }
-        chars.count = len;
-    }
-
-    /**
-     * Creates a position within the content that will
-     * track change as the content is mutated.
-     *
-     * @param offset the offset to track &amp;gt;= 0
-     * @return the position
-     * @exception BadLocationException if the specified position is invalid
-     */
-    public Position createPosition(int offset) throws BadLocationException {
-        while ( queue.poll() != null ) {
-            unusedMarks++;
-        }
-        if (unusedMarks &gt; Math.max(5, (marks.size() / 10))) {
-            removeUnusedMarks();
-        }
-        int g0 = getGapStart();
-        int g1 = getGapEnd();
-        int index = (offset &lt; g0) ? offset : offset + (g1 - g0);
-        search.index = index;
-        int sortIndex = findSortIndex(search);
-        MarkData m;
-        StickyPosition position;
-        if (sortIndex &lt; marks.size()
-            &amp;&amp; (m = marks.elementAt(sortIndex)).index == index
-            &amp;&amp; (position = m.getPosition()) != null) {
-            //position references the correct StickyPostition
-        } else {
-            position = new StickyPosition();
-            m = new MarkData(index,position,queue);
-            position.setMark(m);
-            marks.insertElementAt(m, sortIndex);
-        }
-
-        return position;
-    }
-
-    /**
-     * Holds the data for a mark... separately from
-     * the real mark so that the real mark (Position
-     * that the caller of createPosition holds) can be
-     * collected if there are no more references to
-     * it.  The update table holds only a reference
-     * to this data.
-     */
-    final class MarkData extends WeakReference&lt;StickyPosition&gt; {
-
-        MarkData(int index) {
-            super(null);
-            this.index = index;
-        }
-        MarkData(int index, StickyPosition position, ReferenceQueue&lt;? super StickyPosition&gt; queue) {
-            super(position, queue);
-            this.index = index;
-        }
-
-        /**
-         * Fetch the location in the contiguous sequence
-         * being modeled.  The index in the gap array
-         * is held by the mark, so it is adjusted according
-         * to it's relationship to the gap.
-         */
-        public final int getOffset() {
-            int g0 = getGapStart();
-            int g1 = getGapEnd();
-            int offs = (index &lt; g0) ? index : index - (g1 - g0);
-            return Math.max(offs, 0);
-        }
-
-        StickyPosition getPosition() {
-            return get();
-        }
-        int index;
-    }
-
-    final class StickyPosition implements Position {
-
-        StickyPosition() {
-        }
-
-        void setMark(MarkData mark) {
-            this.mark = mark;
-        }
-
-        public final int getOffset() {
-            return mark.getOffset();
-        }
-
-        public String toString() {
-            return Integer.toString(getOffset());
-        }
-
-        MarkData mark;
-    }
-
-    // --- variables --------------------------------------
-
-    private static final char[] empty = new char[0];
-    private transient MarkVector marks;
-
-    /**
-     * Record used for searching for the place to
-     * start updating mark indexs when the gap
-     * boundaries are moved.
-     */
-    private transient MarkData search;
-
-    /**
-     * The number of unused mark entries
-     */
-    private transient int unusedMarks = 0;
-
-    private transient ReferenceQueue&lt;StickyPosition&gt; queue;
-
-    final static int GROWTH_SIZE = 1024 * 512;
-
-    // --- gap management -------------------------------
-
-    /**
-     * Make the gap bigger, moving any necessary data and updating
-     * the appropriate marks
-     */
-    protected void shiftEnd(int newSize) {
-        int oldGapEnd = getGapEnd();
-
-        super.shiftEnd(newSize);
-
-        // Adjust marks.
-        int dg = getGapEnd() - oldGapEnd;
-        int adjustIndex = findMarkAdjustIndex(oldGapEnd);
-        int n = marks.size();
-        for (int i = adjustIndex; i &lt; n; i++) {
-            MarkData mark = marks.elementAt(i);
-            mark.index += dg;
-        }
-    }
-
-    /**
-     * Overridden to make growth policy less agressive for large
-     * text amount.
-     */
-    int getNewArraySize(int reqSize) {
-        if (reqSize &lt; GROWTH_SIZE) {
-            return super.getNewArraySize(reqSize);
-        } else {
-            return reqSize + GROWTH_SIZE;
-        }
-    }
-
-    /**
-     * Move the start of the gap to a new location,
-     * without changing the size of the gap.  This
-     * moves the data in the array and updates the
-     * marks accordingly.
-     */
-    protected void shiftGap(int newGapStart) {
-        int oldGapStart = getGapStart();
-        int dg = newGapStart - oldGapStart;
-        int oldGapEnd = getGapEnd();
-        int newGapEnd = oldGapEnd + dg;
-        int gapSize = oldGapEnd - oldGapStart;
-
-        // shift gap in the character array
-        super.shiftGap(newGapStart);
-
-        // update the marks
-        if (dg &gt; 0) {
-            // Move gap up, move data and marks down.
-            int adjustIndex = findMarkAdjustIndex(oldGapStart);
-            int n = marks.size();
-            for (int i = adjustIndex; i &lt; n; i++) {
-                MarkData mark = marks.elementAt(i);
-                if (mark.index &gt;= newGapEnd) {
-                    break;
-                }
-                mark.index -= gapSize;
-            }
-        } else if (dg &lt; 0) {
-            // Move gap down, move data and marks up.
-            int adjustIndex = findMarkAdjustIndex(newGapStart);
-            int n = marks.size();
-            for (int i = adjustIndex; i &lt; n; i++) {
-                MarkData mark = marks.elementAt(i);
-                if (mark.index &gt;= oldGapEnd) {
-                    break;
-                }
-                mark.index += gapSize;
-            }
-        }
-        resetMarksAtZero();
-    }
-
-    /**
-     * Resets all the marks that have an offset of 0 to have an index of
-     * zero as well.
-     */
-    protected void resetMarksAtZero() {
-        if (marks != null &amp;&amp; getGapStart() == 0) {
-            int g1 = getGapEnd();
-            for (int counter = 0, maxCounter = marks.size();
-                 counter &lt; maxCounter; counter++) {
-                MarkData mark = marks.elementAt(counter);
-                if (mark.index &lt;= g1) {
-                    mark.index = 0;
-                }
-                else {
-                    break;
-                }
-            }
-        }
-    }
-
-    /**
-     * Adjust the gap end downward.  This doesn't move
-     * any data, but it does update any marks affected
-     * by the boundary change.  All marks from the old
-     * gap start down to the new gap start are squeezed
-     * to the end of the gap (their location has been
-     * removed).
-     */
-    protected void shiftGapStartDown(int newGapStart) {
-        // Push aside all marks from oldGapStart down to newGapStart.
-        int adjustIndex = findMarkAdjustIndex(newGapStart);
-        int n = marks.size();
-        int g0 = getGapStart();
-        int g1 = getGapEnd();
-        for (int i = adjustIndex; i &lt; n; i++) {
-            MarkData mark = marks.elementAt(i);
-            if (mark.index &gt; g0) {
-                // no more marks to adjust
-                break;
-            }
-            mark.index = g1;
-        }
-
-        // shift the gap in the character array
-        super.shiftGapStartDown(newGapStart);
-
-        resetMarksAtZero();
-    }
-
-    /**
-     * Adjust the gap end upward.  This doesn't move
-     * any data, but it does update any marks affected
-     * by the boundary change. All marks from the old
-     * gap end up to the new gap end are squeezed
-     * to the end of the gap (their location has been
-     * removed).
-     */
-    protected void shiftGapEndUp(int newGapEnd) {
-        int adjustIndex = findMarkAdjustIndex(getGapEnd());
-        int n = marks.size();
-        for (int i = adjustIndex; i &lt; n; i++) {
-            MarkData mark = marks.elementAt(i);
-            if (mark.index &gt;= newGapEnd) {
-                break;
-            }
-            mark.index = newGapEnd;
-        }
-
-        // shift the gap in the character array
-        super.shiftGapEndUp(newGapEnd);
-
-        resetMarksAtZero();
-    }
-
-    /**
-     * Compares two marks.
-     *
-     * @param o1 the first object
-     * @param o2 the second object
-     * @return &lt; 0 if o1 &lt; o2, 0 if the same, &gt; 0 if o1 &gt; o2
-     */
-    final int compare(MarkData o1, MarkData o2) {
-        if (o1.index &lt; o2.index) {
-            return -1;
-        } else if (o1.index &gt; o2.index) {
-            return 1;
-        } else {
-            return 0;
-        }
-    }
-
-    /**
-     * Finds the index to start mark adjustments given
-     * some search index.
-     */
-    final int findMarkAdjustIndex(int searchIndex) {
-        search.index = Math.max(searchIndex, 1);
-        int index = findSortIndex(search);
-
-        // return the first in the series
-        // (ie. there may be duplicates).
-        for (int i = index - 1; i &gt;= 0; i--) {
-            MarkData d = marks.elementAt(i);
-            if (d.index != search.index) {
-                break;
-            }
-            index -= 1;
-        }
-        return index;
-    }
-
-    /**
-     * Finds the index of where to insert a new mark.
-     *
-     * @param o the mark to insert
-     * @return the index
-     */
-    final int findSortIndex(MarkData o) {
-        int lower = 0;
-        int upper = marks.size() - 1;
-        int mid = 0;
-
-        if (upper == -1) {
-            return 0;
-        }
-
-        int cmp;
-        MarkData last = marks.elementAt(upper);
-        cmp = compare(o, last);
-        if (cmp &gt; 0)
-            return upper + 1;
-
-        while (lower &lt;= upper) {
-            mid = lower + ((upper - lower) / 2);
-            MarkData entry = marks.elementAt(mid);
-            cmp = compare(o, entry);
-
-            if (cmp == 0) {
-                // found a match
-                return mid;
-            } else if (cmp &lt; 0) {
-                upper = mid - 1;
-            } else {
-                lower = mid + 1;
-            }
-        }
-
-        // didn't find it, but we indicate the index of where it would belong.
-        return (cmp &lt; 0) ? mid : mid + 1;
-    }
-
-    /**
-     * Remove all unused marks out of the sorted collection
-     * of marks.
-     */
-    final void removeUnusedMarks() {
-        int n = marks.size();
-        MarkVector cleaned = new MarkVector(n);
-        for (int i = 0; i &lt; n; i++) {
-            MarkData mark = marks.elementAt(i);
-            if (mark.get() != null) {
-                cleaned.addElement(mark);
-            }
-        }
-        marks = cleaned;
-        unusedMarks = 0;
-    }
-
-
-    static class MarkVector extends GapVector {
-
-        MarkVector() {
-            super();
-        }
-
-        MarkVector(int size) {
-            super(size);
-        }
-
-        /**
-         * Allocate an array to store items of the type
-         * appropriate (which is determined by the subclass).
-         */
-        protected Object allocateArray(int len) {
-            return new MarkData[len];
-        }
-
-        /**
-         * Get the length of the allocated array
-         */
-        protected int getArrayLength() {
-            MarkData[] marks = (MarkData[]) getArray();
-            return marks.length;
-        }
-
-        /**
-         * Returns the number of marks currently held
-         */
-        public int size() {
-            int len = getArrayLength() - (getGapEnd() - getGapStart());
-            return len;
-        }
-
-        /**
-         * Inserts a mark into the vector
-         */
-        public void insertElementAt(MarkData m, int index) {
-            oneMark[0] = m;
-            replace(index, 0, oneMark, 1);
-        }
-
-        /**
-         * Add a mark to the end
-         */
-        public void addElement(MarkData m) {
-            insertElementAt(m, size());
-        }
-
-        /**
-         * Fetches the mark at the given index
-         */
-        public MarkData elementAt(int index) {
-            int g0 = getGapStart();
-            int g1 = getGapEnd();
-            MarkData[] array = (MarkData[]) getArray();
-            if (index &lt; g0) {
-                // below gap
-                return array[index];
-            } else {
-                // above gap
-                index += g1 - g0;
-                return array[index];
-            }
-        }
-
-        /**
-         * Replaces the elements in the specified range with the passed
-         * in objects. This will NOT adjust the gap. The passed in indices
-         * do not account for the gap, they are the same as would be used
-         * int &lt;code&gt;elementAt&lt;/code&gt;.
-         */
-        protected void replaceRange(int start, int end, Object[] marks) {
-            int g0 = getGapStart();
-            int g1 = getGapEnd();
-            int index = start;
-            int newIndex = 0;
-            Object[] array = (Object[]) getArray();
-            if (start &gt;= g0) {
-                // Completely passed gap
-                index += (g1 - g0);
-                end += (g1 - g0);
-            }
-            else if (end &gt;= g0) {
-                // straddles gap
-                end += (g1 - g0);
-                while (index &lt; g0) {
-                    array[index++] = marks[newIndex++];
-                }
-                index = g1;
-            }
-            else {
-                // below gap
-                while (index &lt; end) {
-                    array[index++] = marks[newIndex++];
-                }
-            }
-            while (index &lt; end) {
-                array[index++] = marks[newIndex++];
-            }
-        }
-
-        MarkData[] oneMark = new MarkData[1];
-
-    }
-
-    // --- serialization -------------------------------------
-
-    private void readObject(ObjectInputStream s)
-      throws ClassNotFoundException, IOException {
-        s.defaultReadObject();
-        marks = new MarkVector();
-        search = new MarkData(0);
-        queue = new ReferenceQueue&lt;StickyPosition&gt;();
-    }
-
-
-    // --- undo support --------------------------------------
-
-    /**
-     * Returns a Vector containing instances of UndoPosRef for the
-     * Positions in the range
-     * &lt;code&gt;offset&lt;/code&gt; to &lt;code&gt;offset&lt;/code&gt; + &lt;code&gt;length&lt;/code&gt;.
-     * If &lt;code&gt;v&lt;/code&gt; is not null the matching Positions are placed in
-     * there. The vector with the resulting Positions are returned.
-     *
-     * @param v the Vector to use, with a new one created on null
-     * @param offset the starting offset &amp;gt;= 0
-     * @param length the length &amp;gt;= 0
-     * @return the set of instances
-     */
-    protected Vector getPositionsInRange(Vector v, int offset, int length) {
-        int endOffset = offset + length;
-        int startIndex;
-        int endIndex;
-        int g0 = getGapStart();
-        int g1 = getGapEnd();
-
-        // Find the index of the marks.
-        if (offset &lt; g0) {
-            if (offset == 0) {
-                // findMarkAdjustIndex start at 1!
-                startIndex = 0;
-            }
-            else {
-                startIndex = findMarkAdjustIndex(offset);
-            }
-            if (endOffset &gt;= g0) {
-                endIndex = findMarkAdjustIndex(endOffset + (g1 - g0) + 1);
-            }
-            else {
-                endIndex = findMarkAdjustIndex(endOffset + 1);
-            }
-        }
-        else {
-            startIndex = findMarkAdjustIndex(offset + (g1 - g0));
-            endIndex = findMarkAdjustIndex(endOffset + (g1 - g0) + 1);
-        }
-
-        Vector placeIn = (v == null) ? new Vector(Math.max(1, endIndex -
-                                                           startIndex)) : v;
-
-        for (int counter = startIndex; counter &lt; endIndex; counter++) {
-            placeIn.addElement(new UndoPosRef(marks.elementAt(counter)));
-        }
-        return placeIn;
-    }
-
-    /**
-     * Resets the location for all the UndoPosRef instances
-     * in &lt;code&gt;positions&lt;/code&gt;.
-     * &lt;p&gt;
-     * This is meant for internal usage, and is generally not of interest
-     * to subclasses.
-     *
-     * @param positions the UndoPosRef instances to reset
-     */
-    protected void updateUndoPositions(Vector positions, int offset,
-                                       int length) {
-        // Find the indexs of the end points.
-        int endOffset = offset + length;
-        int g1 = getGapEnd();
-        int startIndex;
-        int endIndex = findMarkAdjustIndex(g1 + 1);
-
-        if (offset != 0) {
-            startIndex = findMarkAdjustIndex(g1);
-        }
-        else {
-            startIndex = 0;
-        }
-
-        // Reset the location of the refenences.
-        for(int counter = positions.size() - 1; counter &gt;= 0; counter--) {
-            UndoPosRef ref = (UndoPosRef)positions.elementAt(counter);
-            ref.resetLocation(endOffset, g1);
-        }
-        // We have to resort the marks in the range startIndex to endIndex.
-        // We can take advantage of the fact that it will be in
-        // increasing order, accept there will be a bunch of MarkData's with
-        // the index g1 (or 0 if offset == 0) interspersed throughout.
-        if (startIndex &lt; endIndex) {
-            Object[] sorted = new Object[endIndex - startIndex];
-            int addIndex = 0;
-            int counter;
-            if (offset == 0) {
-                // If the offset is 0, the positions won't have incremented,
-                // have to do the reverse thing.
-                // Find the elements in startIndex whose index is 0
-                for (counter = startIndex; counter &lt; endIndex; counter++) {
-                    MarkData mark = marks.elementAt(counter);
-                    if (mark.index == 0) {
-                        sorted[addIndex++] = mark;
-                    }
-                }
-                for (counter = startIndex; counter &lt; endIndex; counter++) {
-                    MarkData mark = marks.elementAt(counter);
-                    if (mark.index != 0) {
-                        sorted[addIndex++] = mark;
-                    }
-                }
-            }
-            else {
-                for (counter = startIndex; counter &lt; endIndex; counter++) {
-                    MarkData mark = marks.elementAt(counter);
-                    if (mark.index != g1) {
-                        sorted[addIndex++] = mark;
-                    }
-                }
-                for (counter = startIndex; counter &lt; endIndex; counter++) {
-                    MarkData mark = marks.elementAt(counter);
-                    if (mark.index == g1) {
-                        sorted[addIndex++] = mark;
-                    }
-                }
-            }
-            // And replace
-            marks.replaceRange(startIndex, endIndex, sorted);
-        }
-    }
-
-    /**
-     * Used to hold a reference to a Mark that is being reset as the
-     * result of removing from the content.
-     */
-    final class UndoPosRef {
-        UndoPosRef(MarkData rec) {
-            this.rec = rec;
-            this.undoLocation = rec.getOffset();
-        }
-
-        /**
-         * Resets the location of the Position to the offset when the
-         * receiver was instantiated.
-         *
-         * @param endOffset end location of inserted string.
-         * @param g1 resulting end of gap.
-         */
-        protected void resetLocation(int endOffset, int g1) {
-            if (undoLocation != endOffset) {
-                this.rec.index = undoLocation;
-            }
-            else {
-                this.rec.index = g1;
-            }
-        }
-
-        /** Previous Offset of rec. */
-        protected int undoLocation;
-        /** Mark to reset offset. */
-        protected MarkData rec;
-    } // End of GapContent.UndoPosRef
-
-
-    /**
-     * UnoableEdit created for inserts.
-     */
-    class InsertUndo extends AbstractUndoableEdit {
-        protected InsertUndo(int offset, int length) {
-            super();
-            this.offset = offset;
-            this.length = length;
-        }
-
-        public void undo() throws CannotUndoException {
-            super.undo();
-            try {
-                // Get the Positions in the range being removed.
-                posRefs = getPositionsInRange(null, offset, length);
-                string = getString(offset, length);
-                remove(offset, length);
-            } catch (BadLocationException bl) {
-              throw new CannotUndoException();
-            }
-        }
-
-        public void redo() throws CannotRedoException {
-            super.redo();
-            try {
-                insertString(offset, string);
-                string = null;
-                // Update the Positions that were in the range removed.
-                if(posRefs != null) {
-                    updateUndoPositions(posRefs, offset, length);
-                    posRefs = null;
-                }
-            } catch (BadLocationException bl) {
-                throw new CannotRedoException();
-            }
-        }
-
-        /** Where string was inserted. */
-        protected int offset;
-        /** Length of string inserted. */
-        protected int length;
-        /** The string that was inserted. This will only be valid after an
-         * undo. */
-        protected String string;
-        /** An array of instances of UndoPosRef for the Positions in the
-         * range that was removed, valid after undo. */
-        protected Vector posRefs;
-    } // GapContent.InsertUndo
-
-
-    /**
-     * UndoableEdit created for removes.
-     */
-    class RemoveUndo extends AbstractUndoableEdit {
-        protected RemoveUndo(int offset, String string) {
-            super();
-            this.offset = offset;
-            this.string = string;
-            this.length = string.length();
-            posRefs = getPositionsInRange(null, offset, length);
-        }
-
-        public void undo() throws CannotUndoException {
-            super.undo();
-            try {
-                insertString(offset, string);
-                // Update the Positions that were in the range removed.
-                if(posRefs != null) {
-                    updateUndoPositions(posRefs, offset, length);
-                    posRefs = null;
-                }
-                string = null;
-            } catch (BadLocationException bl) {
-              throw new CannotUndoException();
-            }
-        }
-
-        public void redo() throws CannotRedoException {
-            super.redo();
-            try {
-                string = getString(offset, length);
-                // Get the Positions in the range being removed.
-                posRefs = getPositionsInRange(null, offset, length);
-                remove(offset, length);
-            } catch (BadLocationException bl) {
-              throw new CannotRedoException();
-            }
-        }
-
-        /** Where the string was removed from. */
-        protected int offset;
-        /** Length of string removed. */
-        protected int length;
-        /** The string that was removed. This is valid when redo is valid. */
-        protected String string;
-        /** An array of instances of UndoPosRef for the Positions in the
-         * range that was removed, valid before undo. */
-        protected Vector posRefs;
-    } // GapContent.RemoveUndo
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 1998, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre>package javax.swing.text;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre>import java.util.Vector;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.io.IOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.io.ObjectInputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.io.Serializable;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import javax.swing.undo.AbstractUndoableEdit;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import javax.swing.undo.CannotRedoException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import javax.swing.undo.CannotUndoException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import javax.swing.undo.UndoableEdit;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import javax.swing.SwingUtilities;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.lang.ref.WeakReference;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import java.lang.ref.ReferenceQueue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre> * An implementation of the AbstractDocument.Content interface</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre> * implemented using a gapped buffer similar to that used by emacs.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre> * The underlying storage is a array of unicode characters with</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre> * a gap somewhere.  The gap is moved to the location of changes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre> * to take advantage of common behavior where most changes are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre> * in the same location.  Changes that occur at a gap boundary are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre> * generally cheap and moving the gap is generally cheaper than</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre> * moving the array contents directly to accommodate the change.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre> * &lt;p&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre> * The positions tracking change are also generally cheap to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre> * maintain.  The Position implementations (marks) store the array</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre> * index and can easily calculate the sequential position from</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre> * the current gap location.  Changes only require update to the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre> * the marks between the old and new gap boundaries when the gap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre> * is moved, so generally updating the marks is pretty cheap.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre> * The marks are stored sorted so they can be located quickly</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre> * with a binary search.  This increases the cost of adding a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre> * mark, and decreases the cost of keeping the mark updated.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre> * @author  Timothy Prinzing</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>public class GapContent extends GapVector implements AbstractDocument.Content, Serializable {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>     * Creates a new GapContent object.  Initial size defaults to 10.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>    public GapContent() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>        this(10);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>     * Creates a new GapContent object, with the initial</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>     * size specified.  The initial size will not be allowed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>     * to go below 2, to give room for the implied break and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>     * the gap.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>     * @param initialLength the initial size</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>    public GapContent(int initialLength) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>        super(Math.max(initialLength,2));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>        char[] implied = new char[1];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>        implied[0] = '\n';</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>        replace(0, 0, implied, implied.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>        marks = new MarkVector();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>        search = new MarkData(0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>        queue = new ReferenceQueue&lt;StickyPosition&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>     * Allocate an array to store items of the type</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>     * appropriate (which is determined by the subclass).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>    protected Object allocateArray(int len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>        return new char[len];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>     * Get the length of the allocated array.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>    protected int getArrayLength() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>        char[] carray = (char[]) getArray();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>        return carray.length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>    // --- AbstractDocument.Content methods -------------------------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>     * Returns the length of the content.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>     * @return the length &amp;gt;= 1</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>     * @see AbstractDocument.Content#length</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>    public int length() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>        int len = getArrayLength() - (getGapEnd() - getGapStart());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>        return len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>     * Inserts a string into the content.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>     * @param where the starting position &amp;gt;= 0, &amp;lt; length()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>     * @param str the non-null string to insert</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>     * @return an UndoableEdit object for undoing</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>     * @exception BadLocationException if the specified position is invalid</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>     * @see AbstractDocument.Content#insertString</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>    public UndoableEdit insertString(int where, String str) throws BadLocationException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>        if (where &gt; length() || where &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>            throw new BadLocationException(&quot;Invalid insert&quot;, length());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>        char[] chars = str.toCharArray();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>        replace(where, 0, chars, chars.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>        return new InsertUndo(where, str.length());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>     * Removes part of the content.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>     * @param where the starting position &amp;gt;= 0, where + nitems &amp;lt; length()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>     * @param nitems the number of characters to remove &amp;gt;= 0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>     * @return an UndoableEdit object for undoing</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>     * @exception BadLocationException if the specified position is invalid</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>     * @see AbstractDocument.Content#remove</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>    public UndoableEdit remove(int where, int nitems) throws BadLocationException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>        if (where + nitems &gt;= length()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>            throw new BadLocationException(&quot;Invalid remove&quot;, length() + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>        String removedString = getString(where, nitems);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>        UndoableEdit edit = new RemoveUndo(where, removedString);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>        replace(where, nitems, empty, 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>        return edit;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>     * Retrieves a portion of the content.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>     * @param where the starting position &amp;gt;= 0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>     * @param len the length to retrieve &amp;gt;= 0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>     * @return a string representing the content</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>     * @exception BadLocationException if the specified position is invalid</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>     * @see AbstractDocument.Content#getString</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>    public String getString(int where, int len) throws BadLocationException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>        Segment s = new Segment();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>        getChars(where, len, s);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>        return new String(s.array, s.offset, s.count);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>     * Retrieves a portion of the content.  If the desired content spans</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>     * the gap, we copy the content.  If the desired content does not</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>     * span the gap, the actual store is returned to avoid the copy since</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>     * it is contiguous.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>     * @param where the starting position &amp;gt;= 0, where + len &amp;lt;= length()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>     * @param len the number of characters to retrieve &amp;gt;= 0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>     * @param chars the Segment object to return the characters in</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>     * @exception BadLocationException if the specified position is invalid</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>     * @see AbstractDocument.Content#getChars</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>    public void getChars(int where, int len, Segment chars) throws BadLocationException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>        int end = where + len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>        if (where &lt; 0 || end &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>            throw new BadLocationException(&quot;Invalid location&quot;, -1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>        if (end &gt; length() || where &gt; length()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>            throw new BadLocationException(&quot;Invalid location&quot;, length() + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>        int g0 = getGapStart();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>        int g1 = getGapEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>        char[] array = (char[]) getArray();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>        if ((where + len) &lt;= g0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>            // below gap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>            chars.array = array;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>            chars.offset = where;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>        } else if (where &gt;= g0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>            // above gap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>            chars.array = array;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>            chars.offset = g1 + where - g0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>            // spans the gap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>            int before = g0 - where;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>            if (chars.isPartialReturn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>                // partial return allowed, return amount before the gap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>                chars.array = array;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>                chars.offset = where;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>                chars.count = before;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>            // partial return not allowed, must copy</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>            chars.array = new char[len];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>            chars.offset = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>            System.arraycopy(array, where, chars.array, 0, before);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>            System.arraycopy(array, g1, chars.array, before, len - before);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>        chars.count = len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>     * Creates a position within the content that will</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>     * track change as the content is mutated.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>     * @param offset the offset to track &amp;gt;= 0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>     * @return the position</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>     * @exception BadLocationException if the specified position is invalid</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>    public Position createPosition(int offset) throws BadLocationException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>        while ( queue.poll() != null ) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>            unusedMarks++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>        if (unusedMarks &gt; Math.max(5, (marks.size() / 10))) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>            removeUnusedMarks();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>        int g0 = getGapStart();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>        int g1 = getGapEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>        int index = (offset &lt; g0) ? offset : offset + (g1 - g0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>        search.index = index;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>        int sortIndex = findSortIndex(search);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>        MarkData m;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>        StickyPosition position;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>        if (sortIndex &lt; marks.size()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>            &amp;&amp; (m = marks.elementAt(sortIndex)).index == index</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>            &amp;&amp; (position = m.getPosition()) != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>            //position references the correct StickyPostition</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>            position = new StickyPosition();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>            m = new MarkData(index,position,queue);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>            position.setMark(m);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>            marks.insertElementAt(m, sortIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>        return position;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>     * Holds the data for a mark... separately from</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>     * the real mark so that the real mark (Position</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>     * that the caller of createPosition holds) can be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>     * collected if there are no more references to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>     * it.  The update table holds only a reference</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>     * to this data.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>    final class MarkData extends WeakReference&lt;StickyPosition&gt; {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>        MarkData(int index) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>            super(null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>            this.index = index;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>        MarkData(int index, StickyPosition position, ReferenceQueue&lt;? super StickyPosition&gt; queue) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>            super(position, queue);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>            this.index = index;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>         * Fetch the location in the contiguous sequence</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>         * being modeled.  The index in the gap array</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>         * is held by the mark, so it is adjusted according</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>         * to it's relationship to the gap.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>        public final int getOffset() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>            int g0 = getGapStart();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>            int g1 = getGapEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>            int offs = (index &lt; g0) ? index : index - (g1 - g0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>            return Math.max(offs, 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>        StickyPosition getPosition() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>            return get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>        int index;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>    final class StickyPosition implements Position {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>        StickyPosition() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>        void setMark(MarkData mark) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>            this.mark = mark;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>        public final int getOffset() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>            return mark.getOffset();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>        public String toString() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>            return Integer.toString(getOffset());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>        MarkData mark;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>    // --- variables --------------------------------------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>    private static final char[] empty = new char[0];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>    private transient MarkVector marks;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>     * Record used for searching for the place to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>     * start updating mark indexs when the gap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>     * boundaries are moved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>    private transient MarkData search;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>     * The number of unused mark entries</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>    private transient int unusedMarks = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>    private transient ReferenceQueue&lt;StickyPosition&gt; queue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>    final static int GROWTH_SIZE = 1024 * 512;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>    // --- gap management -------------------------------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>     * Make the gap bigger, moving any necessary data and updating</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>     * the appropriate marks</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>    protected void shiftEnd(int newSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>        int oldGapEnd = getGapEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>        super.shiftEnd(newSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>        // Adjust marks.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>        int dg = getGapEnd() - oldGapEnd;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>        int adjustIndex = findMarkAdjustIndex(oldGapEnd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>        int n = marks.size();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>        for (int i = adjustIndex; i &lt; n; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>            MarkData mark = marks.elementAt(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>            mark.index += dg;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>     * Overridden to make growth policy less agressive for large</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>     * text amount.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>    int getNewArraySize(int reqSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>        if (reqSize &lt; GROWTH_SIZE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>            return super.getNewArraySize(reqSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>            return reqSize + GROWTH_SIZE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>     * Move the start of the gap to a new location,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>     * without changing the size of the gap.  This</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>     * moves the data in the array and updates the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>     * marks accordingly.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>    protected void shiftGap(int newGapStart) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>        int oldGapStart = getGapStart();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>        int dg = newGapStart - oldGapStart;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>        int oldGapEnd = getGapEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>        int newGapEnd = oldGapEnd + dg;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>        int gapSize = oldGapEnd - oldGapStart;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>        // shift gap in the character array</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>        super.shiftGap(newGapStart);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>        // update the marks</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>        if (dg &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>            // Move gap up, move data and marks down.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>            int adjustIndex = findMarkAdjustIndex(oldGapStart);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>            int n = marks.size();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>            for (int i = adjustIndex; i &lt; n; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>                MarkData mark = marks.elementAt(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>                if (mark.index &gt;= newGapEnd) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>                mark.index -= gapSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>        } else if (dg &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>            // Move gap down, move data and marks up.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>            int adjustIndex = findMarkAdjustIndex(newGapStart);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>            int n = marks.size();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>            for (int i = adjustIndex; i &lt; n; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>                MarkData mark = marks.elementAt(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>                if (mark.index &gt;= oldGapEnd) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>                mark.index += gapSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>        resetMarksAtZero();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>     * Resets all the marks that have an offset of 0 to have an index of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>     * zero as well.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>    protected void resetMarksAtZero() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>        if (marks != null &amp;&amp; getGapStart() == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>            int g1 = getGapEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>            for (int counter = 0, maxCounter = marks.size();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>                 counter &lt; maxCounter; counter++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>                MarkData mark = marks.elementAt(counter);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>                if (mark.index &lt;= g1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>                    mark.index = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>                else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>     * Adjust the gap end downward.  This doesn't move</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>     * any data, but it does update any marks affected</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>     * by the boundary change.  All marks from the old</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>     * gap start down to the new gap start are squeezed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>     * to the end of the gap (their location has been</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>     * removed).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>    protected void shiftGapStartDown(int newGapStart) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>        // Push aside all marks from oldGapStart down to newGapStart.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>        int adjustIndex = findMarkAdjustIndex(newGapStart);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>        int n = marks.size();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>        int g0 = getGapStart();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>        int g1 = getGapEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>        for (int i = adjustIndex; i &lt; n; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>            MarkData mark = marks.elementAt(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>            if (mark.index &gt; g0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>                // no more marks to adjust</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>            mark.index = g1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>        // shift the gap in the character array</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>        super.shiftGapStartDown(newGapStart);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>        resetMarksAtZero();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>     * Adjust the gap end upward.  This doesn't move</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>     * any data, but it does update any marks affected</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>     * by the boundary change. All marks from the old</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>     * gap end up to the new gap end are squeezed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>     * to the end of the gap (their location has been</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>     * removed).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>    protected void shiftGapEndUp(int newGapEnd) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>        int adjustIndex = findMarkAdjustIndex(getGapEnd());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>        int n = marks.size();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>        for (int i = adjustIndex; i &lt; n; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>            MarkData mark = marks.elementAt(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>            if (mark.index &gt;= newGapEnd) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>            mark.index = newGapEnd;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>        // shift the gap in the character array</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>        super.shiftGapEndUp(newGapEnd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>        resetMarksAtZero();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>     * Compares two marks.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>     * @param o1 the first object</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>     * @param o2 the second object</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>     * @return &lt; 0 if o1 &lt; o2, 0 if the same, &gt; 0 if o1 &gt; o2</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>    final int compare(MarkData o1, MarkData o2) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>        if (o1.index &lt; o2.index) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>            return -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>        } else if (o1.index &gt; o2.index) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>            return 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>            return 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre>     * Finds the index to start mark adjustments given</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>     * some search index.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>    final int findMarkAdjustIndex(int searchIndex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>        search.index = Math.max(searchIndex, 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>        int index = findSortIndex(search);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>        // return the first in the series</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>        // (ie. there may be duplicates).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>        for (int i = index - 1; i &gt;= 0; i--) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>            MarkData d = marks.elementAt(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>            if (d.index != search.index) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>            index -= 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>        return index;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>     * Finds the index of where to insert a new mark.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>     * @param o the mark to insert</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>     * @return the index</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>    final int findSortIndex(MarkData o) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>        int lower = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>        int upper = marks.size() - 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>        int mid = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>        if (upper == -1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>            return 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>        int cmp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>        MarkData last = marks.elementAt(upper);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>        cmp = compare(o, last);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>        if (cmp &gt; 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>            return upper + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>        while (lower &lt;= upper) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre>            mid = lower + ((upper - lower) / 2);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>            MarkData entry = marks.elementAt(mid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>            cmp = compare(o, entry);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>            if (cmp == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>                // found a match</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>                return mid;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>            } else if (cmp &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>                upper = mid - 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>                lower = mid + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>        // didn't find it, but we indicate the index of where it would belong.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>        return (cmp &lt; 0) ? mid : mid + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre>     * Remove all unused marks out of the sorted collection</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>     * of marks.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>    final void removeUnusedMarks() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>        int n = marks.size();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>        MarkVector cleaned = new MarkVector(n);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; n; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre>            MarkData mark = marks.elementAt(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>            if (mark.get() != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre>                cleaned.addElement(mark);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>        marks = cleaned;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>        unusedMarks = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>    static class MarkVector extends GapVector {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>        MarkVector() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>            super();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>        MarkVector(int size) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>            super(size);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>         * Allocate an array to store items of the type</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>         * appropriate (which is determined by the subclass).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>        protected Object allocateArray(int len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>            return new MarkData[len];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>         * Get the length of the allocated array</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>        protected int getArrayLength() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>            MarkData[] marks = (MarkData[]) getArray();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>            return marks.length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>         * Returns the number of marks currently held</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre>        public int size() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>            int len = getArrayLength() - (getGapEnd() - getGapStart());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>            return len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>         * Inserts a mark into the vector</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>        public void insertElementAt(MarkData m, int index) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>            oneMark[0] = m;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>            replace(index, 0, oneMark, 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre>         * Add a mark to the end</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>        public void addElement(MarkData m) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>            insertElementAt(m, size());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>         * Fetches the mark at the given index</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>        public MarkData elementAt(int index) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre>            int g0 = getGapStart();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>            int g1 = getGapEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>            MarkData[] array = (MarkData[]) getArray();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre>            if (index &lt; g0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>                // below gap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>                return array[index];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>                // above gap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>                index += g1 - g0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>                return array[index];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>         * Replaces the elements in the specified range with the passed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>         * in objects. This will NOT adjust the gap. The passed in indices</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>         * do not account for the gap, they are the same as would be used</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>         * int &lt;code&gt;elementAt&lt;/code&gt;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>        protected void replaceRange(int start, int end, Object[] marks) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>            int g0 = getGapStart();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre>            int g1 = getGapEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre>            int index = start;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre>            int newIndex = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>            Object[] array = (Object[]) getArray();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre>            if (start &gt;= g0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>                // Completely passed gap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>                index += (g1 - g0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>                end += (g1 - g0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>            else if (end &gt;= g0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre>                // straddles gap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>                end += (g1 - g0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre>                while (index &lt; g0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>                    array[index++] = marks[newIndex++];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>                index = g1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre>            else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>                // below gap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>                while (index &lt; end) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>                    array[index++] = marks[newIndex++];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre>            while (index &lt; end) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre>                array[index++] = marks[newIndex++];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre>        MarkData[] oneMark = new MarkData[1];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre>    // --- serialization -------------------------------------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>    private void readObject(ObjectInputStream s)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre>      throws ClassNotFoundException, IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre>        s.defaultReadObject();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre>        marks = new MarkVector();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>        search = new MarkData(0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre>        queue = new ReferenceQueue&lt;StickyPosition&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre>    // --- undo support --------------------------------------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre>     * Returns a Vector containing instances of UndoPosRef for the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre>     * Positions in the range</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>     * &lt;code&gt;offset&lt;/code&gt; to &lt;code&gt;offset&lt;/code&gt; + &lt;code&gt;length&lt;/code&gt;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre>     * If &lt;code&gt;v&lt;/code&gt; is not null the matching Positions are placed in</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre>     * there. The vector with the resulting Positions are returned.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>     * @param v the Vector to use, with a new one created on null</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre>     * @param offset the starting offset &amp;gt;= 0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre>     * @param length the length &amp;gt;= 0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>     * @return the set of instances</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre>    protected Vector getPositionsInRange(Vector v, int offset, int length) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>        int endOffset = offset + length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre>        int startIndex;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre>        int endIndex;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre>        int g0 = getGapStart();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre>        int g1 = getGapEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="719" href="#"></a></td>
+<td><pre>        // Find the index of the marks.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="720" href="#"></a></td>
+<td><pre>        if (offset &lt; g0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="721" href="#"></a></td>
+<td><pre>            if (offset == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="722" href="#"></a></td>
+<td><pre>                // findMarkAdjustIndex start at 1!</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="723" href="#"></a></td>
+<td><pre>                startIndex = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="724" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="725" href="#"></a></td>
+<td><pre>            else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="726" href="#"></a></td>
+<td><pre>                startIndex = findMarkAdjustIndex(offset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="727" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="728" href="#"></a></td>
+<td><pre>            if (endOffset &gt;= g0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="729" href="#"></a></td>
+<td><pre>                endIndex = findMarkAdjustIndex(endOffset + (g1 - g0) + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="730" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="731" href="#"></a></td>
+<td><pre>            else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="732" href="#"></a></td>
+<td><pre>                endIndex = findMarkAdjustIndex(endOffset + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="733" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="734" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="735" href="#"></a></td>
+<td><pre>        else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="736" href="#"></a></td>
+<td><pre>            startIndex = findMarkAdjustIndex(offset + (g1 - g0));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="737" href="#"></a></td>
+<td><pre>            endIndex = findMarkAdjustIndex(endOffset + (g1 - g0) + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="738" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="739" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="740" href="#"></a></td>
+<td><pre>        Vector placeIn = (v == null) ? new Vector(Math.max(1, endIndex -</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="741" href="#"></a></td>
+<td><pre>                                                           startIndex)) : v;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="742" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="743" href="#"></a></td>
+<td><pre>        for (int counter = startIndex; counter &lt; endIndex; counter++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="744" href="#"></a></td>
+<td><pre>            placeIn.addElement(new UndoPosRef(marks.elementAt(counter)));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="745" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="746" href="#"></a></td>
+<td><pre>        return placeIn;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="747" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="748" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="749" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="750" href="#"></a></td>
+<td><pre>     * Resets the location for all the UndoPosRef instances</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="751" href="#"></a></td>
+<td><pre>     * in &lt;code&gt;positions&lt;/code&gt;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="752" href="#"></a></td>
+<td><pre>     * &lt;p&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="753" href="#"></a></td>
+<td><pre>     * This is meant for internal usage, and is generally not of interest</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="754" href="#"></a></td>
+<td><pre>     * to subclasses.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="755" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="756" href="#"></a></td>
+<td><pre>     * @param positions the UndoPosRef instances to reset</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="757" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="758" href="#"></a></td>
+<td><pre>    protected void updateUndoPositions(Vector positions, int offset,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="759" href="#"></a></td>
+<td><pre>                                       int length) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="760" href="#"></a></td>
+<td><pre>        // Find the indexs of the end points.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="761" href="#"></a></td>
+<td><pre>        int endOffset = offset + length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="762" href="#"></a></td>
+<td><pre>        int g1 = getGapEnd();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="763" href="#"></a></td>
+<td><pre>        int startIndex;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="764" href="#"></a></td>
+<td><pre>        int endIndex = findMarkAdjustIndex(g1 + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="765" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="766" href="#"></a></td>
+<td><pre>        if (offset != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="767" href="#"></a></td>
+<td><pre>            startIndex = findMarkAdjustIndex(g1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="768" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="769" href="#"></a></td>
+<td><pre>        else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="770" href="#"></a></td>
+<td><pre>            startIndex = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="771" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="772" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="773" href="#"></a></td>
+<td><pre>        // Reset the location of the refenences.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="774" href="#"></a></td>
+<td><pre>        for(int counter = positions.size() - 1; counter &gt;= 0; counter--) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="775" href="#"></a></td>
+<td><pre>            UndoPosRef ref = (UndoPosRef)positions.elementAt(counter);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="776" href="#"></a></td>
+<td><pre>            ref.resetLocation(endOffset, g1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="777" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="778" href="#"></a></td>
+<td><pre>        // We have to resort the marks in the range startIndex to endIndex.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="779" href="#"></a></td>
+<td><pre>        // We can take advantage of the fact that it will be in</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="780" href="#"></a></td>
+<td><pre>        // increasing order, accept there will be a bunch of MarkData's with</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="781" href="#"></a></td>
+<td><pre>        // the index g1 (or 0 if offset == 0) interspersed throughout.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="782" href="#"></a></td>
+<td><pre>        if (startIndex &lt; endIndex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="783" href="#"></a></td>
+<td><pre>            Object[] sorted = new Object[endIndex - startIndex];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="784" href="#"></a></td>
+<td><pre>            int addIndex = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="785" href="#"></a></td>
+<td><pre>            int counter;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="786" href="#"></a></td>
+<td><pre>            if (offset == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="787" href="#"></a></td>
+<td><pre>                // If the offset is 0, the positions won't have incremented,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="788" href="#"></a></td>
+<td><pre>                // have to do the reverse thing.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="789" href="#"></a></td>
+<td><pre>                // Find the elements in startIndex whose index is 0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="790" href="#"></a></td>
+<td><pre>                for (counter = startIndex; counter &lt; endIndex; counter++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="791" href="#"></a></td>
+<td><pre>                    MarkData mark = marks.elementAt(counter);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="792" href="#"></a></td>
+<td><pre>                    if (mark.index == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="793" href="#"></a></td>
+<td><pre>                        sorted[addIndex++] = mark;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="794" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="795" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="796" href="#"></a></td>
+<td><pre>                for (counter = startIndex; counter &lt; endIndex; counter++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="797" href="#"></a></td>
+<td><pre>                    MarkData mark = marks.elementAt(counter);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="798" href="#"></a></td>
+<td><pre>                    if (mark.index != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="799" href="#"></a></td>
+<td><pre>                        sorted[addIndex++] = mark;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="800" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="801" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="802" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="803" href="#"></a></td>
+<td><pre>            else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="804" href="#"></a></td>
+<td><pre>                for (counter = startIndex; counter &lt; endIndex; counter++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="805" href="#"></a></td>
+<td><pre>                    MarkData mark = marks.elementAt(counter);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="806" href="#"></a></td>
+<td><pre>                    if (mark.index != g1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="807" href="#"></a></td>
+<td><pre>                        sorted[addIndex++] = mark;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="808" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="809" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="810" href="#"></a></td>
+<td><pre>                for (counter = startIndex; counter &lt; endIndex; counter++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="811" href="#"></a></td>
+<td><pre>                    MarkData mark = marks.elementAt(counter);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="812" href="#"></a></td>
+<td><pre>                    if (mark.index == g1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="813" href="#"></a></td>
+<td><pre>                        sorted[addIndex++] = mark;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="814" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="815" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="816" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="817" href="#"></a></td>
+<td><pre>            // And replace</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="818" href="#"></a></td>
+<td><pre>            marks.replaceRange(startIndex, endIndex, sorted);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="819" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="820" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="821" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="822" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="823" href="#"></a></td>
+<td><pre>     * Used to hold a reference to a Mark that is being reset as the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="824" href="#"></a></td>
+<td><pre>     * result of removing from the content.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="825" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="826" href="#"></a></td>
+<td><pre>    final class UndoPosRef {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="827" href="#"></a></td>
+<td><pre>        UndoPosRef(MarkData rec) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="828" href="#"></a></td>
+<td><pre>            this.rec = rec;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="829" href="#"></a></td>
+<td><pre>            this.undoLocation = rec.getOffset();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="830" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="831" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="832" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="833" href="#"></a></td>
+<td><pre>         * Resets the location of the Position to the offset when the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="834" href="#"></a></td>
+<td><pre>         * receiver was instantiated.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="835" href="#"></a></td>
+<td><pre>         *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="836" href="#"></a></td>
+<td><pre>         * @param endOffset end location of inserted string.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="837" href="#"></a></td>
+<td><pre>         * @param g1 resulting end of gap.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="838" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="839" href="#"></a></td>
+<td><pre>        protected void resetLocation(int endOffset, int g1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="840" href="#"></a></td>
+<td><pre>            if (undoLocation != endOffset) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="841" href="#"></a></td>
+<td><pre>                this.rec.index = undoLocation;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="842" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="843" href="#"></a></td>
+<td><pre>            else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="844" href="#"></a></td>
+<td><pre>                this.rec.index = g1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="845" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="846" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="847" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="848" href="#"></a></td>
+<td><pre>        /** Previous Offset of rec. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="849" href="#"></a></td>
+<td><pre>        protected int undoLocation;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="850" href="#"></a></td>
+<td><pre>        /** Mark to reset offset. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="851" href="#"></a></td>
+<td><pre>        protected MarkData rec;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="852" href="#"></a></td>
+<td><pre>    } // End of GapContent.UndoPosRef</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="853" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="854" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="855" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="856" href="#"></a></td>
+<td><pre>     * UnoableEdit created for inserts.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="857" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="858" href="#"></a></td>
+<td><pre>    class InsertUndo extends AbstractUndoableEdit {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="859" href="#"></a></td>
+<td><pre>        protected InsertUndo(int offset, int length) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="860" href="#"></a></td>
+<td><pre>            super();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="861" href="#"></a></td>
+<td><pre>            this.offset = offset;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="862" href="#"></a></td>
+<td><pre>            this.length = length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="863" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="864" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="865" href="#"></a></td>
+<td><pre>        public void undo() throws CannotUndoException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="866" href="#"></a></td>
+<td><pre>            super.undo();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="867" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="868" href="#"></a></td>
+<td><pre>                // Get the Positions in the range being removed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="869" href="#"></a></td>
+<td><pre>                posRefs = getPositionsInRange(null, offset, length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="870" href="#"></a></td>
+<td><pre>                string = getString(offset, length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="871" href="#"></a></td>
+<td><pre>                remove(offset, length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="872" href="#"></a></td>
+<td><pre>            } catch (BadLocationException bl) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="873" href="#"></a></td>
+<td><pre>              throw new CannotUndoException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="874" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="875" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="876" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="877" href="#"></a></td>
+<td><pre>        public void redo() throws CannotRedoException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="878" href="#"></a></td>
+<td><pre>            super.redo();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="879" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="880" href="#"></a></td>
+<td><pre>                insertString(offset, string);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="881" href="#"></a></td>
+<td><pre>                string = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="882" href="#"></a></td>
+<td><pre>                // Update the Positions that were in the range removed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="883" href="#"></a></td>
+<td><pre>                if(posRefs != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="884" href="#"></a></td>
+<td><pre>                    updateUndoPositions(posRefs, offset, length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="885" href="#"></a></td>
+<td><pre>                    posRefs = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="886" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="887" href="#"></a></td>
+<td><pre>            } catch (BadLocationException bl) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="888" href="#"></a></td>
+<td><pre>                throw new CannotRedoException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="889" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="890" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="891" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="892" href="#"></a></td>
+<td><pre>        /** Where string was inserted. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="893" href="#"></a></td>
+<td><pre>        protected int offset;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="894" href="#"></a></td>
+<td><pre>        /** Length of string inserted. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="895" href="#"></a></td>
+<td><pre>        protected int length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="896" href="#"></a></td>
+<td><pre>        /** The string that was inserted. This will only be valid after an</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="897" href="#"></a></td>
+<td><pre>         * undo. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="898" href="#"></a></td>
+<td><pre>        protected String string;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="899" href="#"></a></td>
+<td><pre>        /** An array of instances of UndoPosRef for the Positions in the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="900" href="#"></a></td>
+<td><pre>         * range that was removed, valid after undo. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="901" href="#"></a></td>
+<td><pre>        protected Vector posRefs;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="902" href="#"></a></td>
+<td><pre>    } // GapContent.InsertUndo</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="903" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="904" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="905" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="906" href="#"></a></td>
+<td><pre>     * UndoableEdit created for removes.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="907" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="908" href="#"></a></td>
+<td><pre>    class RemoveUndo extends AbstractUndoableEdit {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="909" href="#"></a></td>
+<td><pre>        protected RemoveUndo(int offset, String string) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="910" href="#"></a></td>
+<td><pre>            super();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="911" href="#"></a></td>
+<td><pre>            this.offset = offset;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="912" href="#"></a></td>
+<td><pre>            this.string = string;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="913" href="#"></a></td>
+<td><pre>            this.length = string.length();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="914" href="#"></a></td>
+<td><pre>            posRefs = getPositionsInRange(null, offset, length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="915" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="916" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="917" href="#"></a></td>
+<td><pre>        public void undo() throws CannotUndoException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="918" href="#"></a></td>
+<td><pre>            super.undo();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="919" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="920" href="#"></a></td>
+<td><pre>                insertString(offset, string);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="921" href="#"></a></td>
+<td><pre>                // Update the Positions that were in the range removed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="922" href="#"></a></td>
+<td><pre>                if(posRefs != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="923" href="#"></a></td>
+<td><pre>                    updateUndoPositions(posRefs, offset, length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="924" href="#"></a></td>
+<td><pre>                    posRefs = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="925" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="926" href="#"></a></td>
+<td><pre>                string = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="927" href="#"></a></td>
+<td><pre>            } catch (BadLocationException bl) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="928" href="#"></a></td>
+<td><pre>              throw new CannotUndoException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="929" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="930" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="931" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="932" href="#"></a></td>
+<td><pre>        public void redo() throws CannotRedoException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="933" href="#"></a></td>
+<td><pre>            super.redo();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="934" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="935" href="#"></a></td>
+<td><pre>                string = getString(offset, length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="936" href="#"></a></td>
+<td><pre>                // Get the Positions in the range being removed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="937" href="#"></a></td>
+<td><pre>                posRefs = getPositionsInRange(null, offset, length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="938" href="#"></a></td>
+<td><pre>                remove(offset, length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="939" href="#"></a></td>
+<td><pre>            } catch (BadLocationException bl) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="940" href="#"></a></td>
+<td><pre>              throw new CannotRedoException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="941" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="942" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="943" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="944" href="#"></a></td>
+<td><pre>        /** Where the string was removed from. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="945" href="#"></a></td>
+<td><pre>        protected int offset;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="946" href="#"></a></td>
+<td><pre>        /** Length of string removed. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="947" href="#"></a></td>
+<td><pre>        protected int length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="948" href="#"></a></td>
+<td><pre>        /** The string that was removed. This is valid when redo is valid. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="949" href="#"></a></td>
+<td><pre>        protected String string;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="950" href="#"></a></td>
+<td><pre>        /** An array of instances of UndoPosRef for the Positions in the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="951" href="#"></a></td>
+<td><pre>         * range that was removed, valid before undo. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="952" href="#"></a></td>
+<td><pre>        protected Vector posRefs;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="953" href="#"></a></td>
+<td><pre>    } // GapContent.RemoveUndo</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="954" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

@@ -3,913 +3,3631 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2002, 2012, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-package com.sun.jmx.remote.internal;
-
-import java.io.IOException;
-import java.io.NotSerializableException;
-
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.Executor;
-
-import java.security.AccessControlContext;
-import java.security.AccessController;
-import java.security.PrivilegedAction;
-import javax.security.auth.Subject;
-
-import javax.management.Notification;
-import javax.management.NotificationListener;
-import javax.management.NotificationFilter;
-import javax.management.ObjectName;
-import javax.management.MBeanServerNotification;
-import javax.management.InstanceNotFoundException;
-import javax.management.ListenerNotFoundException;
-
-import javax.management.remote.NotificationResult;
-import javax.management.remote.TargetedNotification;
-
-import com.sun.jmx.remote.util.ClassLogger;
-import com.sun.jmx.remote.util.EnvHelp;
-import java.rmi.UnmarshalException;
-
-
-public abstract class ClientNotifForwarder {
-
-    private final AccessControlContext acc;
-
-    public ClientNotifForwarder(Map env) {
-        this(null, env);
-    }
-
-    private static int threadId;
-
-    /* An Executor that allows at most one executing and one pending
-       Runnable.  It uses at most one thread -- as soon as there is
-       no pending Runnable the thread can exit.  Another thread is
-       created as soon as there is a new pending Runnable.  This
-       Executor is adapted for use in a situation where each Runnable
-       usually schedules up another Runnable.  On return from the
-       first one, the second one is immediately executed.  So this
-       just becomes a complicated way to write a while loop, but with
-       the advantage that you can replace it with another Executor,
-       for instance one that you are using to execute a bunch of other
-       unrelated work.
-
-       You might expect that a java.util.concurrent.ThreadPoolExecutor
-       with corePoolSize=0 and maximumPoolSize=1 would have the same
-       behavior, but it does not.  A ThreadPoolExecutor only creates
-       a new thread when a new task is submitted and the number of
-       existing threads is &lt; corePoolSize.  This can never happen when
-       corePoolSize=0, so new threads are never created.  Surprising,
-       but there you are.
-    */
-    private static class LinearExecutor implements Executor {
-        public synchronized void execute(Runnable command) {
-            if (this.command != null)
-                throw new IllegalArgumentException(&quot;More than one command&quot;);
-            this.command = command;
-            if (thread == null) {
-                thread = new Thread() {
-
-                    @Override
-                    public void run() {
-                        while (true) {
-                            Runnable r;
-                            synchronized (LinearExecutor.this) {
-                                if (LinearExecutor.this.command == null) {
-                                    thread = null;
-                                    return;
-                                } else {
-                                    r = LinearExecutor.this.command;
-                                    LinearExecutor.this.command = null;
-                                }
-                            }
-                            r.run();
-                        }
-                    }
-                };
-                thread.setDaemon(true);
-                thread.setName(&quot;ClientNotifForwarder-&quot; + ++threadId);
-                thread.start();
-            }
-        }
-
-        private Runnable command;
-        private Thread thread;
-    }
-
-    public ClientNotifForwarder(ClassLoader defaultClassLoader, Map&lt;String, ?&gt; env) {
-        maxNotifications = EnvHelp.getMaxFetchNotifNumber(env);
-        timeout = EnvHelp.getFetchTimeout(env);
-
-        /* You can supply an Executor in which the remote call to
-           fetchNotifications will be made.  The Executor's execute
-           method reschedules another task, so you must not use
-           an Executor that executes tasks in the caller's thread.  */
-        Executor ex = (Executor)
-            env.get(&quot;jmx.remote.x.fetch.notifications.executor&quot;);
-        if (ex == null)
-            ex = new LinearExecutor();
-        else if (logger.traceOn())
-            logger.trace(&quot;ClientNotifForwarder&quot;, &quot;executor is &quot; + ex);
-
-        this.defaultClassLoader = defaultClassLoader;
-        this.executor = ex;
-        this.acc = AccessController.getContext();
-    }
-
-    /**
-     * Called to to fetch notifications from a server.
-     */
-    abstract protected NotificationResult fetchNotifs(long clientSequenceNumber,
-                                                      int maxNotifications,
-                                                      long timeout)
-            throws IOException, ClassNotFoundException;
-
-    abstract protected Integer addListenerForMBeanRemovedNotif()
-        throws IOException, InstanceNotFoundException;
-
-    abstract protected void removeListenerForMBeanRemovedNotif(Integer id)
-        throws IOException, InstanceNotFoundException,
-               ListenerNotFoundException;
-
-    /**
-     * Used to send out a notification about lost notifs
-     */
-    abstract protected void lostNotifs(String message, long number);
-
-
-    public synchronized void addNotificationListener(Integer listenerID,
-                                        ObjectName name,
-                                        NotificationListener listener,
-                                        NotificationFilter filter,
-                                        Object handback,
-                                        Subject delegationSubject)
-            throws IOException, InstanceNotFoundException {
-
-        if (logger.traceOn()) {
-            logger.trace(&quot;addNotificationListener&quot;,
-                         &quot;Add the listener &quot;+listener+&quot; at &quot;+name);
-        }
-
-        infoList.put(listenerID,
-                     new ClientListenerInfo(listenerID,
-                                            name,
-                                            listener,
-                                            filter,
-                                            handback,
-                                            delegationSubject));
-
-
-        init(false);
-    }
-
-    public synchronized Integer[]
-        removeNotificationListener(ObjectName name,
-                                   NotificationListener listener)
-        throws ListenerNotFoundException, IOException {
-
-        beforeRemove();
-
-        if (logger.traceOn()) {
-            logger.trace(&quot;removeNotificationListener&quot;,
-                         &quot;Remove the listener &quot;+listener+&quot; from &quot;+name);
-        }
-
-        List&lt;Integer&gt; ids = new ArrayList&lt;Integer&gt;();
-        List&lt;ClientListenerInfo&gt; values =
-                new ArrayList&lt;ClientListenerInfo&gt;(infoList.values());
-        for (int i=values.size()-1; i&gt;=0; i--) {
-            ClientListenerInfo li = values.get(i);
-
-            if (li.sameAs(name, listener)) {
-                ids.add(li.getListenerID());
-
-                infoList.remove(li.getListenerID());
-            }
-        }
-
-        if (ids.isEmpty())
-            throw new ListenerNotFoundException(&quot;Listener not found&quot;);
-
-        return ids.toArray(new Integer[0]);
-    }
-
-    public synchronized Integer
-        removeNotificationListener(ObjectName name,
-                                   NotificationListener listener,
-                                   NotificationFilter filter,
-                                   Object handback)
-            throws ListenerNotFoundException, IOException {
-
-        if (logger.traceOn()) {
-            logger.trace(&quot;removeNotificationListener&quot;,
-                         &quot;Remove the listener &quot;+listener+&quot; from &quot;+name);
-        }
-
-        beforeRemove();
-
-        Integer id = null;
-
-        List&lt;ClientListenerInfo&gt; values =
-                new ArrayList&lt;ClientListenerInfo&gt;(infoList.values());
-        for (int i=values.size()-1; i&gt;=0; i--) {
-            ClientListenerInfo li = values.get(i);
-            if (li.sameAs(name, listener, filter, handback)) {
-                id=li.getListenerID();
-
-                infoList.remove(id);
-
-                break;
-            }
-        }
-
-        if (id == null)
-            throw new ListenerNotFoundException(&quot;Listener not found&quot;);
-
-        return id;
-    }
-
-    public synchronized Integer[] removeNotificationListener(ObjectName name) {
-        if (logger.traceOn()) {
-            logger.trace(&quot;removeNotificationListener&quot;,
-                         &quot;Remove all listeners registered at &quot;+name);
-        }
-
-        List&lt;Integer&gt; ids = new ArrayList&lt;Integer&gt;();
-
-        List&lt;ClientListenerInfo&gt; values =
-                new ArrayList&lt;ClientListenerInfo&gt;(infoList.values());
-        for (int i=values.size()-1; i&gt;=0; i--) {
-            ClientListenerInfo li = values.get(i);
-            if (li.sameAs(name)) {
-                ids.add(li.getListenerID());
-
-                infoList.remove(li.getListenerID());
-            }
-        }
-
-        return ids.toArray(new Integer[0]);
-    }
-
-    /*
-     * Called when a connector is doing reconnection. Like &lt;code&gt;postReconnection&lt;/code&gt;,
-     * this method is intended to be called only by a client connector:
-     * &lt;code&gt;RMIConnector&lt;/code&gt; and &lt;code&gt;ClientIntermediary&lt;/code&gt;.
-     * Call this method will set the flag beingReconnection to &lt;code&gt;true&lt;/code&gt;,
-     * and the thread used to fetch notifis will be stopped, a new thread can be
-     * created only after the method &lt;code&gt;postReconnection&lt;/code&gt; is called.
-     *
-     * It is caller's responsiblity to not re-call this method before calling
-     * &lt;code&gt;postReconnection&lt;/code&gt;.
-     */
-    public synchronized ClientListenerInfo[] preReconnection() throws IOException {
-        if (state == TERMINATED || beingReconnected) { // should never
-            throw new IOException(&quot;Illegal state.&quot;);
-        }
-
-        final ClientListenerInfo[] tmp =
-            infoList.values().toArray(new ClientListenerInfo[0]);
-
-
-        beingReconnected = true;
-
-        infoList.clear();
-
-        return tmp;
-    }
-
-    /**
-     * Called after reconnection is finished.
-     * This method is intended to be called only by a client connector:
-     * &lt;code&gt;RMIConnector&lt;/code&gt; and &lt;code&gt;ClientIntermediary&lt;/code&gt;.
-     */
-    public synchronized void postReconnection(ClientListenerInfo[] listenerInfos)
-        throws IOException {
-
-        if (state == TERMINATED) {
-            return;
-        }
-
-        while (state == STOPPING) {
-            try {
-                wait();
-            } catch (InterruptedException ire) {
-                IOException ioe = new IOException(ire.toString());
-                EnvHelp.initCause(ioe, ire);
-                throw ioe;
-            }
-        }
-
-        final boolean trace = logger.traceOn();
-        final int len   = listenerInfos.length;
-
-        for (int i=0; i&lt;len; i++) {
-            if (trace) {
-                logger.trace(&quot;addNotificationListeners&quot;,
-                             &quot;Add a listener at &quot;+
-                             listenerInfos[i].getListenerID());
-            }
-
-            infoList.put(listenerInfos[i].getListenerID(), listenerInfos[i]);
-        }
-
-        beingReconnected = false;
-        notifyAll();
-
-        if (currentFetchThread == Thread.currentThread() ||
-              state == STARTING || state == STARTED) { // doing or waiting reconnection
-              // only update mbeanRemovedNotifID
-            try {
-                mbeanRemovedNotifID = addListenerForMBeanRemovedNotif();
-            } catch (Exception e) {
-                final String msg =
-                    &quot;Failed to register a listener to the mbean &quot; +
-                    &quot;server: the client will not do clean when an MBean &quot; +
-                    &quot;is unregistered&quot;;
-                if (logger.traceOn()) {
-                    logger.trace(&quot;init&quot;, msg, e);
-                }
-            }
-        } else {
-              while (state == STOPPING) {
-                  try {
-                      wait();
-                  } catch (InterruptedException ire) {
-                      IOException ioe = new IOException(ire.toString());
-                      EnvHelp.initCause(ioe, ire);
-                      throw ioe;
-                  }
-              }
-
-              if (listenerInfos.length &gt; 0) { // old listeners are re-added
-                  init(true); // not update clientSequenceNumber
-              } else if (infoList.size() &gt; 0) { // only new listeners added during reconnection
-                  init(false); // need update clientSequenceNumber
-              }
-          }
-    }
-
-    public synchronized void terminate() {
-        if (state == TERMINATED) {
-            return;
-        }
-
-        if (logger.traceOn()) {
-            logger.trace(&quot;terminate&quot;, &quot;Terminating...&quot;);
-        }
-
-        if (state == STARTED) {
-           infoList.clear();
-        }
-
-        setState(TERMINATED);
-    }
-
-
-    // -------------------------------------------------
-    // private classes
-    // -------------------------------------------------
-    //
-
-    private class NotifFetcher implements Runnable {
-
-        private volatile boolean alreadyLogged = false;
-
-        private void logOnce(String msg, SecurityException x) {
-            if (alreadyLogged) return;
-            // Log only once.
-            logger.config(&quot;setContextClassLoader&quot;,msg);
-            if (x != null) logger.fine(&quot;setContextClassLoader&quot;, x);
-            alreadyLogged = true;
-        }
-
-        // Set new context class loader, returns previous one.
-        private final ClassLoader setContextClassLoader(final ClassLoader loader) {
-            final AccessControlContext ctxt = ClientNotifForwarder.this.acc;
-            // if ctxt is null, log a config message and throw a
-            // SecurityException.
-            if (ctxt == null) {
-                logOnce(&quot;AccessControlContext must not be null.&quot;,null);
-                throw new SecurityException(&quot;AccessControlContext must not be null&quot;);
-            }
-            return AccessController.doPrivileged(
-                new PrivilegedAction&lt;ClassLoader&gt;() {
-                    public ClassLoader run() {
-                        try {
-                            // get context class loader - may throw
-                            // SecurityException - though unlikely.
-                            final ClassLoader previous =
-                                Thread.currentThread().getContextClassLoader();
-
-                            // if nothing needs to be done, break here...
-                            if (loader == previous) return previous;
-
-                            // reset context class loader - may throw
-                            // SecurityException
-                            Thread.currentThread().setContextClassLoader(loader);
-                            return previous;
-                        } catch (SecurityException x) {
-                            logOnce(&quot;Permission to set ContextClassLoader missing. &quot; +
-                                    &quot;Notifications will not be dispatched. &quot; +
-                                    &quot;Please check your Java policy configuration: &quot; +
-                                    x, x);
-                            throw x;
-                        }
-                    }
-                }, ctxt);
-        }
-
-        public void run() {
-            final ClassLoader previous;
-            if (defaultClassLoader != null) {
-                previous = setContextClassLoader(defaultClassLoader);
-            } else {
-                previous = null;
-            }
-            try {
-                doRun();
-            } finally {
-                if (defaultClassLoader != null) {
-                    setContextClassLoader(previous);
-                }
-            }
-        }
-
-        private void doRun() {
-            synchronized (ClientNotifForwarder.this) {
-                currentFetchThread = Thread.currentThread();
-
-                if (state == STARTING) {
-                    setState(STARTED);
-                }
-            }
-
-
-            NotificationResult nr = null;
-            if (!shouldStop() &amp;&amp; (nr = fetchNotifs()) != null) {
-                // nr == null means got exception
-
-                final TargetedNotification[] notifs =
-                    nr.getTargetedNotifications();
-                final int len = notifs.length;
-                final Map&lt;Integer, ClientListenerInfo&gt; listeners;
-                final Integer myListenerID;
-
-                long missed = 0;
-
-                synchronized(ClientNotifForwarder.this) {
-                    // check sequence number.
-                    //
-                    if (clientSequenceNumber &gt;= 0) {
-                        missed = nr.getEarliestSequenceNumber() -
-                            clientSequenceNumber;
-                    }
-
-                    clientSequenceNumber = nr.getNextSequenceNumber();
-
-                    listeners = new HashMap&lt;Integer, ClientListenerInfo&gt;();
-
-                    for (int i = 0 ; i &lt; len ; i++) {
-                        final TargetedNotification tn = notifs[i];
-                        final Integer listenerID = tn.getListenerID();
-
-                        // check if an mbean unregistration notif
-                        if (!listenerID.equals(mbeanRemovedNotifID)) {
-                            final ClientListenerInfo li = infoList.get(listenerID);
-                            if (li != null) {
-                                listeners.put(listenerID, li);
-                            }
-                            continue;
-                        }
-                        final Notification notif = tn.getNotification();
-                        final String unreg =
-                            MBeanServerNotification.UNREGISTRATION_NOTIFICATION;
-                        if (notif instanceof MBeanServerNotification &amp;&amp;
-                            notif.getType().equals(unreg)) {
-
-                            MBeanServerNotification mbsn =
-                                (MBeanServerNotification) notif;
-                            ObjectName name = mbsn.getMBeanName();
-
-                            removeNotificationListener(name);
-                        }
-                    }
-                    myListenerID = mbeanRemovedNotifID;
-                }
-
-                if (missed &gt; 0) {
-                    final String msg =
-                        &quot;May have lost up to &quot; + missed +
-                        &quot; notification&quot; + (missed == 1 ? &quot;&quot; : &quot;s&quot;);
-                    lostNotifs(msg, missed);
-                    logger.trace(&quot;NotifFetcher.run&quot;, msg);
-                }
-
-                // forward
-                for (int i = 0 ; i &lt; len ; i++) {
-                    final TargetedNotification tn = notifs[i];
-                    dispatchNotification(tn,myListenerID,listeners);
-                }
-            }
-
-            synchronized (ClientNotifForwarder.this) {
-                currentFetchThread = null;
-            }
-
-            if (nr == null || shouldStop()) {
-                // tell that the thread is REALLY stopped
-                setState(STOPPED);
-
-                try {
-                      removeListenerForMBeanRemovedNotif(mbeanRemovedNotifID);
-                } catch (Exception e) {
-                    if (logger.traceOn()) {
-                        logger.trace(&quot;NotifFetcher-run&quot;,
-                                &quot;removeListenerForMBeanRemovedNotif&quot;, e);
-                    }
-                }
-            } else {
-                executor.execute(this);
-            }
-        }
-
-        void dispatchNotification(TargetedNotification tn,
-                                  Integer myListenerID,
-                                  Map&lt;Integer, ClientListenerInfo&gt; listeners) {
-            final Notification notif = tn.getNotification();
-            final Integer listenerID = tn.getListenerID();
-
-            if (listenerID.equals(myListenerID)) return;
-            final ClientListenerInfo li = listeners.get(listenerID);
-
-            if (li == null) {
-                logger.trace(&quot;NotifFetcher.dispatch&quot;,
-                             &quot;Listener ID not in map&quot;);
-                return;
-            }
-
-            NotificationListener l = li.getListener();
-            Object h = li.getHandback();
-            try {
-                l.handleNotification(notif, h);
-            } catch (RuntimeException e) {
-                final String msg =
-                    &quot;Failed to forward a notification &quot; +
-                    &quot;to a listener&quot;;
-                logger.trace(&quot;NotifFetcher-run&quot;, msg, e);
-            }
-
-        }
-
-        private NotificationResult fetchNotifs() {
-            try {
-                NotificationResult nr = ClientNotifForwarder.this.
-                    fetchNotifs(clientSequenceNumber,maxNotifications,
-                                timeout);
-
-                if (logger.traceOn()) {
-                    logger.trace(&quot;NotifFetcher-run&quot;,
-                                 &quot;Got notifications from the server: &quot;+nr);
-                }
-
-                return nr;
-            } catch (ClassNotFoundException | NotSerializableException | UnmarshalException e) {
-                logger.trace(&quot;NotifFetcher.fetchNotifs&quot;, e);
-                return fetchOneNotif();
-            } catch (IOException ioe) {
-                if (!shouldStop()) {
-                    logger.error(&quot;NotifFetcher-run&quot;,
-                                 &quot;Failed to fetch notification, &quot; +
-                                 &quot;stopping thread. Error is: &quot; + ioe, ioe);
-                    logger.debug(&quot;NotifFetcher-run&quot;,ioe);
-                }
-
-                // no more fetching
-                return null;
-            }
-        }
-
-        /* Fetch one notification when we suspect that it might be a
-           notification that we can't deserialize (because of a
-           missing class).  First we ask for 0 notifications with 0
-           timeout.  This allows us to skip sequence numbers for
-           notifications that don't match our filters.  Then we ask
-           for one notification.  If that produces a
-           ClassNotFoundException, NotSerializableException or
-           UnmarshalException, we increase our sequence number and ask again.
-           Eventually we will either get a successful notification, or a
-           return with 0 notifications.  In either case we can return a
-           NotificationResult.  This algorithm works (albeit less
-           well) even if the server implementation doesn't optimize a
-           request for 0 notifications to skip sequence numbers for
-           notifications that don't match our filters.
-
-           If we had at least one
-           ClassNotFoundException/NotSerializableException/UnmarshalException,
-           then we must emit a JMXConnectionNotification.LOST_NOTIFS.
-        */
-        private NotificationResult fetchOneNotif() {
-            ClientNotifForwarder cnf = ClientNotifForwarder.this;
-
-            long startSequenceNumber = clientSequenceNumber;
-
-            int notFoundCount = 0;
-
-            NotificationResult result = null;
-            long firstEarliest = -1;
-
-            while (result == null &amp;&amp; !shouldStop()) {
-                NotificationResult nr;
-
-                try {
-                    // 0 notifs to update startSequenceNumber
-                    nr = cnf.fetchNotifs(startSequenceNumber, 0, 0L);
-                } catch (ClassNotFoundException e) {
-                    logger.warning(&quot;NotifFetcher.fetchOneNotif&quot;,
-                                   &quot;Impossible exception: &quot; + e);
-                    logger.debug(&quot;NotifFetcher.fetchOneNotif&quot;,e);
-                    return null;
-                } catch (IOException e) {
-                    if (!shouldStop())
-                        logger.trace(&quot;NotifFetcher.fetchOneNotif&quot;, e);
-                    return null;
-                }
-
-                if (shouldStop())
-                    return null;
-
-                startSequenceNumber = nr.getNextSequenceNumber();
-                if (firstEarliest &lt; 0)
-                    firstEarliest = nr.getEarliestSequenceNumber();
-
-                try {
-                    // 1 notif to skip possible missing class
-                    result = cnf.fetchNotifs(startSequenceNumber, 1, 0L);
-                } catch (ClassNotFoundException | NotSerializableException | UnmarshalException e) {
-                    logger.warning(&quot;NotifFetcher.fetchOneNotif&quot;,
-                                   &quot;Failed to deserialize a notification: &quot;+e.toString());
-                    if (logger.traceOn()) {
-                        logger.trace(&quot;NotifFetcher.fetchOneNotif&quot;,
-                                     &quot;Failed to deserialize a notification.&quot;, e);
-                    }
-
-                    notFoundCount++;
-                    startSequenceNumber++;
-                } catch (Exception e) {
-                    if (!shouldStop())
-                        logger.trace(&quot;NotifFetcher.fetchOneNotif&quot;, e);
-                    return null;
-                }
-            }
-
-            if (notFoundCount &gt; 0) {
-                final String msg =
-                    &quot;Dropped &quot; + notFoundCount + &quot; notification&quot; +
-                    (notFoundCount == 1 ? &quot;&quot; : &quot;s&quot;) +
-                    &quot; because classes were missing locally or incompatible&quot;;
-                lostNotifs(msg, notFoundCount);
-                // Even if result.getEarliestSequenceNumber() is now greater than
-                // it was initially, meaning some notifs have been dropped
-                // from the buffer, we don't want the caller to see that
-                // because it is then likely to renotify about the lost notifs.
-                // So we put back the first value of earliestSequenceNumber
-                // that we saw.
-                if (result != null) {
-                    result = new NotificationResult(
-                            firstEarliest, result.getNextSequenceNumber(),
-                            result.getTargetedNotifications());
-                }
-            }
-
-            return result;
-        }
-
-        private boolean shouldStop() {
-            synchronized (ClientNotifForwarder.this) {
-                if (state != STARTED) {
-                    return true;
-                } else if (infoList.size() == 0) {
-                    // no more listener, stop fetching
-                    setState(STOPPING);
-
-                    return true;
-                }
-
-                return false;
-            }
-        }
-    }
-
-
-// -------------------------------------------------
-// private methods
-// -------------------------------------------------
-    private synchronized void setState(int newState) {
-        if (state == TERMINATED) {
-            return;
-        }
-
-        state = newState;
-        this.notifyAll();
-    }
-
-    /*
-     * Called to decide whether need to start a thread for fetching notifs.
-     * &lt;P&gt;The parameter reconnected will decide whether to initilize the clientSequenceNumber,
-     * initilaizing the clientSequenceNumber means to ignore all notifications arrived before.
-     * If it is reconnected, we will not initialize in order to get all notifications arrived
-     * during the reconnection. It may cause the newly registered listeners to receive some
-     * notifications arrived before its registray.
-     */
-    private synchronized void init(boolean reconnected) throws IOException {
-        switch (state) {
-        case STARTED:
-            return;
-        case STARTING:
-            return;
-        case TERMINATED:
-            throw new IOException(&quot;The ClientNotifForwarder has been terminated.&quot;);
-        case STOPPING:
-            if (beingReconnected == true) {
-                // wait for another thread to do, which is doing reconnection
-                return;
-            }
-
-            while (state == STOPPING) { // make sure only one fetching thread.
-                try {
-                    wait();
-                } catch (InterruptedException ire) {
-                    IOException ioe = new IOException(ire.toString());
-                    EnvHelp.initCause(ioe, ire);
-
-                    throw ioe;
-                }
-            }
-
-            // re-call this method to check the state again,
-            // the state can be other value like TERMINATED.
-            init(reconnected);
-
-            return;
-        case STOPPED:
-            if (beingReconnected == true) {
-                // wait for another thread to do, which is doing reconnection
-                return;
-            }
-
-            if (logger.traceOn()) {
-                logger.trace(&quot;init&quot;, &quot;Initializing...&quot;);
-            }
-
-            // init the clientSequenceNumber if not reconnected.
-            if (!reconnected) {
-                try {
-                    NotificationResult nr = fetchNotifs(-1, 0, 0);
-                    clientSequenceNumber = nr.getNextSequenceNumber();
-                } catch (ClassNotFoundException e) {
-                    // can't happen
-                    logger.warning(&quot;init&quot;, &quot;Impossible exception: &quot;+ e);
-                    logger.debug(&quot;init&quot;,e);
-                }
-            }
-
-            // for cleaning
-            try {
-                mbeanRemovedNotifID = addListenerForMBeanRemovedNotif();
-            } catch (Exception e) {
-                final String msg =
-                    &quot;Failed to register a listener to the mbean &quot; +
-                    &quot;server: the client will not do clean when an MBean &quot; +
-                    &quot;is unregistered&quot;;
-                if (logger.traceOn()) {
-                    logger.trace(&quot;init&quot;, msg, e);
-                }
-            }
-
-            setState(STARTING);
-
-            // start fetching
-            executor.execute(new NotifFetcher());
-
-            return;
-        default:
-            // should not
-            throw new IOException(&quot;Unknown state.&quot;);
-        }
-    }
-
-    /**
-     * Import: should not remove a listener during reconnection, the reconnection
-     * needs to change the listener list and that will possibly make removal fail.
-     */
-    private synchronized void beforeRemove() throws IOException {
-        while (beingReconnected) {
-            if (state == TERMINATED) {
-                throw new IOException(&quot;Terminated.&quot;);
-            }
-
-            try {
-                wait();
-            } catch (InterruptedException ire) {
-                IOException ioe = new IOException(ire.toString());
-                EnvHelp.initCause(ioe, ire);
-
-                throw ioe;
-            }
-        }
-
-        if (state == TERMINATED) {
-            throw new IOException(&quot;Terminated.&quot;);
-        }
-    }
-
-// -------------------------------------------------
-// private variables
-// -------------------------------------------------
-
-    private final ClassLoader defaultClassLoader;
-    private final Executor executor;
-
-    private final Map&lt;Integer, ClientListenerInfo&gt; infoList =
-            new HashMap&lt;Integer, ClientListenerInfo&gt;();
-
-    // notif stuff
-    private long clientSequenceNumber = -1;
-    private final int maxNotifications;
-    private final long timeout;
-    private Integer mbeanRemovedNotifID = null;
-    private Thread currentFetchThread;
-
-    // state
-    /**
-     * This state means that a thread is being created for fetching and forwarding notifications.
-     */
-    private static final int STARTING = 0;
-
-    /**
-     * This state tells that a thread has been started for fetching and forwarding notifications.
-     */
-    private static final int STARTED = 1;
-
-    /**
-     * This state means that the fetching thread is informed to stop.
-     */
-    private static final int STOPPING = 2;
-
-    /**
-     * This state means that the fetching thread is already stopped.
-     */
-    private static final int STOPPED = 3;
-
-    /**
-     * This state means that this object is terminated and no more thread will be created
-     * for fetching notifications.
-     */
-    private static final int TERMINATED = 4;
-
-    private int state = STOPPED;
-
-    /**
-     * This variable is used to tell whether a connector (RMIConnector or ClientIntermediary)
-     * is doing reconnection.
-     * This variable will be set to true by the method &lt;code&gt;preReconnection&lt;/code&gt;, and set
-     * to false by &lt;code&gt;postReconnection&lt;/code&gt;.
-     * When beingReconnected == true, no thread will be created for fetching notifications.
-     */
-    private boolean beingReconnected = false;
-
-    private static final ClassLogger logger =
-        new ClassLogger(&quot;javax.management.remote.misc&quot;,
-                        &quot;ClientNotifForwarder&quot;);
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2002, 2012, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre>package com.sun.jmx.remote.internal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre>import java.io.IOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.io.NotSerializableException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.util.ArrayList;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.util.HashMap;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.util.List;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.util.Map;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.util.concurrent.Executor;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.security.AccessControlContext;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import java.security.AccessController;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import java.security.PrivilegedAction;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import javax.security.auth.Subject;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre>import javax.management.Notification;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>import javax.management.NotificationListener;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>import javax.management.NotificationFilter;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre>import javax.management.ObjectName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre>import javax.management.MBeanServerNotification;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>import javax.management.InstanceNotFoundException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre>import javax.management.ListenerNotFoundException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre>import javax.management.remote.NotificationResult;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre>import javax.management.remote.TargetedNotification;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre>import com.sun.jmx.remote.util.ClassLogger;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre>import com.sun.jmx.remote.util.EnvHelp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre>import java.rmi.UnmarshalException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>public abstract class ClientNotifForwarder {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre>    private final AccessControlContext acc;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>    public ClientNotifForwarder(Map env) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre>        this(null, env);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>    private static int threadId;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>    /* An Executor that allows at most one executing and one pending</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>       Runnable.  It uses at most one thread -- as soon as there is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>       no pending Runnable the thread can exit.  Another thread is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>       created as soon as there is a new pending Runnable.  This</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>       Executor is adapted for use in a situation where each Runnable</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>       usually schedules up another Runnable.  On return from the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>       first one, the second one is immediately executed.  So this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>       just becomes a complicated way to write a while loop, but with</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>       the advantage that you can replace it with another Executor,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>       for instance one that you are using to execute a bunch of other</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>       unrelated work.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>       You might expect that a java.util.concurrent.ThreadPoolExecutor</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>       with corePoolSize=0 and maximumPoolSize=1 would have the same</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>       behavior, but it does not.  A ThreadPoolExecutor only creates</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>       a new thread when a new task is submitted and the number of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>       existing threads is &lt; corePoolSize.  This can never happen when</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>       corePoolSize=0, so new threads are never created.  Surprising,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>       but there you are.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>    */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>    private static class LinearExecutor implements Executor {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>        public synchronized void execute(Runnable command) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>            if (this.command != null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>                throw new IllegalArgumentException(&quot;More than one command&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>            this.command = command;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>            if (thread == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>                thread = new Thread() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>                    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>                    public void run() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>                        while (true) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>                            Runnable r;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>                            synchronized (LinearExecutor.this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>                                if (LinearExecutor.this.command == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>                                    thread = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>                                    return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>                                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>                                    r = LinearExecutor.this.command;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>                                    LinearExecutor.this.command = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>                            r.run();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>                };</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>                thread.setDaemon(true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>                thread.setName(&quot;ClientNotifForwarder-&quot; + ++threadId);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>                thread.start();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>        private Runnable command;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>        private Thread thread;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>    public ClientNotifForwarder(ClassLoader defaultClassLoader, Map&lt;String, ?&gt; env) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>        maxNotifications = EnvHelp.getMaxFetchNotifNumber(env);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>        timeout = EnvHelp.getFetchTimeout(env);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>        /* You can supply an Executor in which the remote call to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>           fetchNotifications will be made.  The Executor's execute</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>           method reschedules another task, so you must not use</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>           an Executor that executes tasks in the caller's thread.  */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>        Executor ex = (Executor)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>            env.get(&quot;jmx.remote.x.fetch.notifications.executor&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>        if (ex == null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>            ex = new LinearExecutor();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>        else if (logger.traceOn())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>            logger.trace(&quot;ClientNotifForwarder&quot;, &quot;executor is &quot; + ex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>        this.defaultClassLoader = defaultClassLoader;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>        this.executor = ex;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>        this.acc = AccessController.getContext();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>     * Called to to fetch notifications from a server.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>    abstract protected NotificationResult fetchNotifs(long clientSequenceNumber,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>                                                      int maxNotifications,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>                                                      long timeout)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>            throws IOException, ClassNotFoundException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>    abstract protected Integer addListenerForMBeanRemovedNotif()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>        throws IOException, InstanceNotFoundException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>    abstract protected void removeListenerForMBeanRemovedNotif(Integer id)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>        throws IOException, InstanceNotFoundException,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>               ListenerNotFoundException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>     * Used to send out a notification about lost notifs</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>    abstract protected void lostNotifs(String message, long number);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>    public synchronized void addNotificationListener(Integer listenerID,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>                                        ObjectName name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>                                        NotificationListener listener,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>                                        NotificationFilter filter,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>                                        Object handback,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>                                        Subject delegationSubject)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>            throws IOException, InstanceNotFoundException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>        if (logger.traceOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>            logger.trace(&quot;addNotificationListener&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>                         &quot;Add the listener &quot;+listener+&quot; at &quot;+name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>        infoList.put(listenerID,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>                     new ClientListenerInfo(listenerID,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>                                            name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>                                            listener,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>                                            filter,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>                                            handback,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>                                            delegationSubject));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>        init(false);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>    public synchronized Integer[]</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>        removeNotificationListener(ObjectName name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>                                   NotificationListener listener)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>        throws ListenerNotFoundException, IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>        beforeRemove();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>        if (logger.traceOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>            logger.trace(&quot;removeNotificationListener&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>                         &quot;Remove the listener &quot;+listener+&quot; from &quot;+name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>        List&lt;Integer&gt; ids = new ArrayList&lt;Integer&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>        List&lt;ClientListenerInfo&gt; values =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>                new ArrayList&lt;ClientListenerInfo&gt;(infoList.values());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>        for (int i=values.size()-1; i&gt;=0; i--) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>            ClientListenerInfo li = values.get(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>            if (li.sameAs(name, listener)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>                ids.add(li.getListenerID());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>                infoList.remove(li.getListenerID());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>        if (ids.isEmpty())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>            throw new ListenerNotFoundException(&quot;Listener not found&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>        return ids.toArray(new Integer[0]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>    public synchronized Integer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>        removeNotificationListener(ObjectName name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>                                   NotificationListener listener,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>                                   NotificationFilter filter,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>                                   Object handback)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>            throws ListenerNotFoundException, IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>        if (logger.traceOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>            logger.trace(&quot;removeNotificationListener&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>                         &quot;Remove the listener &quot;+listener+&quot; from &quot;+name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>        beforeRemove();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>        Integer id = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>        List&lt;ClientListenerInfo&gt; values =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>                new ArrayList&lt;ClientListenerInfo&gt;(infoList.values());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>        for (int i=values.size()-1; i&gt;=0; i--) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>            ClientListenerInfo li = values.get(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>            if (li.sameAs(name, listener, filter, handback)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>                id=li.getListenerID();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>                infoList.remove(id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>        if (id == null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>            throw new ListenerNotFoundException(&quot;Listener not found&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>        return id;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>    public synchronized Integer[] removeNotificationListener(ObjectName name) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>        if (logger.traceOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>            logger.trace(&quot;removeNotificationListener&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>                         &quot;Remove all listeners registered at &quot;+name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>        List&lt;Integer&gt; ids = new ArrayList&lt;Integer&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>        List&lt;ClientListenerInfo&gt; values =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>                new ArrayList&lt;ClientListenerInfo&gt;(infoList.values());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>        for (int i=values.size()-1; i&gt;=0; i--) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>            ClientListenerInfo li = values.get(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>            if (li.sameAs(name)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>                ids.add(li.getListenerID());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>                infoList.remove(li.getListenerID());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>        return ids.toArray(new Integer[0]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>     * Called when a connector is doing reconnection. Like &lt;code&gt;postReconnection&lt;/code&gt;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>     * this method is intended to be called only by a client connector:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>     * &lt;code&gt;RMIConnector&lt;/code&gt; and &lt;code&gt;ClientIntermediary&lt;/code&gt;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>     * Call this method will set the flag beingReconnection to &lt;code&gt;true&lt;/code&gt;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>     * and the thread used to fetch notifis will be stopped, a new thread can be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>     * created only after the method &lt;code&gt;postReconnection&lt;/code&gt; is called.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>     * It is caller's responsiblity to not re-call this method before calling</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>     * &lt;code&gt;postReconnection&lt;/code&gt;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>    public synchronized ClientListenerInfo[] preReconnection() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>        if (state == TERMINATED || beingReconnected) { // should never</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>            throw new IOException(&quot;Illegal state.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>        final ClientListenerInfo[] tmp =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>            infoList.values().toArray(new ClientListenerInfo[0]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>        beingReconnected = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>        infoList.clear();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>        return tmp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>     * Called after reconnection is finished.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>     * This method is intended to be called only by a client connector:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>     * &lt;code&gt;RMIConnector&lt;/code&gt; and &lt;code&gt;ClientIntermediary&lt;/code&gt;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>    public synchronized void postReconnection(ClientListenerInfo[] listenerInfos)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>        throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>        if (state == TERMINATED) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>        while (state == STOPPING) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>                wait();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>            } catch (InterruptedException ire) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>                IOException ioe = new IOException(ire.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>                EnvHelp.initCause(ioe, ire);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>                throw ioe;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>        final boolean trace = logger.traceOn();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>        final int len   = listenerInfos.length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>        for (int i=0; i&lt;len; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>            if (trace) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>                logger.trace(&quot;addNotificationListeners&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>                             &quot;Add a listener at &quot;+</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>                             listenerInfos[i].getListenerID());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>            infoList.put(listenerInfos[i].getListenerID(), listenerInfos[i]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>        beingReconnected = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>        notifyAll();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>        if (currentFetchThread == Thread.currentThread() ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>              state == STARTING || state == STARTED) { // doing or waiting reconnection</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>              // only update mbeanRemovedNotifID</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>                mbeanRemovedNotifID = addListenerForMBeanRemovedNotif();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>            } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>                final String msg =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>                    &quot;Failed to register a listener to the mbean &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>                    &quot;server: the client will not do clean when an MBean &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>                    &quot;is unregistered&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>                if (logger.traceOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>                    logger.trace(&quot;init&quot;, msg, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>              while (state == STOPPING) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>                  try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>                      wait();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>                  } catch (InterruptedException ire) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>                      IOException ioe = new IOException(ire.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>                      EnvHelp.initCause(ioe, ire);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>                      throw ioe;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>                  }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>              }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>              if (listenerInfos.length &gt; 0) { // old listeners are re-added</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>                  init(true); // not update clientSequenceNumber</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>              } else if (infoList.size() &gt; 0) { // only new listeners added during reconnection</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>                  init(false); // need update clientSequenceNumber</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>              }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>          }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>    public synchronized void terminate() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>        if (state == TERMINATED) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>        if (logger.traceOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>            logger.trace(&quot;terminate&quot;, &quot;Terminating...&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>        if (state == STARTED) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>           infoList.clear();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>        setState(TERMINATED);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>    // -------------------------------------------------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>    // private classes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>    // -------------------------------------------------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>    private class NotifFetcher implements Runnable {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>        private volatile boolean alreadyLogged = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>        private void logOnce(String msg, SecurityException x) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>            if (alreadyLogged) return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>            // Log only once.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>            logger.config(&quot;setContextClassLoader&quot;,msg);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>            if (x != null) logger.fine(&quot;setContextClassLoader&quot;, x);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>            alreadyLogged = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>        // Set new context class loader, returns previous one.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>        private final ClassLoader setContextClassLoader(final ClassLoader loader) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>            final AccessControlContext ctxt = ClientNotifForwarder.this.acc;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>            // if ctxt is null, log a config message and throw a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>            // SecurityException.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>            if (ctxt == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>                logOnce(&quot;AccessControlContext must not be null.&quot;,null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>                throw new SecurityException(&quot;AccessControlContext must not be null&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>            return AccessController.doPrivileged(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>                new PrivilegedAction&lt;ClassLoader&gt;() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>                    public ClassLoader run() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>                        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>                            // get context class loader - may throw</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>                            // SecurityException - though unlikely.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>                            final ClassLoader previous =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>                                Thread.currentThread().getContextClassLoader();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>                            // if nothing needs to be done, break here...</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>                            if (loader == previous) return previous;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>                            // reset context class loader - may throw</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>                            // SecurityException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>                            Thread.currentThread().setContextClassLoader(loader);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>                            return previous;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>                        } catch (SecurityException x) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>                            logOnce(&quot;Permission to set ContextClassLoader missing. &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>                                    &quot;Notifications will not be dispatched. &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>                                    &quot;Please check your Java policy configuration: &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>                                    x, x);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>                            throw x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>                }, ctxt);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>        public void run() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>            final ClassLoader previous;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>            if (defaultClassLoader != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>                previous = setContextClassLoader(defaultClassLoader);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>                previous = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>                doRun();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>            } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>                if (defaultClassLoader != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>                    setContextClassLoader(previous);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>        private void doRun() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>            synchronized (ClientNotifForwarder.this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>                currentFetchThread = Thread.currentThread();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>                if (state == STARTING) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>                    setState(STARTED);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>            NotificationResult nr = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>            if (!shouldStop() &amp;&amp; (nr = fetchNotifs()) != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>                // nr == null means got exception</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>                final TargetedNotification[] notifs =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>                    nr.getTargetedNotifications();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>                final int len = notifs.length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>                final Map&lt;Integer, ClientListenerInfo&gt; listeners;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>                final Integer myListenerID;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>                long missed = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>                synchronized(ClientNotifForwarder.this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>                    // check sequence number.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>                    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>                    if (clientSequenceNumber &gt;= 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>                        missed = nr.getEarliestSequenceNumber() -</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>                            clientSequenceNumber;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>                    clientSequenceNumber = nr.getNextSequenceNumber();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>                    listeners = new HashMap&lt;Integer, ClientListenerInfo&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>                    for (int i = 0 ; i &lt; len ; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>                        final TargetedNotification tn = notifs[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>                        final Integer listenerID = tn.getListenerID();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>                        // check if an mbean unregistration notif</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>                        if (!listenerID.equals(mbeanRemovedNotifID)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>                            final ClientListenerInfo li = infoList.get(listenerID);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>                            if (li != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>                                listeners.put(listenerID, li);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre>                            continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>                        final Notification notif = tn.getNotification();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>                        final String unreg =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>                            MBeanServerNotification.UNREGISTRATION_NOTIFICATION;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>                        if (notif instanceof MBeanServerNotification &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>                            notif.getType().equals(unreg)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>                            MBeanServerNotification mbsn =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>                                (MBeanServerNotification) notif;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>                            ObjectName name = mbsn.getMBeanName();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre>                            removeNotificationListener(name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>                    myListenerID = mbeanRemovedNotifID;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>                if (missed &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>                    final String msg =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>                        &quot;May have lost up to &quot; + missed +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>                        &quot; notification&quot; + (missed == 1 ? &quot;&quot; : &quot;s&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>                    lostNotifs(msg, missed);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>                    logger.trace(&quot;NotifFetcher.run&quot;, msg);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>                // forward</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>                for (int i = 0 ; i &lt; len ; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>                    final TargetedNotification tn = notifs[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>                    dispatchNotification(tn,myListenerID,listeners);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>            synchronized (ClientNotifForwarder.this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>                currentFetchThread = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>            if (nr == null || shouldStop()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>                // tell that the thread is REALLY stopped</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>                setState(STOPPED);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>                      removeListenerForMBeanRemovedNotif(mbeanRemovedNotifID);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>                } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>                    if (logger.traceOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>                        logger.trace(&quot;NotifFetcher-run&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>                                &quot;removeListenerForMBeanRemovedNotif&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>                executor.execute(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>        void dispatchNotification(TargetedNotification tn,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>                                  Integer myListenerID,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>                                  Map&lt;Integer, ClientListenerInfo&gt; listeners) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>            final Notification notif = tn.getNotification();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>            final Integer listenerID = tn.getListenerID();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre>            if (listenerID.equals(myListenerID)) return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>            final ClientListenerInfo li = listeners.get(listenerID);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>            if (li == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>                logger.trace(&quot;NotifFetcher.dispatch&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>                             &quot;Listener ID not in map&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre>            NotificationListener l = li.getListener();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>            Object h = li.getHandback();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>                l.handleNotification(notif, h);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>            } catch (RuntimeException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>                final String msg =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>                    &quot;Failed to forward a notification &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>                    &quot;to a listener&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>                logger.trace(&quot;NotifFetcher-run&quot;, msg, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>        private NotificationResult fetchNotifs() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>                NotificationResult nr = ClientNotifForwarder.this.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>                    fetchNotifs(clientSequenceNumber,maxNotifications,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre>                                timeout);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>                if (logger.traceOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>                    logger.trace(&quot;NotifFetcher-run&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>                                 &quot;Got notifications from the server: &quot;+nr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>                return nr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>            } catch (ClassNotFoundException | NotSerializableException | UnmarshalException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>                logger.trace(&quot;NotifFetcher.fetchNotifs&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>                return fetchOneNotif();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>            } catch (IOException ioe) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>                if (!shouldStop()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>                    logger.error(&quot;NotifFetcher-run&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>                                 &quot;Failed to fetch notification, &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>                                 &quot;stopping thread. Error is: &quot; + ioe, ioe);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre>                    logger.debug(&quot;NotifFetcher-run&quot;,ioe);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>                // no more fetching</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre>                return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>        /* Fetch one notification when we suspect that it might be a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>           notification that we can't deserialize (because of a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>           missing class).  First we ask for 0 notifications with 0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>           timeout.  This allows us to skip sequence numbers for</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>           notifications that don't match our filters.  Then we ask</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>           for one notification.  If that produces a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>           ClassNotFoundException, NotSerializableException or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>           UnmarshalException, we increase our sequence number and ask again.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre>           Eventually we will either get a successful notification, or a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>           return with 0 notifications.  In either case we can return a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre>           NotificationResult.  This algorithm works (albeit less</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre>           well) even if the server implementation doesn't optimize a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>           request for 0 notifications to skip sequence numbers for</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>           notifications that don't match our filters.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre>           If we had at least one</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>           ClassNotFoundException/NotSerializableException/UnmarshalException,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>           then we must emit a JMXConnectionNotification.LOST_NOTIFS.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre>        */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>        private NotificationResult fetchOneNotif() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre>            ClientNotifForwarder cnf = ClientNotifForwarder.this;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>            long startSequenceNumber = clientSequenceNumber;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>            int notFoundCount = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre>            NotificationResult result = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>            long firstEarliest = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>            while (result == null &amp;&amp; !shouldStop()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>                NotificationResult nr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>                    // 0 notifs to update startSequenceNumber</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>                    nr = cnf.fetchNotifs(startSequenceNumber, 0, 0L);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>                } catch (ClassNotFoundException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>                    logger.warning(&quot;NotifFetcher.fetchOneNotif&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>                                   &quot;Impossible exception: &quot; + e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>                    logger.debug(&quot;NotifFetcher.fetchOneNotif&quot;,e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>                    return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>                } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre>                    if (!shouldStop())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre>                        logger.trace(&quot;NotifFetcher.fetchOneNotif&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre>                    return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>                if (shouldStop())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>                    return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre>                startSequenceNumber = nr.getNextSequenceNumber();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>                if (firstEarliest &lt; 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre>                    firstEarliest = nr.getEarliestSequenceNumber();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>                    // 1 notif to skip possible missing class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre>                    result = cnf.fetchNotifs(startSequenceNumber, 1, 0L);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>                } catch (ClassNotFoundException | NotSerializableException | UnmarshalException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>                    logger.warning(&quot;NotifFetcher.fetchOneNotif&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre>                                   &quot;Failed to deserialize a notification: &quot;+e.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>                    if (logger.traceOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>                        logger.trace(&quot;NotifFetcher.fetchOneNotif&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>                                     &quot;Failed to deserialize a notification.&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre>                    notFoundCount++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre>                    startSequenceNumber++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>                } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>                    if (!shouldStop())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre>                        logger.trace(&quot;NotifFetcher.fetchOneNotif&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre>                    return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre>            if (notFoundCount &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre>                final String msg =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>                    &quot;Dropped &quot; + notFoundCount + &quot; notification&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre>                    (notFoundCount == 1 ? &quot;&quot; : &quot;s&quot;) +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre>                    &quot; because classes were missing locally or incompatible&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre>                lostNotifs(msg, notFoundCount);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>                // Even if result.getEarliestSequenceNumber() is now greater than</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre>                // it was initially, meaning some notifs have been dropped</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>                // from the buffer, we don't want the caller to see that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre>                // because it is then likely to renotify about the lost notifs.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre>                // So we put back the first value of earliestSequenceNumber</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre>                // that we saw.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre>                if (result != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>                    result = new NotificationResult(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre>                            firstEarliest, result.getNextSequenceNumber(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre>                            result.getTargetedNotifications());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>            return result;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre>        private boolean shouldStop() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>            synchronized (ClientNotifForwarder.this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre>                if (state != STARTED) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre>                    return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>                } else if (infoList.size() == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre>                    // no more listener, stop fetching</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre>                    setState(STOPPING);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre>                    return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="719" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="720" href="#"></a></td>
+<td><pre>                return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="721" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="722" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="723" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="724" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="725" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="726" href="#"></a></td>
+<td><pre>// -------------------------------------------------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="727" href="#"></a></td>
+<td><pre>// private methods</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="728" href="#"></a></td>
+<td><pre>// -------------------------------------------------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="729" href="#"></a></td>
+<td><pre>    private synchronized void setState(int newState) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="730" href="#"></a></td>
+<td><pre>        if (state == TERMINATED) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="731" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="732" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="733" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="734" href="#"></a></td>
+<td><pre>        state = newState;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="735" href="#"></a></td>
+<td><pre>        this.notifyAll();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="736" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="737" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="738" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="739" href="#"></a></td>
+<td><pre>     * Called to decide whether need to start a thread for fetching notifs.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="740" href="#"></a></td>
+<td><pre>     * &lt;P&gt;The parameter reconnected will decide whether to initilize the clientSequenceNumber,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="741" href="#"></a></td>
+<td><pre>     * initilaizing the clientSequenceNumber means to ignore all notifications arrived before.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="742" href="#"></a></td>
+<td><pre>     * If it is reconnected, we will not initialize in order to get all notifications arrived</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="743" href="#"></a></td>
+<td><pre>     * during the reconnection. It may cause the newly registered listeners to receive some</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="744" href="#"></a></td>
+<td><pre>     * notifications arrived before its registray.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="745" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="746" href="#"></a></td>
+<td><pre>    private synchronized void init(boolean reconnected) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="747" href="#"></a></td>
+<td><pre>        switch (state) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="748" href="#"></a></td>
+<td><pre>        case STARTED:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="749" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="750" href="#"></a></td>
+<td><pre>        case STARTING:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="751" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="752" href="#"></a></td>
+<td><pre>        case TERMINATED:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="753" href="#"></a></td>
+<td><pre>            throw new IOException(&quot;The ClientNotifForwarder has been terminated.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="754" href="#"></a></td>
+<td><pre>        case STOPPING:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="755" href="#"></a></td>
+<td><pre>            if (beingReconnected == true) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="756" href="#"></a></td>
+<td><pre>                // wait for another thread to do, which is doing reconnection</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="757" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="758" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="759" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="760" href="#"></a></td>
+<td><pre>            while (state == STOPPING) { // make sure only one fetching thread.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="761" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="762" href="#"></a></td>
+<td><pre>                    wait();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="763" href="#"></a></td>
+<td><pre>                } catch (InterruptedException ire) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="764" href="#"></a></td>
+<td><pre>                    IOException ioe = new IOException(ire.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="765" href="#"></a></td>
+<td><pre>                    EnvHelp.initCause(ioe, ire);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="766" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="767" href="#"></a></td>
+<td><pre>                    throw ioe;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="768" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="769" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="770" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="771" href="#"></a></td>
+<td><pre>            // re-call this method to check the state again,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="772" href="#"></a></td>
+<td><pre>            // the state can be other value like TERMINATED.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="773" href="#"></a></td>
+<td><pre>            init(reconnected);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="774" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="775" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="776" href="#"></a></td>
+<td><pre>        case STOPPED:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="777" href="#"></a></td>
+<td><pre>            if (beingReconnected == true) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="778" href="#"></a></td>
+<td><pre>                // wait for another thread to do, which is doing reconnection</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="779" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="780" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="781" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="782" href="#"></a></td>
+<td><pre>            if (logger.traceOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="783" href="#"></a></td>
+<td><pre>                logger.trace(&quot;init&quot;, &quot;Initializing...&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="784" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="785" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="786" href="#"></a></td>
+<td><pre>            // init the clientSequenceNumber if not reconnected.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="787" href="#"></a></td>
+<td><pre>            if (!reconnected) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="788" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="789" href="#"></a></td>
+<td><pre>                    NotificationResult nr = fetchNotifs(-1, 0, 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="790" href="#"></a></td>
+<td><pre>                    clientSequenceNumber = nr.getNextSequenceNumber();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="791" href="#"></a></td>
+<td><pre>                } catch (ClassNotFoundException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="792" href="#"></a></td>
+<td><pre>                    // can't happen</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="793" href="#"></a></td>
+<td><pre>                    logger.warning(&quot;init&quot;, &quot;Impossible exception: &quot;+ e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="794" href="#"></a></td>
+<td><pre>                    logger.debug(&quot;init&quot;,e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="795" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="796" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="797" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="798" href="#"></a></td>
+<td><pre>            // for cleaning</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="799" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="800" href="#"></a></td>
+<td><pre>                mbeanRemovedNotifID = addListenerForMBeanRemovedNotif();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="801" href="#"></a></td>
+<td><pre>            } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="802" href="#"></a></td>
+<td><pre>                final String msg =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="803" href="#"></a></td>
+<td><pre>                    &quot;Failed to register a listener to the mbean &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="804" href="#"></a></td>
+<td><pre>                    &quot;server: the client will not do clean when an MBean &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="805" href="#"></a></td>
+<td><pre>                    &quot;is unregistered&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="806" href="#"></a></td>
+<td><pre>                if (logger.traceOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="807" href="#"></a></td>
+<td><pre>                    logger.trace(&quot;init&quot;, msg, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="808" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="809" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="810" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="811" href="#"></a></td>
+<td><pre>            setState(STARTING);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="812" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="813" href="#"></a></td>
+<td><pre>            // start fetching</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="814" href="#"></a></td>
+<td><pre>            executor.execute(new NotifFetcher());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="815" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="816" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="817" href="#"></a></td>
+<td><pre>        default:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="818" href="#"></a></td>
+<td><pre>            // should not</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="819" href="#"></a></td>
+<td><pre>            throw new IOException(&quot;Unknown state.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="820" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="821" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="822" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="823" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="824" href="#"></a></td>
+<td><pre>     * Import: should not remove a listener during reconnection, the reconnection</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="825" href="#"></a></td>
+<td><pre>     * needs to change the listener list and that will possibly make removal fail.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="826" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="827" href="#"></a></td>
+<td><pre>    private synchronized void beforeRemove() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="828" href="#"></a></td>
+<td><pre>        while (beingReconnected) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="829" href="#"></a></td>
+<td><pre>            if (state == TERMINATED) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="830" href="#"></a></td>
+<td><pre>                throw new IOException(&quot;Terminated.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="831" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="832" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="833" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="834" href="#"></a></td>
+<td><pre>                wait();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="835" href="#"></a></td>
+<td><pre>            } catch (InterruptedException ire) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="836" href="#"></a></td>
+<td><pre>                IOException ioe = new IOException(ire.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="837" href="#"></a></td>
+<td><pre>                EnvHelp.initCause(ioe, ire);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="838" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="839" href="#"></a></td>
+<td><pre>                throw ioe;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="840" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="841" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="842" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="843" href="#"></a></td>
+<td><pre>        if (state == TERMINATED) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="844" href="#"></a></td>
+<td><pre>            throw new IOException(&quot;Terminated.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="845" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="846" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="847" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="848" href="#"></a></td>
+<td><pre>// -------------------------------------------------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="849" href="#"></a></td>
+<td><pre>// private variables</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="850" href="#"></a></td>
+<td><pre>// -------------------------------------------------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="851" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="852" href="#"></a></td>
+<td><pre>    private final ClassLoader defaultClassLoader;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="853" href="#"></a></td>
+<td><pre>    private final Executor executor;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="854" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="855" href="#"></a></td>
+<td><pre>    private final Map&lt;Integer, ClientListenerInfo&gt; infoList =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="856" href="#"></a></td>
+<td><pre>            new HashMap&lt;Integer, ClientListenerInfo&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="857" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="858" href="#"></a></td>
+<td><pre>    // notif stuff</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="859" href="#"></a></td>
+<td><pre>    private long clientSequenceNumber = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="860" href="#"></a></td>
+<td><pre>    private final int maxNotifications;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="861" href="#"></a></td>
+<td><pre>    private final long timeout;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="862" href="#"></a></td>
+<td><pre>    private Integer mbeanRemovedNotifID = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="863" href="#"></a></td>
+<td><pre>    private Thread currentFetchThread;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="864" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="865" href="#"></a></td>
+<td><pre>    // state</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="866" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="867" href="#"></a></td>
+<td><pre>     * This state means that a thread is being created for fetching and forwarding notifications.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="868" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="869" href="#"></a></td>
+<td><pre>    private static final int STARTING = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="870" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="871" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="872" href="#"></a></td>
+<td><pre>     * This state tells that a thread has been started for fetching and forwarding notifications.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="873" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="874" href="#"></a></td>
+<td><pre>    private static final int STARTED = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="875" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="876" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="877" href="#"></a></td>
+<td><pre>     * This state means that the fetching thread is informed to stop.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="878" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="879" href="#"></a></td>
+<td><pre>    private static final int STOPPING = 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="880" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="881" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="882" href="#"></a></td>
+<td><pre>     * This state means that the fetching thread is already stopped.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="883" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="884" href="#"></a></td>
+<td><pre>    private static final int STOPPED = 3;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="885" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="886" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="887" href="#"></a></td>
+<td><pre>     * This state means that this object is terminated and no more thread will be created</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="888" href="#"></a></td>
+<td><pre>     * for fetching notifications.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="889" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="890" href="#"></a></td>
+<td><pre>    private static final int TERMINATED = 4;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="891" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="892" href="#"></a></td>
+<td><pre>    private int state = STOPPED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="893" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="894" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="895" href="#"></a></td>
+<td><pre>     * This variable is used to tell whether a connector (RMIConnector or ClientIntermediary)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="896" href="#"></a></td>
+<td><pre>     * is doing reconnection.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="897" href="#"></a></td>
+<td><pre>     * This variable will be set to true by the method &lt;code&gt;preReconnection&lt;/code&gt;, and set</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="898" href="#"></a></td>
+<td><pre>     * to false by &lt;code&gt;postReconnection&lt;/code&gt;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="899" href="#"></a></td>
+<td><pre>     * When beingReconnected == true, no thread will be created for fetching notifications.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="900" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="901" href="#"></a></td>
+<td><pre>    private boolean beingReconnected = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="902" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="903" href="#"></a></td>
+<td><pre>    private static final ClassLogger logger =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="904" href="#"></a></td>
+<td><pre>        new ClassLogger(&quot;javax.management.remote.misc&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="905" href="#"></a></td>
+<td><pre>                        &quot;ClientNotifForwarder&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="906" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

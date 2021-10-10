@@ -3,884 +3,3515 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-
-package sun.security.ssl;
-
-import java.net.*;
-import java.util.Enumeration;
-import java.util.Hashtable;
-import java.util.Vector;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.List;
-import java.util.ArrayList;
-
-import java.security.Principal;
-import java.security.PrivateKey;
-import java.security.SecureRandom;
-import java.security.cert.X509Certificate;
-import java.security.cert.CertificateEncodingException;
-
-import javax.crypto.SecretKey;
-
-import javax.net.ssl.SSLSessionContext;
-import javax.net.ssl.SSLSessionBindingListener;
-import javax.net.ssl.SSLSessionBindingEvent;
-import javax.net.ssl.SSLPeerUnverifiedException;
-import javax.net.ssl.SSLPermission;
-import javax.net.ssl.ExtendedSSLSession;
-import javax.net.ssl.SNIServerName;
-
-import static sun.security.ssl.CipherSuite.KeyExchange.*;
-
-/**
- * Implements the SSL session interface, and exposes the session context
- * which is maintained by SSL servers.
- *
- * &lt;P&gt; Servers have the ability to manage the sessions associated with
- * their authentication context(s).  They can do this by enumerating the
- * IDs of the sessions which are cached, examining those sessions, and then
- * perhaps invalidating a given session so that it can't be used again.
- * If servers do not explicitly manage the cache, sessions will linger
- * until memory is low enough that the runtime environment purges cache
- * entries automatically to reclaim space.
- *
- * &lt;P&gt;&lt;em&gt; The only reason this class is not package-private is that
- * there's no other public way to get at the server session context which
- * is associated with any given authentication context. &lt;/em&gt;
- *
- * @author David Brownell
- */
-final class SSLSessionImpl extends ExtendedSSLSession {
-
-    /*
-     * we only really need a single null session
-     */
-    static final SSLSessionImpl         nullSession = new SSLSessionImpl();
-
-    // compression methods
-    private static final byte           compression_null = 0;
-
-    /*
-     * The state of a single session, as described in section 7.1
-     * of the SSLv3 spec.
-     */
-    private final ProtocolVersion       protocolVersion;
-    private final SessionId             sessionId;
-    private X509Certificate[]   peerCerts;
-    private byte                compressionMethod;
-    private CipherSuite         cipherSuite;
-    private SecretKey           masterSecret;
-
-    /*
-     * Information not part of the SSLv3 protocol spec, but used
-     * to support session management policies.
-     */
-    private final long          creationTime = System.currentTimeMillis();
-    private long                lastUsedTime = 0;
-    private final String        host;
-    private final int           port;
-    private SSLSessionContextImpl       context;
-    private int                 sessionCount;
-    private boolean             invalidated;
-    private X509Certificate[]   localCerts;
-    private PrivateKey          localPrivateKey;
-    private String[]            localSupportedSignAlgs;
-    private String[]            peerSupportedSignAlgs;
-    private List&lt;SNIServerName&gt;    requestedServerNames;
-
-
-    // Principals for non-certificate based cipher suites
-    private Principal peerPrincipal;
-    private Principal localPrincipal;
-
-    /*
-     * We count session creations, eventually for statistical data but
-     * also since counters make shorter debugging IDs than the big ones
-     * we use in the protocol for uniqueness-over-time.
-     */
-    private static volatile int counter = 0;
-
-    /*
-     * Use of session caches is globally enabled/disabled.
-     */
-    private static boolean      defaultRejoinable = true;
-
-    /* Class and subclass dynamic debugging support */
-    private static final Debug debug = Debug.getInstance(&quot;ssl&quot;);
-
-    /*
-     * Create a new non-rejoinable session, using the default (null)
-     * cipher spec.  This constructor returns a session which could
-     * be used either by a client or by a server, as a connection is
-     * first opened and before handshaking begins.
-     */
-    private SSLSessionImpl() {
-        this(ProtocolVersion.NONE, CipherSuite.C_NULL, null,
-            new SessionId(false, null), null, -1);
-    }
-
-    /*
-     * Create a new session, using a given cipher spec.  This will
-     * be rejoinable if session caching is enabled; the constructor
-     * is intended mostly for use by serves.
-     */
-    SSLSessionImpl(ProtocolVersion protocolVersion, CipherSuite cipherSuite,
-            Collection&lt;SignatureAndHashAlgorithm&gt; algorithms,
-            SecureRandom generator, String host, int port) {
-        this(protocolVersion, cipherSuite, algorithms,
-             new SessionId(defaultRejoinable, generator), host, port);
-    }
-
-    /*
-     * Record a new session, using a given cipher spec and session ID.
-     */
-    SSLSessionImpl(ProtocolVersion protocolVersion, CipherSuite cipherSuite,
-            Collection&lt;SignatureAndHashAlgorithm&gt; algorithms,
-            SessionId id, String host, int port) {
-        this.protocolVersion = protocolVersion;
-        sessionId = id;
-        peerCerts = null;
-        compressionMethod = compression_null;
-        this.cipherSuite = cipherSuite;
-        masterSecret = null;
-        this.host = host;
-        this.port = port;
-        sessionCount = ++counter;
-        localSupportedSignAlgs =
-            SignatureAndHashAlgorithm.getAlgorithmNames(algorithms);
-
-        if (debug != null &amp;&amp; Debug.isOn(&quot;session&quot;)) {
-            System.out.println(&quot;%% Initialized:  &quot; + this);
-        }
-    }
-
-    void setMasterSecret(SecretKey secret) {
-        if (masterSecret == null) {
-            masterSecret = secret;
-        } else {
-            throw new RuntimeException(&quot;setMasterSecret() error&quot;);
-        }
-    }
-
-    /**
-     * Returns the master secret ... treat with extreme caution!
-     */
-    SecretKey getMasterSecret() {
-        return masterSecret;
-    }
-
-    void setPeerCertificates(X509Certificate[] peer) {
-        if (peerCerts == null) {
-            peerCerts = peer;
-        }
-    }
-
-    void setLocalCertificates(X509Certificate[] local) {
-        localCerts = local;
-    }
-
-    void setLocalPrivateKey(PrivateKey privateKey) {
-        localPrivateKey = privateKey;
-    }
-
-    void setPeerSupportedSignatureAlgorithms(
-            Collection&lt;SignatureAndHashAlgorithm&gt; algorithms) {
-        peerSupportedSignAlgs =
-            SignatureAndHashAlgorithm.getAlgorithmNames(algorithms);
-    }
-
-    void setRequestedServerNames(List&lt;SNIServerName&gt; requestedServerNames) {
-        this.requestedServerNames = new ArrayList&lt;&gt;(requestedServerNames);
-    }
-
-    /**
-     * Set the peer principal.
-     */
-    void setPeerPrincipal(Principal principal) {
-        if (peerPrincipal == null) {
-            peerPrincipal = principal;
-        }
-    }
-
-    /**
-     * Set the local principal.
-     */
-    void setLocalPrincipal(Principal principal) {
-        localPrincipal = principal;
-    }
-
-    /**
-     * Returns true iff this session may be resumed ... sessions are
-     * usually resumable.  Security policies may suggest otherwise,
-     * for example sessions that haven't been used for a while (say,
-     * a working day) won't be resumable, and sessions might have a
-     * maximum lifetime in any case.
-     */
-    boolean isRejoinable() {
-        return sessionId != null &amp;&amp; sessionId.length() != 0 &amp;&amp;
-            !invalidated &amp;&amp; isLocalAuthenticationValid();
-    }
-
-    @Override
-    public synchronized boolean isValid() {
-        return isRejoinable();
-    }
-
-    /**
-     * Check if the authentication used when establishing this session
-     * is still valid. Returns true if no authentication was used
-     */
-    boolean isLocalAuthenticationValid() {
-        if (localPrivateKey != null) {
-            try {
-                // if the private key is no longer valid, getAlgorithm()
-                // should throw an exception
-                // (e.g. Smartcard has been removed from the reader)
-                localPrivateKey.getAlgorithm();
-            } catch (Exception e) {
-                invalidate();
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /**
-     * Returns the ID for this session.  The ID is fixed for the
-     * duration of the session; neither it, nor its value, changes.
-     */
-    @Override
-    public byte[] getId() {
-        return sessionId.getId();
-    }
-
-    /**
-     * For server sessions, this returns the set of sessions which
-     * are currently valid in this process.  For client sessions,
-     * this returns null.
-     */
-    @Override
-    public SSLSessionContext getSessionContext() {
-        /*
-         * An interim security policy until we can do something
-         * more specific in 1.2. Only allow trusted code (code which
-         * can set system properties) to get an
-         * SSLSessionContext. This is to limit the ability of code to
-         * look up specific sessions or enumerate over them. Otherwise,
-         * code can only get session objects from successful SSL
-         * connections which implies that they must have had permission
-         * to make the network connection in the first place.
-         */
-        SecurityManager sm;
-        if ((sm = System.getSecurityManager()) != null) {
-            sm.checkPermission(new SSLPermission(&quot;getSSLSessionContext&quot;));
-        }
-
-        return context;
-    }
-
-
-    SessionId getSessionId() {
-        return sessionId;
-    }
-
-
-    /**
-     * Returns the cipher spec in use on this session
-     */
-    CipherSuite getSuite() {
-        return cipherSuite;
-    }
-
-    /**
-     * Resets the cipher spec in use on this session
-     */
-    void setSuite(CipherSuite suite) {
-       cipherSuite = suite;
-
-       if (debug != null &amp;&amp; Debug.isOn(&quot;session&quot;)) {
-           System.out.println(&quot;%% Negotiating:  &quot; + this);
-       }
-    }
-
-    /**
-     * Returns the name of the cipher suite in use on this session
-     */
-    @Override
-    public String getCipherSuite() {
-        return getSuite().name;
-    }
-
-    ProtocolVersion getProtocolVersion() {
-        return protocolVersion;
-    }
-
-    /**
-     * Returns the standard name of the protocol in use on this session
-     */
-    @Override
-    public String getProtocol() {
-        return getProtocolVersion().name;
-    }
-
-    /**
-     * Returns the compression technique used in this session
-     */
-    byte getCompression() {
-        return compressionMethod;
-    }
-
-    /**
-     * Returns the hashcode for this session
-     */
-    @Override
-    public int hashCode() {
-        return sessionId.hashCode();
-    }
-
-
-    /**
-     * Returns true if sessions have same ids, false otherwise.
-     */
-    @Override
-    public boolean equals(Object obj) {
-
-        if (obj == this) {
-            return true;
-        }
-
-        if (obj instanceof SSLSessionImpl) {
-            SSLSessionImpl sess = (SSLSessionImpl) obj;
-            return (sessionId != null) &amp;&amp; (sessionId.equals(
-                        sess.getSessionId()));
-        }
-
-        return false;
-    }
-
-
-    /**
-     * Return the cert chain presented by the peer in the
-     * java.security.cert format.
-     * Note: This method can be used only when using certificate-based
-     * cipher suites; using it with non-certificate-based cipher suites,
-     * such as Kerberos, will throw an SSLPeerUnverifiedException.
-     *
-     * @return array of peer X.509 certs, with the peer's own cert
-     *  first in the chain, and with the &quot;root&quot; CA last.
-     */
-    @Override
-    public java.security.cert.Certificate[] getPeerCertificates()
-            throws SSLPeerUnverifiedException {
-        //
-        // clone to preserve integrity of session ... caller can't
-        // change record of peer identity even by accident, much
-        // less do it intentionally.
-        //
-        if ((cipherSuite.keyExchange == K_KRB5) ||
-            (cipherSuite.keyExchange == K_KRB5_EXPORT)) {
-            throw new SSLPeerUnverifiedException(&quot;no certificates expected&quot;
-                        + &quot; for Kerberos cipher suites&quot;);
-        }
-        if (peerCerts == null) {
-            throw new SSLPeerUnverifiedException(&quot;peer not authenticated&quot;);
-        }
-        // Certs are immutable objects, therefore we don't clone them.
-        // But do need to clone the array, so that nothing is inserted
-        // into peerCerts.
-        return (java.security.cert.Certificate[])peerCerts.clone();
-    }
-
-    /**
-     * Return the cert chain presented to the peer in the
-     * java.security.cert format.
-     * Note: This method is useful only when using certificate-based
-     * cipher suites.
-     *
-     * @return array of peer X.509 certs, with the peer's own cert
-     *  first in the chain, and with the &quot;root&quot; CA last.
-     */
-    @Override
-    public java.security.cert.Certificate[] getLocalCertificates() {
-        //
-        // clone to preserve integrity of session ... caller can't
-        // change record of peer identity even by accident, much
-        // less do it intentionally.
-        return (localCerts == null ? null :
-            (java.security.cert.Certificate[])localCerts.clone());
-    }
-
-    /**
-     * Return the cert chain presented by the peer in the
-     * javax.security.cert format.
-     * Note: This method can be used only when using certificate-based
-     * cipher suites; using it with non-certificate-based cipher suites,
-     * such as Kerberos, will throw an SSLPeerUnverifiedException.
-     *
-     * @return array of peer X.509 certs, with the peer's own cert
-     *  first in the chain, and with the &quot;root&quot; CA last.
-     */
-    @Override
-    public javax.security.cert.X509Certificate[] getPeerCertificateChain()
-            throws SSLPeerUnverifiedException {
-        //
-        // clone to preserve integrity of session ... caller can't
-        // change record of peer identity even by accident, much
-        // less do it intentionally.
-        //
-        if ((cipherSuite.keyExchange == K_KRB5) ||
-            (cipherSuite.keyExchange == K_KRB5_EXPORT)) {
-            throw new SSLPeerUnverifiedException(&quot;no certificates expected&quot;
-                        + &quot; for Kerberos cipher suites&quot;);
-        }
-        if (peerCerts == null) {
-            throw new SSLPeerUnverifiedException(&quot;peer not authenticated&quot;);
-        }
-        javax.security.cert.X509Certificate[] certs;
-        certs = new javax.security.cert.X509Certificate[peerCerts.length];
-        for (int i = 0; i &lt; peerCerts.length; i++) {
-            byte[] der = null;
-            try {
-                der = peerCerts[i].getEncoded();
-                certs[i] = javax.security.cert.X509Certificate.getInstance(der);
-            } catch (CertificateEncodingException e) {
-                throw new SSLPeerUnverifiedException(e.getMessage());
-            } catch (javax.security.cert.CertificateException e) {
-                throw new SSLPeerUnverifiedException(e.getMessage());
-            }
-        }
-
-        return certs;
-    }
-
-    /**
-     * Return the cert chain presented by the peer.
-     * Note: This method can be used only when using certificate-based
-     * cipher suites; using it with non-certificate-based cipher suites,
-     * such as Kerberos, will throw an SSLPeerUnverifiedException.
-     *
-     * @return array of peer X.509 certs, with the peer's own cert
-     *  first in the chain, and with the &quot;root&quot; CA last.
-     */
-    public X509Certificate[] getCertificateChain()
-            throws SSLPeerUnverifiedException {
-        /*
-         * clone to preserve integrity of session ... caller can't
-         * change record of peer identity even by accident, much
-         * less do it intentionally.
-         */
-        if ((cipherSuite.keyExchange == K_KRB5) ||
-            (cipherSuite.keyExchange == K_KRB5_EXPORT)) {
-            throw new SSLPeerUnverifiedException(&quot;no certificates expected&quot;
-                        + &quot; for Kerberos cipher suites&quot;);
-        }
-        if (peerCerts != null) {
-            return peerCerts.clone();
-        } else {
-            throw new SSLPeerUnverifiedException(&quot;peer not authenticated&quot;);
-        }
-    }
-
-    /**
-     * Returns the identity of the peer which was established as part of
-     * defining the session.
-     *
-     * @return the peer's principal. Returns an X500Principal of the
-     * end-entity certificate for X509-based cipher suites, and
-     * Principal for Kerberos cipher suites.
-     *
-     * @throws SSLPeerUnverifiedException if the peer's identity has not
-     *          been verified
-     */
-    @Override
-    public Principal getPeerPrincipal()
-                throws SSLPeerUnverifiedException
-    {
-        if ((cipherSuite.keyExchange == K_KRB5) ||
-            (cipherSuite.keyExchange == K_KRB5_EXPORT)) {
-            if (peerPrincipal == null) {
-                throw new SSLPeerUnverifiedException(&quot;peer not authenticated&quot;);
-            } else {
-                // Eliminate dependency on KerberosPrincipal
-                return peerPrincipal;
-            }
-        }
-        if (peerCerts == null) {
-            throw new SSLPeerUnverifiedException(&quot;peer not authenticated&quot;);
-        }
-        return peerCerts[0].getSubjectX500Principal();
-    }
-
-    /**
-     * Returns the principal that was sent to the peer during handshaking.
-     *
-     * @return the principal sent to the peer. Returns an X500Principal
-     * of the end-entity certificate for X509-based cipher suites, and
-     * Principal for Kerberos cipher suites. If no principal was
-     * sent, then null is returned.
-     */
-    @Override
-    public Principal getLocalPrincipal() {
-
-        if ((cipherSuite.keyExchange == K_KRB5) ||
-            (cipherSuite.keyExchange == K_KRB5_EXPORT)) {
-                // Eliminate dependency on KerberosPrincipal
-                return (localPrincipal == null ? null : localPrincipal);
-        }
-        return (localCerts == null ? null :
-                localCerts[0].getSubjectX500Principal());
-    }
-
-    /**
-     * Returns the time this session was created.
-     */
-    @Override
-    public long getCreationTime() {
-        return creationTime;
-    }
-
-    /**
-     * Returns the last time this session was used to initialize
-     * a connection.
-     */
-    @Override
-    public long getLastAccessedTime() {
-        return (lastUsedTime != 0) ? lastUsedTime : creationTime;
-    }
-
-    void setLastAccessedTime(long time) {
-        lastUsedTime = time;
-    }
-
-
-    /**
-     * Returns the network address of the session's peer.  This
-     * implementation does not insist that connections between
-     * different ports on the same host must necessarily belong
-     * to different sessions, though that is of course allowed.
-     */
-    public InetAddress getPeerAddress() {
-        try {
-            return InetAddress.getByName(host);
-        } catch (java.net.UnknownHostException e) {
-            return null;
-        }
-    }
-
-    @Override
-    public String getPeerHost() {
-        return host;
-    }
-
-    /**
-     * Need to provide the port info for caching sessions based on
-     * host and port. Accessed by SSLSessionContextImpl
-     */
-    @Override
-    public int getPeerPort() {
-        return port;
-    }
-
-    void setContext(SSLSessionContextImpl ctx) {
-        if (context == null) {
-            context = ctx;
-        }
-    }
-
-    /**
-     * Invalidate a session.  Active connections may still exist, but
-     * no connections will be able to rejoin this session.
-     */
-    @Override
-    synchronized public void invalidate() {
-        //
-        // Can't invalidate the NULL session -- this would be
-        // attempted when we get a handshaking error on a brand
-        // new connection, with no &quot;real&quot; session yet.
-        //
-        if (this == nullSession) {
-            return;
-        }
-        invalidated = true;
-        if (debug != null &amp;&amp; Debug.isOn(&quot;session&quot;)) {
-            System.out.println(&quot;%% Invalidated:  &quot; + this);
-        }
-        if (context != null) {
-            context.remove(sessionId);
-            context = null;
-        }
-    }
-
-    /*
-     * Table of application-specific session data indexed by an application
-     * key and the calling security context. This is important since
-     * sessions can be shared across different protection domains.
-     */
-    private Hashtable&lt;SecureKey, Object&gt; table = new Hashtable&lt;&gt;();
-
-    /**
-     * Assigns a session value.  Session change events are given if
-     * appropriate, to any original value as well as the new value.
-     */
-    @Override
-    public void putValue(String key, Object value) {
-        if ((key == null) || (value == null)) {
-            throw new IllegalArgumentException(&quot;arguments can not be null&quot;);
-        }
-
-        SecureKey secureKey = new SecureKey(key);
-        Object oldValue = table.put(secureKey, value);
-
-        if (oldValue instanceof SSLSessionBindingListener) {
-            SSLSessionBindingEvent e;
-
-            e = new SSLSessionBindingEvent(this, key);
-            ((SSLSessionBindingListener)oldValue).valueUnbound(e);
-        }
-        if (value instanceof SSLSessionBindingListener) {
-            SSLSessionBindingEvent e;
-
-            e = new SSLSessionBindingEvent(this, key);
-            ((SSLSessionBindingListener)value).valueBound(e);
-        }
-    }
-
-
-    /**
-     * Returns the specified session value.
-     */
-    @Override
-    public Object getValue(String key) {
-        if (key == null) {
-            throw new IllegalArgumentException(&quot;argument can not be null&quot;);
-        }
-
-        SecureKey secureKey = new SecureKey(key);
-        return table.get(secureKey);
-    }
-
-
-    /**
-     * Removes the specified session value, delivering a session changed
-     * event as appropriate.
-     */
-    @Override
-    public void removeValue(String key) {
-        if (key == null) {
-            throw new IllegalArgumentException(&quot;argument can not be null&quot;);
-        }
-
-        SecureKey secureKey = new SecureKey(key);
-        Object value = table.remove(secureKey);
-
-        if (value instanceof SSLSessionBindingListener) {
-            SSLSessionBindingEvent e;
-
-            e = new SSLSessionBindingEvent(this, key);
-            ((SSLSessionBindingListener)value).valueUnbound(e);
-        }
-    }
-
-
-    /**
-     * Lists the names of the session values.
-     */
-    @Override
-    public String[] getValueNames() {
-        Enumeration&lt;SecureKey&gt; e;
-        Vector&lt;Object&gt; v = new Vector&lt;&gt;();
-        SecureKey key;
-        Object securityCtx = SecureKey.getCurrentSecurityContext();
-
-        for (e = table.keys(); e.hasMoreElements(); ) {
-            key = e.nextElement();
-
-            if (securityCtx.equals(key.getSecurityContext())) {
-                v.addElement(key.getAppKey());
-            }
-        }
-        String[] names = new String[v.size()];
-        v.copyInto(names);
-
-        return names;
-    }
-
-    /**
-     * Use large packet sizes now or follow RFC 2246 packet sizes (2^14)
-     * until changed.
-     *
-     * In the TLS specification (section 6.2.1, RFC2246), it is not
-     * recommended that the plaintext has more than 2^14 bytes.
-     * However, some TLS implementations violate the specification.
-     * This is a workaround for interoperability with these stacks.
-     *
-     * Application could accept large fragments up to 2^15 bytes by
-     * setting the system property jsse.SSLEngine.acceptLargeFragments
-     * to &quot;true&quot;.
-     */
-    private boolean acceptLargeFragments =
-        Debug.getBooleanProperty(&quot;jsse.SSLEngine.acceptLargeFragments&quot;, false);
-
-    /**
-     * Expand the buffer size of both SSL/TLS network packet and
-     * application data.
-     */
-    protected synchronized void expandBufferSizes() {
-        acceptLargeFragments = true;
-    }
-
-    /**
-     * Gets the current size of the largest SSL/TLS packet that is expected
-     * when using this session.
-     */
-    @Override
-    public synchronized int getPacketBufferSize() {
-        return acceptLargeFragments ?
-                Record.maxLargeRecordSize : Record.maxRecordSize;
-    }
-
-    /**
-     * Gets the current size of the largest application data that is
-     * expected when using this session.
-     */
-    @Override
-    public synchronized int getApplicationBufferSize() {
-        return getPacketBufferSize() - Record.headerSize;
-    }
-
-    /**
-     * Gets an array of supported signature algorithms that the local side is
-     * willing to verify.
-     */
-    @Override
-    public String[] getLocalSupportedSignatureAlgorithms() {
-        if (localSupportedSignAlgs != null) {
-            return localSupportedSignAlgs.clone();
-        }
-
-        return new String[0];
-    }
-
-    /**
-     * Gets an array of supported signature algorithms that the peer is
-     * able to verify.
-     */
-    @Override
-    public String[] getPeerSupportedSignatureAlgorithms() {
-        if (peerSupportedSignAlgs != null) {
-            return peerSupportedSignAlgs.clone();
-        }
-
-        return new String[0];
-    }
-
-    /**
-     * Obtains a &lt;code&gt;List&lt;/code&gt; containing all {@link SNIServerName}s
-     * of the requested Server Name Indication (SNI) extension.
-     */
-    @Override
-    public List&lt;SNIServerName&gt; getRequestedServerNames() {
-        if (requestedServerNames != null &amp;&amp; !requestedServerNames.isEmpty()) {
-            return Collections.&lt;SNIServerName&gt;unmodifiableList(
-                                                requestedServerNames);
-        }
-
-        return Collections.&lt;SNIServerName&gt;emptyList();
-    }
-
-    /** Returns a string representation of this SSL session */
-    @Override
-    public String toString() {
-        return &quot;[Session-&quot; + sessionCount
-            + &quot;, &quot; + getCipherSuite()
-            + &quot;]&quot;;
-    }
-
-    /**
-     * When SSL sessions are finalized, all values bound to
-     * them are removed.
-     */
-    @Override
-    protected void finalize() throws Throwable {
-        String[] names = getValueNames();
-        for (int i = 0; i &lt; names.length; i++) {
-            removeValue(names[i]);
-        }
-    }
-}
-
-
-/**
- * This &quot;struct&quot; class serves as a Hash Key that combines an
- * application-specific key and a security context.
- */
-class SecureKey {
-    private static Object       nullObject = new Object();
-    private Object        appKey;
-    private Object      securityCtx;
-
-    static Object getCurrentSecurityContext() {
-        SecurityManager sm = System.getSecurityManager();
-        Object context = null;
-
-        if (sm != null)
-            context = sm.getSecurityContext();
-        if (context == null)
-            context = nullObject;
-        return context;
-    }
-
-    SecureKey(Object key) {
-        this.appKey = key;
-        this.securityCtx = getCurrentSecurityContext();
-    }
-
-    Object getAppKey() {
-        return appKey;
-    }
-
-    Object getSecurityContext() {
-        return securityCtx;
-    }
-
-    @Override
-    public int hashCode() {
-        return appKey.hashCode() ^ securityCtx.hashCode();
-    }
-
-    @Override
-    public boolean equals(Object o) {
-        return o instanceof SecureKey &amp;&amp; ((SecureKey)o).appKey.equals(appKey)
-                        &amp;&amp; ((SecureKey)o).securityCtx.equals(securityCtx);
-    }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre>package sun.security.ssl;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.net.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.util.Enumeration;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.util.Hashtable;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.util.Vector;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.util.Collection;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.util.Collections;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import java.util.List;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.util.ArrayList;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import java.security.Principal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import java.security.PrivateKey;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre>import java.security.SecureRandom;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre>import java.security.cert.X509Certificate;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>import java.security.cert.CertificateEncodingException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre>import javax.crypto.SecretKey;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>import javax.net.ssl.SSLSessionContext;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre>import javax.net.ssl.SSLSessionBindingListener;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre>import javax.net.ssl.SSLSessionBindingEvent;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre>import javax.net.ssl.SSLPeerUnverifiedException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre>import javax.net.ssl.SSLPermission;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>import javax.net.ssl.ExtendedSSLSession;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre>import javax.net.ssl.SNIServerName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre>import static sun.security.ssl.CipherSuite.KeyExchange.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre> * Implements the SSL session interface, and exposes the session context</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre> * which is maintained by SSL servers.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre> * &lt;P&gt; Servers have the ability to manage the sessions associated with</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre> * their authentication context(s).  They can do this by enumerating the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre> * IDs of the sessions which are cached, examining those sessions, and then</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre> * perhaps invalidating a given session so that it can't be used again.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre> * If servers do not explicitly manage the cache, sessions will linger</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre> * until memory is low enough that the runtime environment purges cache</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre> * entries automatically to reclaim space.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre> * &lt;P&gt;&lt;em&gt; The only reason this class is not package-private is that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre> * there's no other public way to get at the server session context which</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre> * is associated with any given authentication context. &lt;/em&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre> * @author David Brownell</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>final class SSLSessionImpl extends ExtendedSSLSession {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>     * we only really need a single null session</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>    static final SSLSessionImpl         nullSession = new SSLSessionImpl();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>    // compression methods</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>    private static final byte           compression_null = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>     * The state of a single session, as described in section 7.1</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>     * of the SSLv3 spec.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>    private final ProtocolVersion       protocolVersion;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>    private final SessionId             sessionId;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>    private X509Certificate[]   peerCerts;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>    private byte                compressionMethod;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>    private CipherSuite         cipherSuite;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>    private SecretKey           masterSecret;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>     * Information not part of the SSLv3 protocol spec, but used</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>     * to support session management policies.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>    private final long          creationTime = System.currentTimeMillis();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>    private long                lastUsedTime = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>    private final String        host;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>    private final int           port;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>    private SSLSessionContextImpl       context;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>    private int                 sessionCount;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>    private boolean             invalidated;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>    private X509Certificate[]   localCerts;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>    private PrivateKey          localPrivateKey;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>    private String[]            localSupportedSignAlgs;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>    private String[]            peerSupportedSignAlgs;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>    private List&lt;SNIServerName&gt;    requestedServerNames;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>    // Principals for non-certificate based cipher suites</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>    private Principal peerPrincipal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>    private Principal localPrincipal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>     * We count session creations, eventually for statistical data but</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>     * also since counters make shorter debugging IDs than the big ones</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>     * we use in the protocol for uniqueness-over-time.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>    private static volatile int counter = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>     * Use of session caches is globally enabled/disabled.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>    private static boolean      defaultRejoinable = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>    /* Class and subclass dynamic debugging support */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>    private static final Debug debug = Debug.getInstance(&quot;ssl&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>     * Create a new non-rejoinable session, using the default (null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>     * cipher spec.  This constructor returns a session which could</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>     * be used either by a client or by a server, as a connection is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>     * first opened and before handshaking begins.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>    private SSLSessionImpl() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>        this(ProtocolVersion.NONE, CipherSuite.C_NULL, null,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>            new SessionId(false, null), null, -1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>     * Create a new session, using a given cipher spec.  This will</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>     * be rejoinable if session caching is enabled; the constructor</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>     * is intended mostly for use by serves.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>    SSLSessionImpl(ProtocolVersion protocolVersion, CipherSuite cipherSuite,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>            Collection&lt;SignatureAndHashAlgorithm&gt; algorithms,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>            SecureRandom generator, String host, int port) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>        this(protocolVersion, cipherSuite, algorithms,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>             new SessionId(defaultRejoinable, generator), host, port);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>     * Record a new session, using a given cipher spec and session ID.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>    SSLSessionImpl(ProtocolVersion protocolVersion, CipherSuite cipherSuite,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>            Collection&lt;SignatureAndHashAlgorithm&gt; algorithms,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>            SessionId id, String host, int port) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>        this.protocolVersion = protocolVersion;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>        sessionId = id;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>        peerCerts = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>        compressionMethod = compression_null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>        this.cipherSuite = cipherSuite;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>        masterSecret = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>        this.host = host;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>        this.port = port;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>        sessionCount = ++counter;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>        localSupportedSignAlgs =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>            SignatureAndHashAlgorithm.getAlgorithmNames(algorithms);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>        if (debug != null &amp;&amp; Debug.isOn(&quot;session&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>            System.out.println(&quot;%% Initialized:  &quot; + this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>    void setMasterSecret(SecretKey secret) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>        if (masterSecret == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>            masterSecret = secret;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>            throw new RuntimeException(&quot;setMasterSecret() error&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>     * Returns the master secret ... treat with extreme caution!</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>    SecretKey getMasterSecret() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>        return masterSecret;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>    void setPeerCertificates(X509Certificate[] peer) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>        if (peerCerts == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>            peerCerts = peer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>    void setLocalCertificates(X509Certificate[] local) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>        localCerts = local;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>    void setLocalPrivateKey(PrivateKey privateKey) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>        localPrivateKey = privateKey;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>    void setPeerSupportedSignatureAlgorithms(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>            Collection&lt;SignatureAndHashAlgorithm&gt; algorithms) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>        peerSupportedSignAlgs =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>            SignatureAndHashAlgorithm.getAlgorithmNames(algorithms);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>    void setRequestedServerNames(List&lt;SNIServerName&gt; requestedServerNames) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>        this.requestedServerNames = new ArrayList&lt;&gt;(requestedServerNames);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>     * Set the peer principal.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>    void setPeerPrincipal(Principal principal) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>        if (peerPrincipal == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>            peerPrincipal = principal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>     * Set the local principal.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>    void setLocalPrincipal(Principal principal) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>        localPrincipal = principal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>     * Returns true iff this session may be resumed ... sessions are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>     * usually resumable.  Security policies may suggest otherwise,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>     * for example sessions that haven't been used for a while (say,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>     * a working day) won't be resumable, and sessions might have a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>     * maximum lifetime in any case.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>    boolean isRejoinable() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>        return sessionId != null &amp;&amp; sessionId.length() != 0 &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>            !invalidated &amp;&amp; isLocalAuthenticationValid();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>    public synchronized boolean isValid() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>        return isRejoinable();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>     * Check if the authentication used when establishing this session</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>     * is still valid. Returns true if no authentication was used</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>    boolean isLocalAuthenticationValid() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>        if (localPrivateKey != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>                // if the private key is no longer valid, getAlgorithm()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>                // should throw an exception</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>                // (e.g. Smartcard has been removed from the reader)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>                localPrivateKey.getAlgorithm();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>            } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>                invalidate();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>                return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>        return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>     * Returns the ID for this session.  The ID is fixed for the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>     * duration of the session; neither it, nor its value, changes.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>    public byte[] getId() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>        return sessionId.getId();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>     * For server sessions, this returns the set of sessions which</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>     * are currently valid in this process.  For client sessions,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>     * this returns null.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>    public SSLSessionContext getSessionContext() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>         * An interim security policy until we can do something</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>         * more specific in 1.2. Only allow trusted code (code which</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>         * can set system properties) to get an</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>         * SSLSessionContext. This is to limit the ability of code to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>         * look up specific sessions or enumerate over them. Otherwise,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>         * code can only get session objects from successful SSL</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>         * connections which implies that they must have had permission</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>         * to make the network connection in the first place.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>        SecurityManager sm;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>        if ((sm = System.getSecurityManager()) != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>            sm.checkPermission(new SSLPermission(&quot;getSSLSessionContext&quot;));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>        return context;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>    SessionId getSessionId() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>        return sessionId;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>     * Returns the cipher spec in use on this session</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>    CipherSuite getSuite() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>        return cipherSuite;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>     * Resets the cipher spec in use on this session</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>    void setSuite(CipherSuite suite) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>       cipherSuite = suite;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>       if (debug != null &amp;&amp; Debug.isOn(&quot;session&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>           System.out.println(&quot;%% Negotiating:  &quot; + this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>       }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>     * Returns the name of the cipher suite in use on this session</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>    public String getCipherSuite() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>        return getSuite().name;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>    ProtocolVersion getProtocolVersion() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>        return protocolVersion;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>     * Returns the standard name of the protocol in use on this session</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>    public String getProtocol() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>        return getProtocolVersion().name;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>     * Returns the compression technique used in this session</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>    byte getCompression() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>        return compressionMethod;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>     * Returns the hashcode for this session</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>    public int hashCode() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>        return sessionId.hashCode();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>     * Returns true if sessions have same ids, false otherwise.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>    public boolean equals(Object obj) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>        if (obj == this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>            return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>        if (obj instanceof SSLSessionImpl) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>            SSLSessionImpl sess = (SSLSessionImpl) obj;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>            return (sessionId != null) &amp;&amp; (sessionId.equals(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>                        sess.getSessionId()));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>        return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>     * Return the cert chain presented by the peer in the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>     * java.security.cert format.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>     * Note: This method can be used only when using certificate-based</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>     * cipher suites; using it with non-certificate-based cipher suites,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>     * such as Kerberos, will throw an SSLPeerUnverifiedException.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>     * @return array of peer X.509 certs, with the peer's own cert</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>     *  first in the chain, and with the &quot;root&quot; CA last.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>    public java.security.cert.Certificate[] getPeerCertificates()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>            throws SSLPeerUnverifiedException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>        // clone to preserve integrity of session ... caller can't</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>        // change record of peer identity even by accident, much</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>        // less do it intentionally.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>        if ((cipherSuite.keyExchange == K_KRB5) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>            (cipherSuite.keyExchange == K_KRB5_EXPORT)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>            throw new SSLPeerUnverifiedException(&quot;no certificates expected&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>                        + &quot; for Kerberos cipher suites&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>        if (peerCerts == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>            throw new SSLPeerUnverifiedException(&quot;peer not authenticated&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>        // Certs are immutable objects, therefore we don't clone them.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>        // But do need to clone the array, so that nothing is inserted</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>        // into peerCerts.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>        return (java.security.cert.Certificate[])peerCerts.clone();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>     * Return the cert chain presented to the peer in the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>     * java.security.cert format.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>     * Note: This method is useful only when using certificate-based</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>     * cipher suites.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>     * @return array of peer X.509 certs, with the peer's own cert</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>     *  first in the chain, and with the &quot;root&quot; CA last.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>    public java.security.cert.Certificate[] getLocalCertificates() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>        // clone to preserve integrity of session ... caller can't</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>        // change record of peer identity even by accident, much</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>        // less do it intentionally.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>        return (localCerts == null ? null :</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>            (java.security.cert.Certificate[])localCerts.clone());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>     * Return the cert chain presented by the peer in the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>     * javax.security.cert format.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>     * Note: This method can be used only when using certificate-based</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>     * cipher suites; using it with non-certificate-based cipher suites,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>     * such as Kerberos, will throw an SSLPeerUnverifiedException.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>     * @return array of peer X.509 certs, with the peer's own cert</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>     *  first in the chain, and with the &quot;root&quot; CA last.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>    public javax.security.cert.X509Certificate[] getPeerCertificateChain()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>            throws SSLPeerUnverifiedException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>        // clone to preserve integrity of session ... caller can't</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>        // change record of peer identity even by accident, much</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>        // less do it intentionally.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>        if ((cipherSuite.keyExchange == K_KRB5) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>            (cipherSuite.keyExchange == K_KRB5_EXPORT)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>            throw new SSLPeerUnverifiedException(&quot;no certificates expected&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>                        + &quot; for Kerberos cipher suites&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>        if (peerCerts == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>            throw new SSLPeerUnverifiedException(&quot;peer not authenticated&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>        javax.security.cert.X509Certificate[] certs;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>        certs = new javax.security.cert.X509Certificate[peerCerts.length];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; peerCerts.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>            byte[] der = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>                der = peerCerts[i].getEncoded();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>                certs[i] = javax.security.cert.X509Certificate.getInstance(der);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>            } catch (CertificateEncodingException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>                throw new SSLPeerUnverifiedException(e.getMessage());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>            } catch (javax.security.cert.CertificateException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>                throw new SSLPeerUnverifiedException(e.getMessage());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>        return certs;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>     * Return the cert chain presented by the peer.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>     * Note: This method can be used only when using certificate-based</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>     * cipher suites; using it with non-certificate-based cipher suites,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>     * such as Kerberos, will throw an SSLPeerUnverifiedException.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>     * @return array of peer X.509 certs, with the peer's own cert</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>     *  first in the chain, and with the &quot;root&quot; CA last.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>    public X509Certificate[] getCertificateChain()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>            throws SSLPeerUnverifiedException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>         * clone to preserve integrity of session ... caller can't</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>         * change record of peer identity even by accident, much</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>         * less do it intentionally.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>        if ((cipherSuite.keyExchange == K_KRB5) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>            (cipherSuite.keyExchange == K_KRB5_EXPORT)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>            throw new SSLPeerUnverifiedException(&quot;no certificates expected&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>                        + &quot; for Kerberos cipher suites&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>        if (peerCerts != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>            return peerCerts.clone();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>            throw new SSLPeerUnverifiedException(&quot;peer not authenticated&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>     * Returns the identity of the peer which was established as part of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>     * defining the session.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>     * @return the peer's principal. Returns an X500Principal of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>     * end-entity certificate for X509-based cipher suites, and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>     * Principal for Kerberos cipher suites.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>     * @throws SSLPeerUnverifiedException if the peer's identity has not</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>     *          been verified</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>    public Principal getPeerPrincipal()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>                throws SSLPeerUnverifiedException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>        if ((cipherSuite.keyExchange == K_KRB5) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>            (cipherSuite.keyExchange == K_KRB5_EXPORT)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>            if (peerPrincipal == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>                throw new SSLPeerUnverifiedException(&quot;peer not authenticated&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>                // Eliminate dependency on KerberosPrincipal</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>                return peerPrincipal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>        if (peerCerts == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>            throw new SSLPeerUnverifiedException(&quot;peer not authenticated&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>        return peerCerts[0].getSubjectX500Principal();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>     * Returns the principal that was sent to the peer during handshaking.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>     * @return the principal sent to the peer. Returns an X500Principal</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>     * of the end-entity certificate for X509-based cipher suites, and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>     * Principal for Kerberos cipher suites. If no principal was</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>     * sent, then null is returned.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>    public Principal getLocalPrincipal() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>        if ((cipherSuite.keyExchange == K_KRB5) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>            (cipherSuite.keyExchange == K_KRB5_EXPORT)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>                // Eliminate dependency on KerberosPrincipal</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>                return (localPrincipal == null ? null : localPrincipal);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>        return (localCerts == null ? null :</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>                localCerts[0].getSubjectX500Principal());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>     * Returns the time this session was created.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>    public long getCreationTime() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>        return creationTime;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre>     * Returns the last time this session was used to initialize</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>     * a connection.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>    public long getLastAccessedTime() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>        return (lastUsedTime != 0) ? lastUsedTime : creationTime;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>    void setLastAccessedTime(long time) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre>        lastUsedTime = time;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>     * Returns the network address of the session's peer.  This</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>     * implementation does not insist that connections between</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>     * different ports on the same host must necessarily belong</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>     * to different sessions, though that is of course allowed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>    public InetAddress getPeerAddress() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>            return InetAddress.getByName(host);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>        } catch (java.net.UnknownHostException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>    public String getPeerHost() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>        return host;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>     * Need to provide the port info for caching sessions based on</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>     * host and port. Accessed by SSLSessionContextImpl</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>    public int getPeerPort() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>        return port;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>    void setContext(SSLSessionContextImpl ctx) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre>        if (context == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>            context = ctx;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>     * Invalidate a session.  Active connections may still exist, but</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>     * no connections will be able to rejoin this session.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>    synchronized public void invalidate() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>        // Can't invalidate the NULL session -- this would be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>        // attempted when we get a handshaking error on a brand</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>        // new connection, with no &quot;real&quot; session yet.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre>        if (this == nullSession) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre>        invalidated = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>        if (debug != null &amp;&amp; Debug.isOn(&quot;session&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>            System.out.println(&quot;%% Invalidated:  &quot; + this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre>        if (context != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>            context.remove(sessionId);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>            context = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>     * Table of application-specific session data indexed by an application</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre>     * key and the calling security context. This is important since</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>     * sessions can be shared across different protection domains.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre>    private Hashtable&lt;SecureKey, Object&gt; table = new Hashtable&lt;&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>     * Assigns a session value.  Session change events are given if</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>     * appropriate, to any original value as well as the new value.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>    public void putValue(String key, Object value) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>        if ((key == null) || (value == null)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>            throw new IllegalArgumentException(&quot;arguments can not be null&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>        SecureKey secureKey = new SecureKey(key);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>        Object oldValue = table.put(secureKey, value);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre>        if (oldValue instanceof SSLSessionBindingListener) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre>            SSLSessionBindingEvent e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>            e = new SSLSessionBindingEvent(this, key);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre>            ((SSLSessionBindingListener)oldValue).valueUnbound(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>        if (value instanceof SSLSessionBindingListener) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>            SSLSessionBindingEvent e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>            e = new SSLSessionBindingEvent(this, key);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre>            ((SSLSessionBindingListener)value).valueBound(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>     * Returns the specified session value.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>    public Object getValue(String key) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>        if (key == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>            throw new IllegalArgumentException(&quot;argument can not be null&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre>        SecureKey secureKey = new SecureKey(key);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>        return table.get(secureKey);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>     * Removes the specified session value, delivering a session changed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre>     * event as appropriate.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>    public void removeValue(String key) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre>        if (key == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre>            throw new IllegalArgumentException(&quot;argument can not be null&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre>        SecureKey secureKey = new SecureKey(key);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>        Object value = table.remove(secureKey);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre>        if (value instanceof SSLSessionBindingListener) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre>            SSLSessionBindingEvent e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>            e = new SSLSessionBindingEvent(this, key);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre>            ((SSLSessionBindingListener)value).valueUnbound(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>     * Lists the names of the session values.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>    public String[] getValueNames() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre>        Enumeration&lt;SecureKey&gt; e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre>        Vector&lt;Object&gt; v = new Vector&lt;&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>        SecureKey key;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre>        Object securityCtx = SecureKey.getCurrentSecurityContext();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre>        for (e = table.keys(); e.hasMoreElements(); ) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre>            key = e.nextElement();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="719" href="#"></a></td>
+<td><pre>            if (securityCtx.equals(key.getSecurityContext())) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="720" href="#"></a></td>
+<td><pre>                v.addElement(key.getAppKey());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="721" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="722" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="723" href="#"></a></td>
+<td><pre>        String[] names = new String[v.size()];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="724" href="#"></a></td>
+<td><pre>        v.copyInto(names);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="725" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="726" href="#"></a></td>
+<td><pre>        return names;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="727" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="728" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="729" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="730" href="#"></a></td>
+<td><pre>     * Use large packet sizes now or follow RFC 2246 packet sizes (2^14)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="731" href="#"></a></td>
+<td><pre>     * until changed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="732" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="733" href="#"></a></td>
+<td><pre>     * In the TLS specification (section 6.2.1, RFC2246), it is not</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="734" href="#"></a></td>
+<td><pre>     * recommended that the plaintext has more than 2^14 bytes.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="735" href="#"></a></td>
+<td><pre>     * However, some TLS implementations violate the specification.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="736" href="#"></a></td>
+<td><pre>     * This is a workaround for interoperability with these stacks.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="737" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="738" href="#"></a></td>
+<td><pre>     * Application could accept large fragments up to 2^15 bytes by</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="739" href="#"></a></td>
+<td><pre>     * setting the system property jsse.SSLEngine.acceptLargeFragments</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="740" href="#"></a></td>
+<td><pre>     * to &quot;true&quot;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="741" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="742" href="#"></a></td>
+<td><pre>    private boolean acceptLargeFragments =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="743" href="#"></a></td>
+<td><pre>        Debug.getBooleanProperty(&quot;jsse.SSLEngine.acceptLargeFragments&quot;, false);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="744" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="745" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="746" href="#"></a></td>
+<td><pre>     * Expand the buffer size of both SSL/TLS network packet and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="747" href="#"></a></td>
+<td><pre>     * application data.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="748" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="749" href="#"></a></td>
+<td><pre>    protected synchronized void expandBufferSizes() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="750" href="#"></a></td>
+<td><pre>        acceptLargeFragments = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="751" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="752" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="753" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="754" href="#"></a></td>
+<td><pre>     * Gets the current size of the largest SSL/TLS packet that is expected</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="755" href="#"></a></td>
+<td><pre>     * when using this session.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="756" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="757" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="758" href="#"></a></td>
+<td><pre>    public synchronized int getPacketBufferSize() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="759" href="#"></a></td>
+<td><pre>        return acceptLargeFragments ?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="760" href="#"></a></td>
+<td><pre>                Record.maxLargeRecordSize : Record.maxRecordSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="761" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="762" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="763" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="764" href="#"></a></td>
+<td><pre>     * Gets the current size of the largest application data that is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="765" href="#"></a></td>
+<td><pre>     * expected when using this session.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="766" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="767" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="768" href="#"></a></td>
+<td><pre>    public synchronized int getApplicationBufferSize() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="769" href="#"></a></td>
+<td><pre>        return getPacketBufferSize() - Record.headerSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="770" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="771" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="772" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="773" href="#"></a></td>
+<td><pre>     * Gets an array of supported signature algorithms that the local side is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="774" href="#"></a></td>
+<td><pre>     * willing to verify.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="775" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="776" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="777" href="#"></a></td>
+<td><pre>    public String[] getLocalSupportedSignatureAlgorithms() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="778" href="#"></a></td>
+<td><pre>        if (localSupportedSignAlgs != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="779" href="#"></a></td>
+<td><pre>            return localSupportedSignAlgs.clone();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="780" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="781" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="782" href="#"></a></td>
+<td><pre>        return new String[0];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="783" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="784" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="785" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="786" href="#"></a></td>
+<td><pre>     * Gets an array of supported signature algorithms that the peer is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="787" href="#"></a></td>
+<td><pre>     * able to verify.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="788" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="789" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="790" href="#"></a></td>
+<td><pre>    public String[] getPeerSupportedSignatureAlgorithms() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="791" href="#"></a></td>
+<td><pre>        if (peerSupportedSignAlgs != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="792" href="#"></a></td>
+<td><pre>            return peerSupportedSignAlgs.clone();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="793" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="794" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="795" href="#"></a></td>
+<td><pre>        return new String[0];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="796" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="797" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="798" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="799" href="#"></a></td>
+<td><pre>     * Obtains a &lt;code&gt;List&lt;/code&gt; containing all {@link SNIServerName}s</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="800" href="#"></a></td>
+<td><pre>     * of the requested Server Name Indication (SNI) extension.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="801" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="802" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="803" href="#"></a></td>
+<td><pre>    public List&lt;SNIServerName&gt; getRequestedServerNames() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="804" href="#"></a></td>
+<td><pre>        if (requestedServerNames != null &amp;&amp; !requestedServerNames.isEmpty()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="805" href="#"></a></td>
+<td><pre>            return Collections.&lt;SNIServerName&gt;unmodifiableList(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="806" href="#"></a></td>
+<td><pre>                                                requestedServerNames);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="807" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="808" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="809" href="#"></a></td>
+<td><pre>        return Collections.&lt;SNIServerName&gt;emptyList();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="810" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="811" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="812" href="#"></a></td>
+<td><pre>    /** Returns a string representation of this SSL session */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="813" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="814" href="#"></a></td>
+<td><pre>    public String toString() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="815" href="#"></a></td>
+<td><pre>        return &quot;[Session-&quot; + sessionCount</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="816" href="#"></a></td>
+<td><pre>            + &quot;, &quot; + getCipherSuite()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="817" href="#"></a></td>
+<td><pre>            + &quot;]&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="818" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="819" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="820" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="821" href="#"></a></td>
+<td><pre>     * When SSL sessions are finalized, all values bound to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="822" href="#"></a></td>
+<td><pre>     * them are removed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="823" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="824" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="825" href="#"></a></td>
+<td><pre>    protected void finalize() throws Throwable {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="826" href="#"></a></td>
+<td><pre>        String[] names = getValueNames();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="827" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; names.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="828" href="#"></a></td>
+<td><pre>            removeValue(names[i]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="829" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="830" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="831" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="832" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="833" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="834" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="835" href="#"></a></td>
+<td><pre> * This &quot;struct&quot; class serves as a Hash Key that combines an</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="836" href="#"></a></td>
+<td><pre> * application-specific key and a security context.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="837" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="838" href="#"></a></td>
+<td><pre>class SecureKey {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="839" href="#"></a></td>
+<td><pre>    private static Object       nullObject = new Object();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="840" href="#"></a></td>
+<td><pre>    private Object        appKey;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="841" href="#"></a></td>
+<td><pre>    private Object      securityCtx;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="842" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="843" href="#"></a></td>
+<td><pre>    static Object getCurrentSecurityContext() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="844" href="#"></a></td>
+<td><pre>        SecurityManager sm = System.getSecurityManager();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="845" href="#"></a></td>
+<td><pre>        Object context = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="846" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="847" href="#"></a></td>
+<td><pre>        if (sm != null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="848" href="#"></a></td>
+<td><pre>            context = sm.getSecurityContext();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="849" href="#"></a></td>
+<td><pre>        if (context == null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="850" href="#"></a></td>
+<td><pre>            context = nullObject;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="851" href="#"></a></td>
+<td><pre>        return context;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="852" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="853" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="854" href="#"></a></td>
+<td><pre>    SecureKey(Object key) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="855" href="#"></a></td>
+<td><pre>        this.appKey = key;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="856" href="#"></a></td>
+<td><pre>        this.securityCtx = getCurrentSecurityContext();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="857" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="858" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="859" href="#"></a></td>
+<td><pre>    Object getAppKey() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="860" href="#"></a></td>
+<td><pre>        return appKey;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="861" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="862" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="863" href="#"></a></td>
+<td><pre>    Object getSecurityContext() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="864" href="#"></a></td>
+<td><pre>        return securityCtx;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="865" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="866" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="867" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="868" href="#"></a></td>
+<td><pre>    public int hashCode() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="869" href="#"></a></td>
+<td><pre>        return appKey.hashCode() ^ securityCtx.hashCode();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="870" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="871" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="872" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="873" href="#"></a></td>
+<td><pre>    public boolean equals(Object o) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="874" href="#"></a></td>
+<td><pre>        return o instanceof SecureKey &amp;&amp; ((SecureKey)o).appKey.equals(appKey)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="875" href="#"></a></td>
+<td><pre>                        &amp;&amp; ((SecureKey)o).securityCtx.equals(securityCtx);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="876" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="877" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

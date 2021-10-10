@@ -3,395 +3,1559 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2008, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package java.lang.invoke;
-
-import sun.invoke.util.Wrapper;
-import static java.lang.invoke.MethodHandleStatics.*;
-import static java.lang.invoke.MethodHandleNatives.Constants.*;
- import static java.lang.invoke.MethodHandles.Lookup.IMPL_LOOKUP;
-
-/**
- * Shared information for a group of method types, which differ
- * only by reference types, and therefore share a common erasure
- * and wrapping.
- * &lt;p&gt;
- * For an empirical discussion of the structure of method types,
- * see &lt;a href=&quot;http://groups.google.com/group/jvm-languages/browse_thread/thread/ac9308ae74da9b7e/&quot;&gt;
- * the thread &quot;Avoiding Boxing&quot; on jvm-languages&lt;/a&gt;.
- * There are approximately 2000 distinct erased method types in the JDK.
- * There are a little over 10 times that number of unerased types.
- * No more than half of these are likely to be loaded at once.
- * @author John Rose
- */
-final class MethodTypeForm {
-    final int[] argToSlotTable, slotToArgTable;
-    final long argCounts;               // packed slot &amp; value counts
-    final long primCounts;              // packed prim &amp; double counts
-    final int vmslots;                  // total number of parameter slots
-    final MethodType erasedType;        // the canonical erasure
-    final MethodType basicType;         // the canonical erasure, with primitives simplified
-
-    // Cached adapter information:
-    @Stable String typeString;           // argument type signature characters
-    @Stable MethodHandle genericInvoker; // JVM hook for inexact invoke
-    @Stable MethodHandle basicInvoker;   // cached instance of MH.invokeBasic
-    @Stable MethodHandle namedFunctionInvoker; // cached helper for LF.NamedFunction
-
-    // Cached lambda form information, for basic types only:
-    final @Stable LambdaForm[] lambdaForms;
-    // Indexes into lambdaForms:
-    static final int
-            LF_INVVIRTUAL     =  0,  // DMH invokeVirtual
-            LF_INVSTATIC      =  1,
-            LF_INVSPECIAL     =  2,
-            LF_NEWINVSPECIAL  =  3,
-            LF_INVINTERFACE   =  4,
-            LF_INVSTATIC_INIT =  5,  // DMH invokeStatic with &lt;clinit&gt; barrier
-            LF_INTERPRET      =  6,  // LF interpreter
-            LF_COUNTER        =  7,  // CMH wrapper
-            LF_REINVOKE       =  8,  // other wrapper
-            LF_EX_LINKER      =  9,  // invokeExact_MT
-            LF_EX_INVOKER     = 10,  // invokeExact MH
-            LF_GEN_LINKER     = 11,
-            LF_GEN_INVOKER    = 12,
-            LF_CS_LINKER      = 13,  // linkToCallSite_CS
-            LF_MH_LINKER      = 14,  // linkToCallSite_MH
-            LF_LIMIT          = 15;
-
-    public MethodType erasedType() {
-        return erasedType;
-    }
-
-    public MethodType basicType() {
-        return basicType;
-    }
-
-    public LambdaForm cachedLambdaForm(int which) {
-        return lambdaForms[which];
-    }
-
-    public LambdaForm setCachedLambdaForm(int which, LambdaForm form) {
-        // Should we perform some sort of CAS, to avoid racy duplication?
-        return lambdaForms[which] = form;
-    }
-
-    public MethodHandle basicInvoker() {
-        assert(erasedType == basicType) : &quot;erasedType: &quot; + erasedType + &quot; != basicType: &quot; + basicType;  // primitives must be flattened also
-        MethodHandle invoker = basicInvoker;
-        if (invoker != null)  return invoker;
-        invoker = DirectMethodHandle.make(invokeBasicMethod(basicType));
-        basicInvoker = invoker;
-        return invoker;
-    }
-
-    // This next one is called from LambdaForm.NamedFunction.&lt;init&gt;.
-    /*non-public*/ static MemberName invokeBasicMethod(MethodType basicType) {
-        assert(basicType == basicType.basicType());
-        try {
-            // Do approximately the same as this public API call:
-            //   Lookup.findVirtual(MethodHandle.class, name, type);
-            // But bypass access and corner case checks, since we know exactly what we need.
-            return IMPL_LOOKUP.resolveOrFail(REF_invokeVirtual, MethodHandle.class, &quot;invokeBasic&quot;, basicType);
-         } catch (ReflectiveOperationException ex) {
-            throw newInternalError(&quot;JVM cannot find invoker for &quot;+basicType, ex);
-        }
-    }
-
-    /**
-     * Build an MTF for a given type, which must have all references erased to Object.
-     * This MTF will stand for that type and all un-erased variations.
-     * Eagerly compute some basic properties of the type, common to all variations.
-     */
-    protected MethodTypeForm(MethodType erasedType) {
-        this.erasedType = erasedType;
-
-        Class&lt;?&gt;[] ptypes = erasedType.ptypes();
-        int ptypeCount = ptypes.length;
-        int pslotCount = ptypeCount;            // temp. estimate
-        int rtypeCount = 1;                     // temp. estimate
-        int rslotCount = 1;                     // temp. estimate
-
-        int[] argToSlotTab = null, slotToArgTab = null;
-
-        // Walk the argument types, looking for primitives.
-        int pac = 0, lac = 0, prc = 0, lrc = 0;
-        Class&lt;?&gt;[] epts = ptypes;
-        Class&lt;?&gt;[] bpts = epts;
-        for (int i = 0; i &lt; epts.length; i++) {
-            Class&lt;?&gt; pt = epts[i];
-            if (pt != Object.class) {
-                ++pac;
-                Wrapper w = Wrapper.forPrimitiveType(pt);
-                if (w.isDoubleWord())  ++lac;
-                if (w.isSubwordOrInt() &amp;&amp; pt != int.class) {
-                    if (bpts == epts)
-                        bpts = bpts.clone();
-                    bpts[i] = int.class;
-                }
-            }
-        }
-        pslotCount += lac;                  // #slots = #args + #longs
-        Class&lt;?&gt; rt = erasedType.returnType();
-        Class&lt;?&gt; bt = rt;
-        if (rt != Object.class) {
-            ++prc;          // even void.class counts as a prim here
-            Wrapper w = Wrapper.forPrimitiveType(rt);
-            if (w.isDoubleWord())  ++lrc;
-            if (w.isSubwordOrInt() &amp;&amp; rt != int.class)
-                bt = int.class;
-            // adjust #slots, #args
-            if (rt == void.class)
-                rtypeCount = rslotCount = 0;
-            else
-                rslotCount += lrc;
-        }
-        if (epts == bpts &amp;&amp; bt == rt) {
-            this.basicType = erasedType;
-        } else {
-            this.basicType = MethodType.makeImpl(bt, bpts, true);
-        }
-        if (lac != 0) {
-            int slot = ptypeCount + lac;
-            slotToArgTab = new int[slot+1];
-            argToSlotTab = new int[1+ptypeCount];
-            argToSlotTab[0] = slot;  // argument &quot;-1&quot; is past end of slots
-            for (int i = 0; i &lt; epts.length; i++) {
-                Class&lt;?&gt; pt = epts[i];
-                Wrapper w = Wrapper.forBasicType(pt);
-                if (w.isDoubleWord())  --slot;
-                --slot;
-                slotToArgTab[slot] = i+1; // &quot;+1&quot; see argSlotToParameter note
-                argToSlotTab[1+i]  = slot;
-            }
-            assert(slot == 0);  // filled the table
-        }
-        this.primCounts = pack(lrc, prc, lac, pac);
-        this.argCounts = pack(rslotCount, rtypeCount, pslotCount, ptypeCount);
-        if (slotToArgTab == null) {
-            int slot = ptypeCount; // first arg is deepest in stack
-            slotToArgTab = new int[slot+1];
-            argToSlotTab = new int[1+ptypeCount];
-            argToSlotTab[0] = slot;  // argument &quot;-1&quot; is past end of slots
-            for (int i = 0; i &lt; ptypeCount; i++) {
-                --slot;
-                slotToArgTab[slot] = i+1; // &quot;+1&quot; see argSlotToParameter note
-                argToSlotTab[1+i]  = slot;
-            }
-        }
-        this.argToSlotTable = argToSlotTab;
-        this.slotToArgTable = slotToArgTab;
-
-        if (pslotCount &gt;= 256)  throw newIllegalArgumentException(&quot;too many arguments&quot;);
-
-        // send a few bits down to the JVM:
-        this.vmslots = parameterSlotCount();
-
-        if (basicType == erasedType) {
-            lambdaForms = new LambdaForm[LF_LIMIT];
-        } else {
-            lambdaForms = null;  // could be basicType.form().lambdaForms;
-        }
-    }
-
-    private static long pack(int a, int b, int c, int d) {
-        assert(((a|b|c|d) &amp; ~0xFFFF) == 0);
-        long hw = ((a &lt;&lt; 16) | b), lw = ((c &lt;&lt; 16) | d);
-        return (hw &lt;&lt; 32) | lw;
-    }
-    private static char unpack(long packed, int word) { // word==0 =&gt; return a, ==3 =&gt; return d
-        assert(word &lt;= 3);
-        return (char)(packed &gt;&gt; ((3-word) * 16));
-    }
-
-    public int parameterCount() {                      // # outgoing values
-        return unpack(argCounts, 3);
-    }
-    public int parameterSlotCount() {                  // # outgoing interpreter slots
-        return unpack(argCounts, 2);
-    }
-    public int returnCount() {                         // = 0 (V), or 1
-        return unpack(argCounts, 1);
-    }
-    public int returnSlotCount() {                     // = 0 (V), 2 (J/D), or 1
-        return unpack(argCounts, 0);
-    }
-    public int primitiveParameterCount() {
-        return unpack(primCounts, 3);
-    }
-    public int longPrimitiveParameterCount() {
-        return unpack(primCounts, 2);
-    }
-    public int primitiveReturnCount() {                // = 0 (obj), or 1
-        return unpack(primCounts, 1);
-    }
-    public int longPrimitiveReturnCount() {            // = 1 (J/D), or 0
-        return unpack(primCounts, 0);
-    }
-    public boolean hasPrimitives() {
-        return primCounts != 0;
-    }
-    public boolean hasNonVoidPrimitives() {
-        if (primCounts == 0)  return false;
-        if (primitiveParameterCount() != 0)  return true;
-        return (primitiveReturnCount() != 0 &amp;&amp; returnCount() != 0);
-    }
-    public boolean hasLongPrimitives() {
-        return (longPrimitiveParameterCount() | longPrimitiveReturnCount()) != 0;
-    }
-    public int parameterToArgSlot(int i) {
-        return argToSlotTable[1+i];
-    }
-    public int argSlotToParameter(int argSlot) {
-        // Note:  Empty slots are represented by zero in this table.
-        // Valid arguments slots contain incremented entries, so as to be non-zero.
-        // We return -1 the caller to mean an empty slot.
-        return slotToArgTable[argSlot] - 1;
-    }
-
-    static MethodTypeForm findForm(MethodType mt) {
-        MethodType erased = canonicalize(mt, ERASE, ERASE);
-        if (erased == null) {
-            // It is already erased.  Make a new MethodTypeForm.
-            return new MethodTypeForm(mt);
-        } else {
-            // Share the MethodTypeForm with the erased version.
-            return erased.form();
-        }
-    }
-
-    /** Codes for {@link #canonicalize(java.lang.Class, int)}.
-     * ERASE means change every reference to {@code Object}.
-     * WRAP means convert primitives (including {@code void} to their
-     * corresponding wrapper types.  UNWRAP means the reverse of WRAP.
-     * INTS means convert all non-void primitive types to int or long,
-     * according to size.  LONGS means convert all non-void primitives
-     * to long, regardless of size.  RAW_RETURN means convert a type
-     * (assumed to be a return type) to int if it is smaller than an int,
-     * or if it is void.
-     */
-    public static final int NO_CHANGE = 0, ERASE = 1, WRAP = 2, UNWRAP = 3, INTS = 4, LONGS = 5, RAW_RETURN = 6;
-
-    /** Canonicalize the types in the given method type.
-     * If any types change, intern the new type, and return it.
-     * Otherwise return null.
-     */
-    public static MethodType canonicalize(MethodType mt, int howRet, int howArgs) {
-        Class&lt;?&gt;[] ptypes = mt.ptypes();
-        Class&lt;?&gt;[] ptc = MethodTypeForm.canonicalizes(ptypes, howArgs);
-        Class&lt;?&gt; rtype = mt.returnType();
-        Class&lt;?&gt; rtc = MethodTypeForm.canonicalize(rtype, howRet);
-        if (ptc == null &amp;&amp; rtc == null) {
-            // It is already canonical.
-            return null;
-        }
-        // Find the erased version of the method type:
-        if (rtc == null)  rtc = rtype;
-        if (ptc == null)  ptc = ptypes;
-        return MethodType.makeImpl(rtc, ptc, true);
-    }
-
-    /** Canonicalize the given return or param type.
-     *  Return null if the type is already canonicalized.
-     */
-    static Class&lt;?&gt; canonicalize(Class&lt;?&gt; t, int how) {
-        Class&lt;?&gt; ct;
-        if (t == Object.class) {
-            // no change, ever
-        } else if (!t.isPrimitive()) {
-            switch (how) {
-                case UNWRAP:
-                    ct = Wrapper.asPrimitiveType(t);
-                    if (ct != t)  return ct;
-                    break;
-                case RAW_RETURN:
-                case ERASE:
-                    return Object.class;
-            }
-        } else if (t == void.class) {
-            // no change, usually
-            switch (how) {
-                case RAW_RETURN:
-                    return int.class;
-                case WRAP:
-                    return Void.class;
-            }
-        } else {
-            // non-void primitive
-            switch (how) {
-                case WRAP:
-                    return Wrapper.asWrapperType(t);
-                case INTS:
-                    if (t == int.class || t == long.class)
-                        return null;  // no change
-                    if (t == double.class)
-                        return long.class;
-                    return int.class;
-                case LONGS:
-                    if (t == long.class)
-                        return null;  // no change
-                    return long.class;
-                case RAW_RETURN:
-                    if (t == int.class || t == long.class ||
-                        t == float.class || t == double.class)
-                        return null;  // no change
-                    // everything else returns as an int
-                    return int.class;
-            }
-        }
-        // no change; return null to signify
-        return null;
-    }
-
-    /** Canonicalize each param type in the given array.
-     *  Return null if all types are already canonicalized.
-     */
-    static Class&lt;?&gt;[] canonicalizes(Class&lt;?&gt;[] ts, int how) {
-        Class&lt;?&gt;[] cs = null;
-        for (int imax = ts.length, i = 0; i &lt; imax; i++) {
-            Class&lt;?&gt; c = canonicalize(ts[i], how);
-            if (c == void.class)
-                c = null;  // a Void parameter was unwrapped to void; ignore
-            if (c != null) {
-                if (cs == null)
-                    cs = ts.clone();
-                cs[i] = c;
-            }
-        }
-        return cs;
-    }
-
-    @Override
-    public String toString() {
-        return &quot;Form&quot;+erasedType;
-    }
-
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2008, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package java.lang.invoke;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import sun.invoke.util.Wrapper;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import static java.lang.invoke.MethodHandleStatics.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import static java.lang.invoke.MethodHandleNatives.Constants.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre> import static java.lang.invoke.MethodHandles.Lookup.IMPL_LOOKUP;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre> * Shared information for a group of method types, which differ</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre> * only by reference types, and therefore share a common erasure</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre> * and wrapping.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre> * &lt;p&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre> * For an empirical discussion of the structure of method types,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre> * see &lt;a href=&quot;http://groups.google.com/group/jvm-languages/browse_thread/thread/ac9308ae74da9b7e/&quot;&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre> * the thread &quot;Avoiding Boxing&quot; on jvm-languages&lt;/a&gt;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre> * There are approximately 2000 distinct erased method types in the JDK.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre> * There are a little over 10 times that number of unerased types.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre> * No more than half of these are likely to be loaded at once.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre> * @author John Rose</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>final class MethodTypeForm {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre>    final int[] argToSlotTable, slotToArgTable;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre>    final long argCounts;               // packed slot &amp; value counts</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre>    final long primCounts;              // packed prim &amp; double counts</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre>    final int vmslots;                  // total number of parameter slots</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>    final MethodType erasedType;        // the canonical erasure</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre>    final MethodType basicType;         // the canonical erasure, with primitives simplified</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre>    // Cached adapter information:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>    @Stable String typeString;           // argument type signature characters</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre>    @Stable MethodHandle genericInvoker; // JVM hook for inexact invoke</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>    @Stable MethodHandle basicInvoker;   // cached instance of MH.invokeBasic</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>    @Stable MethodHandle namedFunctionInvoker; // cached helper for LF.NamedFunction</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>    // Cached lambda form information, for basic types only:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>    final @Stable LambdaForm[] lambdaForms;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre>    // Indexes into lambdaForms:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>    static final int</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>            LF_INVVIRTUAL     =  0,  // DMH invokeVirtual</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>            LF_INVSTATIC      =  1,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>            LF_INVSPECIAL     =  2,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>            LF_NEWINVSPECIAL  =  3,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>            LF_INVINTERFACE   =  4,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>            LF_INVSTATIC_INIT =  5,  // DMH invokeStatic with &lt;clinit&gt; barrier</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>            LF_INTERPRET      =  6,  // LF interpreter</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>            LF_COUNTER        =  7,  // CMH wrapper</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>            LF_REINVOKE       =  8,  // other wrapper</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>            LF_EX_LINKER      =  9,  // invokeExact_MT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>            LF_EX_INVOKER     = 10,  // invokeExact MH</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>            LF_GEN_LINKER     = 11,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>            LF_GEN_INVOKER    = 12,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>            LF_CS_LINKER      = 13,  // linkToCallSite_CS</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>            LF_MH_LINKER      = 14,  // linkToCallSite_MH</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>            LF_LIMIT          = 15;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>    public MethodType erasedType() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>        return erasedType;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>    public MethodType basicType() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>        return basicType;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>    public LambdaForm cachedLambdaForm(int which) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>        return lambdaForms[which];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>    public LambdaForm setCachedLambdaForm(int which, LambdaForm form) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>        // Should we perform some sort of CAS, to avoid racy duplication?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>        return lambdaForms[which] = form;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>    public MethodHandle basicInvoker() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>        assert(erasedType == basicType) : &quot;erasedType: &quot; + erasedType + &quot; != basicType: &quot; + basicType;  // primitives must be flattened also</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>        MethodHandle invoker = basicInvoker;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>        if (invoker != null)  return invoker;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>        invoker = DirectMethodHandle.make(invokeBasicMethod(basicType));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>        basicInvoker = invoker;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>        return invoker;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>    // This next one is called from LambdaForm.NamedFunction.&lt;init&gt;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>    /*non-public*/ static MemberName invokeBasicMethod(MethodType basicType) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>        assert(basicType == basicType.basicType());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>            // Do approximately the same as this public API call:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>            //   Lookup.findVirtual(MethodHandle.class, name, type);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>            // But bypass access and corner case checks, since we know exactly what we need.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>            return IMPL_LOOKUP.resolveOrFail(REF_invokeVirtual, MethodHandle.class, &quot;invokeBasic&quot;, basicType);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>         } catch (ReflectiveOperationException ex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>            throw newInternalError(&quot;JVM cannot find invoker for &quot;+basicType, ex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>     * Build an MTF for a given type, which must have all references erased to Object.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>     * This MTF will stand for that type and all un-erased variations.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>     * Eagerly compute some basic properties of the type, common to all variations.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>    protected MethodTypeForm(MethodType erasedType) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>        this.erasedType = erasedType;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>        Class&lt;?&gt;[] ptypes = erasedType.ptypes();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>        int ptypeCount = ptypes.length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>        int pslotCount = ptypeCount;            // temp. estimate</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>        int rtypeCount = 1;                     // temp. estimate</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>        int rslotCount = 1;                     // temp. estimate</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>        int[] argToSlotTab = null, slotToArgTab = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>        // Walk the argument types, looking for primitives.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>        int pac = 0, lac = 0, prc = 0, lrc = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>        Class&lt;?&gt;[] epts = ptypes;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>        Class&lt;?&gt;[] bpts = epts;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; epts.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>            Class&lt;?&gt; pt = epts[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>            if (pt != Object.class) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>                ++pac;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>                Wrapper w = Wrapper.forPrimitiveType(pt);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>                if (w.isDoubleWord())  ++lac;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>                if (w.isSubwordOrInt() &amp;&amp; pt != int.class) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>                    if (bpts == epts)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>                        bpts = bpts.clone();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>                    bpts[i] = int.class;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>        pslotCount += lac;                  // #slots = #args + #longs</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>        Class&lt;?&gt; rt = erasedType.returnType();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>        Class&lt;?&gt; bt = rt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>        if (rt != Object.class) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>            ++prc;          // even void.class counts as a prim here</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>            Wrapper w = Wrapper.forPrimitiveType(rt);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>            if (w.isDoubleWord())  ++lrc;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>            if (w.isSubwordOrInt() &amp;&amp; rt != int.class)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>                bt = int.class;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>            // adjust #slots, #args</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>            if (rt == void.class)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>                rtypeCount = rslotCount = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>            else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>                rslotCount += lrc;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>        if (epts == bpts &amp;&amp; bt == rt) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>            this.basicType = erasedType;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>            this.basicType = MethodType.makeImpl(bt, bpts, true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>        if (lac != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>            int slot = ptypeCount + lac;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>            slotToArgTab = new int[slot+1];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>            argToSlotTab = new int[1+ptypeCount];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>            argToSlotTab[0] = slot;  // argument &quot;-1&quot; is past end of slots</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>            for (int i = 0; i &lt; epts.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>                Class&lt;?&gt; pt = epts[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>                Wrapper w = Wrapper.forBasicType(pt);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>                if (w.isDoubleWord())  --slot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>                --slot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>                slotToArgTab[slot] = i+1; // &quot;+1&quot; see argSlotToParameter note</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>                argToSlotTab[1+i]  = slot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>            assert(slot == 0);  // filled the table</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>        this.primCounts = pack(lrc, prc, lac, pac);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>        this.argCounts = pack(rslotCount, rtypeCount, pslotCount, ptypeCount);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>        if (slotToArgTab == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>            int slot = ptypeCount; // first arg is deepest in stack</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>            slotToArgTab = new int[slot+1];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>            argToSlotTab = new int[1+ptypeCount];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>            argToSlotTab[0] = slot;  // argument &quot;-1&quot; is past end of slots</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>            for (int i = 0; i &lt; ptypeCount; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>                --slot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>                slotToArgTab[slot] = i+1; // &quot;+1&quot; see argSlotToParameter note</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>                argToSlotTab[1+i]  = slot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>        this.argToSlotTable = argToSlotTab;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>        this.slotToArgTable = slotToArgTab;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>        if (pslotCount &gt;= 256)  throw newIllegalArgumentException(&quot;too many arguments&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>        // send a few bits down to the JVM:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>        this.vmslots = parameterSlotCount();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>        if (basicType == erasedType) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>            lambdaForms = new LambdaForm[LF_LIMIT];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>            lambdaForms = null;  // could be basicType.form().lambdaForms;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>    private static long pack(int a, int b, int c, int d) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>        assert(((a|b|c|d) &amp; ~0xFFFF) == 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>        long hw = ((a &lt;&lt; 16) | b), lw = ((c &lt;&lt; 16) | d);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>        return (hw &lt;&lt; 32) | lw;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>    private static char unpack(long packed, int word) { // word==0 =&gt; return a, ==3 =&gt; return d</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>        assert(word &lt;= 3);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>        return (char)(packed &gt;&gt; ((3-word) * 16));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>    public int parameterCount() {                      // # outgoing values</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>        return unpack(argCounts, 3);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>    public int parameterSlotCount() {                  // # outgoing interpreter slots</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>        return unpack(argCounts, 2);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>    public int returnCount() {                         // = 0 (V), or 1</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>        return unpack(argCounts, 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>    public int returnSlotCount() {                     // = 0 (V), 2 (J/D), or 1</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>        return unpack(argCounts, 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>    public int primitiveParameterCount() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>        return unpack(primCounts, 3);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>    public int longPrimitiveParameterCount() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>        return unpack(primCounts, 2);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>    public int primitiveReturnCount() {                // = 0 (obj), or 1</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>        return unpack(primCounts, 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>    public int longPrimitiveReturnCount() {            // = 1 (J/D), or 0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>        return unpack(primCounts, 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>    public boolean hasPrimitives() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>        return primCounts != 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>    public boolean hasNonVoidPrimitives() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>        if (primCounts == 0)  return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>        if (primitiveParameterCount() != 0)  return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>        return (primitiveReturnCount() != 0 &amp;&amp; returnCount() != 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>    public boolean hasLongPrimitives() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>        return (longPrimitiveParameterCount() | longPrimitiveReturnCount()) != 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>    public int parameterToArgSlot(int i) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>        return argToSlotTable[1+i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>    public int argSlotToParameter(int argSlot) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>        // Note:  Empty slots are represented by zero in this table.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>        // Valid arguments slots contain incremented entries, so as to be non-zero.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>        // We return -1 the caller to mean an empty slot.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>        return slotToArgTable[argSlot] - 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>    static MethodTypeForm findForm(MethodType mt) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>        MethodType erased = canonicalize(mt, ERASE, ERASE);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>        if (erased == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>            // It is already erased.  Make a new MethodTypeForm.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>            return new MethodTypeForm(mt);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>            // Share the MethodTypeForm with the erased version.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>            return erased.form();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>    /** Codes for {@link #canonicalize(java.lang.Class, int)}.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>     * ERASE means change every reference to {@code Object}.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>     * WRAP means convert primitives (including {@code void} to their</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>     * corresponding wrapper types.  UNWRAP means the reverse of WRAP.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>     * INTS means convert all non-void primitive types to int or long,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>     * according to size.  LONGS means convert all non-void primitives</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>     * to long, regardless of size.  RAW_RETURN means convert a type</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>     * (assumed to be a return type) to int if it is smaller than an int,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>     * or if it is void.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>    public static final int NO_CHANGE = 0, ERASE = 1, WRAP = 2, UNWRAP = 3, INTS = 4, LONGS = 5, RAW_RETURN = 6;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>    /** Canonicalize the types in the given method type.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>     * If any types change, intern the new type, and return it.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>     * Otherwise return null.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>    public static MethodType canonicalize(MethodType mt, int howRet, int howArgs) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>        Class&lt;?&gt;[] ptypes = mt.ptypes();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>        Class&lt;?&gt;[] ptc = MethodTypeForm.canonicalizes(ptypes, howArgs);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>        Class&lt;?&gt; rtype = mt.returnType();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>        Class&lt;?&gt; rtc = MethodTypeForm.canonicalize(rtype, howRet);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>        if (ptc == null &amp;&amp; rtc == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>            // It is already canonical.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>        // Find the erased version of the method type:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>        if (rtc == null)  rtc = rtype;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>        if (ptc == null)  ptc = ptypes;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>        return MethodType.makeImpl(rtc, ptc, true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>    /** Canonicalize the given return or param type.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>     *  Return null if the type is already canonicalized.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>    static Class&lt;?&gt; canonicalize(Class&lt;?&gt; t, int how) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>        Class&lt;?&gt; ct;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>        if (t == Object.class) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>            // no change, ever</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>        } else if (!t.isPrimitive()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>            switch (how) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>                case UNWRAP:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>                    ct = Wrapper.asPrimitiveType(t);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>                    if (ct != t)  return ct;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>                case RAW_RETURN:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>                case ERASE:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>                    return Object.class;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>        } else if (t == void.class) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>            // no change, usually</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>            switch (how) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>                case RAW_RETURN:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>                    return int.class;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>                case WRAP:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>                    return Void.class;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>            // non-void primitive</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>            switch (how) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>                case WRAP:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>                    return Wrapper.asWrapperType(t);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>                case INTS:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>                    if (t == int.class || t == long.class)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>                        return null;  // no change</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>                    if (t == double.class)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>                        return long.class;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>                    return int.class;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>                case LONGS:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>                    if (t == long.class)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>                        return null;  // no change</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>                    return long.class;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>                case RAW_RETURN:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>                    if (t == int.class || t == long.class ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>                        t == float.class || t == double.class)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>                        return null;  // no change</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>                    // everything else returns as an int</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>                    return int.class;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>        // no change; return null to signify</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>        return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>    /** Canonicalize each param type in the given array.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>     *  Return null if all types are already canonicalized.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>    static Class&lt;?&gt;[] canonicalizes(Class&lt;?&gt;[] ts, int how) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>        Class&lt;?&gt;[] cs = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>        for (int imax = ts.length, i = 0; i &lt; imax; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>            Class&lt;?&gt; c = canonicalize(ts[i], how);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>            if (c == void.class)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>                c = null;  // a Void parameter was unwrapped to void; ignore</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>            if (c != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>                if (cs == null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>                    cs = ts.clone();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>                cs[i] = c;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>        return cs;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>    public String toString() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>        return &quot;Form&quot;+erasedType;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

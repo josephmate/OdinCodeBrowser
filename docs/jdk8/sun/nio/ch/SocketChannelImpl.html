@@ -3,1042 +3,4147 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package sun.nio.ch;
-
-import java.io.FileDescriptor;
-import java.io.IOException;
-import java.net.*;
-import java.nio.ByteBuffer;
-import java.nio.channels.*;
-import java.nio.channels.spi.*;
-import java.util.*;
-import sun.net.NetHooks;
-
-
-/**
- * An implementation of SocketChannels
- */
-
-class SocketChannelImpl
-    extends SocketChannel
-    implements SelChImpl
-{
-
-    // Used to make native read and write calls
-    private static NativeDispatcher nd;
-
-    // Our file descriptor object
-    private final FileDescriptor fd;
-
-    // fd value needed for dev/poll. This value will remain valid
-    // even after the value in the file descriptor object has been set to -1
-    private final int fdVal;
-
-    // IDs of native threads doing reads and writes, for signalling
-    private volatile long readerThread = 0;
-    private volatile long writerThread = 0;
-
-    // Lock held by current reading or connecting thread
-    private final Object readLock = new Object();
-
-    // Lock held by current writing or connecting thread
-    private final Object writeLock = new Object();
-
-    // Lock held by any thread that modifies the state fields declared below
-    // DO NOT invoke a blocking I/O operation while holding this lock!
-    private final Object stateLock = new Object();
-
-    // -- The following fields are protected by stateLock
-
-    // set true when exclusive binding is on and SO_REUSEADDR is emulated
-    private boolean isReuseAddress;
-
-    // State, increases monotonically
-    private static final int ST_UNINITIALIZED = -1;
-    private static final int ST_UNCONNECTED = 0;
-    private static final int ST_PENDING = 1;
-    private static final int ST_CONNECTED = 2;
-    private static final int ST_KILLPENDING = 3;
-    private static final int ST_KILLED = 4;
-    private int state = ST_UNINITIALIZED;
-
-    // Binding
-    private InetSocketAddress localAddress;
-    private InetSocketAddress remoteAddress;
-
-    // Input/Output open
-    private boolean isInputOpen = true;
-    private boolean isOutputOpen = true;
-    private boolean readyToConnect = false;
-
-    // Socket adaptor, created on demand
-    private Socket socket;
-
-    // -- End of fields protected by stateLock
-
-
-    // Constructor for normal connecting sockets
-    //
-    SocketChannelImpl(SelectorProvider sp) throws IOException {
-        super(sp);
-        this.fd = Net.socket(true);
-        this.fdVal = IOUtil.fdVal(fd);
-        this.state = ST_UNCONNECTED;
-    }
-
-    SocketChannelImpl(SelectorProvider sp,
-                      FileDescriptor fd,
-                      boolean bound)
-        throws IOException
-    {
-        super(sp);
-        this.fd = fd;
-        this.fdVal = IOUtil.fdVal(fd);
-        this.state = ST_UNCONNECTED;
-        if (bound)
-            this.localAddress = Net.localAddress(fd);
-    }
-
-    // Constructor for sockets obtained from server sockets
-    //
-    SocketChannelImpl(SelectorProvider sp,
-                      FileDescriptor fd, InetSocketAddress remote)
-        throws IOException
-    {
-        super(sp);
-        this.fd = fd;
-        this.fdVal = IOUtil.fdVal(fd);
-        this.state = ST_CONNECTED;
-        this.localAddress = Net.localAddress(fd);
-        this.remoteAddress = remote;
-    }
-
-    public Socket socket() {
-        synchronized (stateLock) {
-            if (socket == null)
-                socket = SocketAdaptor.create(this);
-            return socket;
-        }
-    }
-
-    @Override
-    public SocketAddress getLocalAddress() throws IOException {
-        synchronized (stateLock) {
-            if (!isOpen())
-                throw new ClosedChannelException();
-            return  Net.getRevealedLocalAddress(localAddress);
-        }
-    }
-
-    @Override
-    public SocketAddress getRemoteAddress() throws IOException {
-        synchronized (stateLock) {
-            if (!isOpen())
-                throw new ClosedChannelException();
-            return remoteAddress;
-        }
-    }
-
-    @Override
-    public &lt;T&gt; SocketChannel setOption(SocketOption&lt;T&gt; name, T value)
-        throws IOException
-    {
-        if (name == null)
-            throw new NullPointerException();
-        if (!supportedOptions().contains(name))
-            throw new UnsupportedOperationException(&quot;'&quot; + name + &quot;' not supported&quot;);
-
-        synchronized (stateLock) {
-            if (!isOpen())
-                throw new ClosedChannelException();
-
-            // special handling for IP_TOS: no-op when IPv6
-            if (name == StandardSocketOptions.IP_TOS) {
-                if (!Net.isIPv6Available())
-                    Net.setSocketOption(fd, StandardProtocolFamily.INET, name, value);
-                return this;
-            } else if (name == StandardSocketOptions.SO_REUSEADDR &amp;&amp;
-                           Net.useExclusiveBind())
-            {
-                // SO_REUSEADDR emulated when using exclusive bind
-                isReuseAddress = (Boolean)value;
-                return this;
-            }
-
-            // no options that require special handling
-            Net.setSocketOption(fd, Net.UNSPEC, name, value);
-            return this;
-        }
-    }
-
-    @Override
-    @SuppressWarnings(&quot;unchecked&quot;)
-    public &lt;T&gt; T getOption(SocketOption&lt;T&gt; name)
-        throws IOException
-    {
-        if (name == null)
-            throw new NullPointerException();
-        if (!supportedOptions().contains(name))
-            throw new UnsupportedOperationException(&quot;'&quot; + name + &quot;' not supported&quot;);
-
-        synchronized (stateLock) {
-            if (!isOpen())
-                throw new ClosedChannelException();
-
-            if (name == StandardSocketOptions.SO_REUSEADDR &amp;&amp;
-                    Net.useExclusiveBind())
-            {
-                // SO_REUSEADDR emulated when using exclusive bind
-                return (T)Boolean.valueOf(isReuseAddress);
-            }
-
-            // special handling for IP_TOS: always return 0 when IPv6
-            if (name == StandardSocketOptions.IP_TOS) {
-                return (Net.isIPv6Available()) ? (T) Integer.valueOf(0) :
-                    (T) Net.getSocketOption(fd, StandardProtocolFamily.INET, name);
-            }
-
-            // no options that require special handling
-            return (T) Net.getSocketOption(fd, Net.UNSPEC, name);
-        }
-    }
-
-    private static class DefaultOptionsHolder {
-        static final Set&lt;SocketOption&lt;?&gt;&gt; defaultOptions = defaultOptions();
-
-        private static Set&lt;SocketOption&lt;?&gt;&gt; defaultOptions() {
-            HashSet&lt;SocketOption&lt;?&gt;&gt; set = new HashSet&lt;SocketOption&lt;?&gt;&gt;(8);
-            set.add(StandardSocketOptions.SO_SNDBUF);
-            set.add(StandardSocketOptions.SO_RCVBUF);
-            set.add(StandardSocketOptions.SO_KEEPALIVE);
-            set.add(StandardSocketOptions.SO_REUSEADDR);
-            set.add(StandardSocketOptions.SO_LINGER);
-            set.add(StandardSocketOptions.TCP_NODELAY);
-            // additional options required by socket adaptor
-            set.add(StandardSocketOptions.IP_TOS);
-            set.add(ExtendedSocketOption.SO_OOBINLINE);
-            return Collections.unmodifiableSet(set);
-        }
-    }
-
-    @Override
-    public final Set&lt;SocketOption&lt;?&gt;&gt; supportedOptions() {
-        return DefaultOptionsHolder.defaultOptions;
-    }
-
-    private boolean ensureReadOpen() throws ClosedChannelException {
-        synchronized (stateLock) {
-            if (!isOpen())
-                throw new ClosedChannelException();
-            if (!isConnected())
-                throw new NotYetConnectedException();
-            if (!isInputOpen)
-                return false;
-            else
-                return true;
-        }
-    }
-
-    private void ensureWriteOpen() throws ClosedChannelException {
-        synchronized (stateLock) {
-            if (!isOpen())
-                throw new ClosedChannelException();
-            if (!isOutputOpen)
-                throw new ClosedChannelException();
-            if (!isConnected())
-                throw new NotYetConnectedException();
-        }
-    }
-
-    private void readerCleanup() throws IOException {
-        synchronized (stateLock) {
-            readerThread = 0;
-            if (state == ST_KILLPENDING)
-                kill();
-        }
-    }
-
-    private void writerCleanup() throws IOException {
-        synchronized (stateLock) {
-            writerThread = 0;
-            if (state == ST_KILLPENDING)
-                kill();
-        }
-    }
-
-    public int read(ByteBuffer buf) throws IOException {
-
-        if (buf == null)
-            throw new NullPointerException();
-
-        synchronized (readLock) {
-            if (!ensureReadOpen())
-                return -1;
-            int n = 0;
-            try {
-
-                // Set up the interruption machinery; see
-                // AbstractInterruptibleChannel for details
-                //
-                begin();
-
-                synchronized (stateLock) {
-                    if (!isOpen()) {
-                    // Either the current thread is already interrupted, so
-                    // begin() closed the channel, or another thread closed the
-                    // channel since we checked it a few bytecodes ago.  In
-                    // either case the value returned here is irrelevant since
-                    // the invocation of end() in the finally block will throw
-                    // an appropriate exception.
-                    //
-                        return 0;
-
-                    }
-
-                    // Save this thread so that it can be signalled on those
-                    // platforms that require it
-                    //
-                    readerThread = NativeThread.current();
-                }
-
-                // Between the previous test of isOpen() and the return of the
-                // IOUtil.read invocation below, this channel might be closed
-                // or this thread might be interrupted.  We rely upon the
-                // implicit synchronization point in the kernel read() call to
-                // make sure that the right thing happens.  In either case the
-                // implCloseSelectableChannel method is ultimately invoked in
-                // some other thread, so there are three possibilities:
-                //
-                //   - implCloseSelectableChannel() invokes nd.preClose()
-                //     before this thread invokes read(), in which case the
-                //     read returns immediately with either EOF or an error,
-                //     the latter of which will cause an IOException to be
-                //     thrown.
-                //
-                //   - implCloseSelectableChannel() invokes nd.preClose() after
-                //     this thread is blocked in read().  On some operating
-                //     systems (e.g., Solaris and Windows) this causes the read
-                //     to return immediately with either EOF or an error
-                //     indication.
-                //
-                //   - implCloseSelectableChannel() invokes nd.preClose() after
-                //     this thread is blocked in read() but the operating
-                //     system (e.g., Linux) doesn't support preemptive close,
-                //     so implCloseSelectableChannel() proceeds to signal this
-                //     thread, thereby causing the read to return immediately
-                //     with IOStatus.INTERRUPTED.
-                //
-                // In all three cases the invocation of end() in the finally
-                // clause will notice that the channel has been closed and
-                // throw an appropriate exception (AsynchronousCloseException
-                // or ClosedByInterruptException) if necessary.
-                //
-                // *There is A fourth possibility. implCloseSelectableChannel()
-                // invokes nd.preClose(), signals reader/writer thred and quickly
-                // moves on to nd.close() in kill(), which does a real close.
-                // Then a third thread accepts a new connection, opens file or
-                // whatever that causes the released &quot;fd&quot; to be recycled. All
-                // above happens just between our last isOpen() check and the
-                // next kernel read reached, with the recycled &quot;fd&quot;. The solution
-                // is to postpone the real kill() if there is a reader or/and
-                // writer thread(s) over there &quot;waiting&quot;, leave the cleanup/kill
-                // to the reader or writer thread. (the preClose() still happens
-                // so the connection gets cut off as usual).
-                //
-                // For socket channels there is the additional wrinkle that
-                // asynchronous shutdown works much like asynchronous close,
-                // except that the channel is shutdown rather than completely
-                // closed.  This is analogous to the first two cases above,
-                // except that the shutdown operation plays the role of
-                // nd.preClose().
-                for (;;) {
-                    n = IOUtil.read(fd, buf, -1, nd);
-                    if ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen()) {
-                        // The system call was interrupted but the channel
-                        // is still open, so retry
-                        continue;
-                    }
-                    return IOStatus.normalize(n);
-                }
-
-            } finally {
-                readerCleanup();        // Clear reader thread
-                // The end method, which is defined in our superclass
-                // AbstractInterruptibleChannel, resets the interruption
-                // machinery.  If its argument is true then it returns
-                // normally; otherwise it checks the interrupt and open state
-                // of this channel and throws an appropriate exception if
-                // necessary.
-                //
-                // So, if we actually managed to do any I/O in the above try
-                // block then we pass true to the end method.  We also pass
-                // true if the channel was in non-blocking mode when the I/O
-                // operation was initiated but no data could be transferred;
-                // this prevents spurious exceptions from being thrown in the
-                // rare event that a channel is closed or a thread is
-                // interrupted at the exact moment that a non-blocking I/O
-                // request is made.
-                //
-                end(n &gt; 0 || (n == IOStatus.UNAVAILABLE));
-
-                // Extra case for socket channels: Asynchronous shutdown
-                //
-                synchronized (stateLock) {
-                    if ((n &lt;= 0) &amp;&amp; (!isInputOpen))
-                        return IOStatus.EOF;
-                }
-
-                assert IOStatus.check(n);
-
-            }
-        }
-    }
-
-    public long read(ByteBuffer[] dsts, int offset, int length)
-        throws IOException
-    {
-        if ((offset &lt; 0) || (length &lt; 0) || (offset &gt; dsts.length - length))
-            throw new IndexOutOfBoundsException();
-        synchronized (readLock) {
-            if (!ensureReadOpen())
-                return -1;
-            long n = 0;
-            try {
-                begin();
-                synchronized (stateLock) {
-                    if (!isOpen())
-                        return 0;
-                    readerThread = NativeThread.current();
-                }
-
-                for (;;) {
-                    n = IOUtil.read(fd, dsts, offset, length, nd);
-                    if ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen())
-                        continue;
-                    return IOStatus.normalize(n);
-                }
-            } finally {
-                readerCleanup();
-                end(n &gt; 0 || (n == IOStatus.UNAVAILABLE));
-                synchronized (stateLock) {
-                    if ((n &lt;= 0) &amp;&amp; (!isInputOpen))
-                        return IOStatus.EOF;
-                }
-                assert IOStatus.check(n);
-            }
-        }
-    }
-
-    public int write(ByteBuffer buf) throws IOException {
-        if (buf == null)
-            throw new NullPointerException();
-        synchronized (writeLock) {
-            ensureWriteOpen();
-            int n = 0;
-            try {
-                begin();
-                synchronized (stateLock) {
-                    if (!isOpen())
-                        return 0;
-                    writerThread = NativeThread.current();
-                }
-                for (;;) {
-                    n = IOUtil.write(fd, buf, -1, nd);
-                    if ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen())
-                        continue;
-                    return IOStatus.normalize(n);
-                }
-            } finally {
-                writerCleanup();
-                end(n &gt; 0 || (n == IOStatus.UNAVAILABLE));
-                synchronized (stateLock) {
-                    if ((n &lt;= 0) &amp;&amp; (!isOutputOpen))
-                        throw new AsynchronousCloseException();
-                }
-                assert IOStatus.check(n);
-            }
-        }
-    }
-
-    public long write(ByteBuffer[] srcs, int offset, int length)
-        throws IOException
-    {
-        if ((offset &lt; 0) || (length &lt; 0) || (offset &gt; srcs.length - length))
-            throw new IndexOutOfBoundsException();
-        synchronized (writeLock) {
-            ensureWriteOpen();
-            long n = 0;
-            try {
-                begin();
-                synchronized (stateLock) {
-                    if (!isOpen())
-                        return 0;
-                    writerThread = NativeThread.current();
-                }
-                for (;;) {
-                    n = IOUtil.write(fd, srcs, offset, length, nd);
-                    if ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen())
-                        continue;
-                    return IOStatus.normalize(n);
-                }
-            } finally {
-                writerCleanup();
-                end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));
-                synchronized (stateLock) {
-                    if ((n &lt;= 0) &amp;&amp; (!isOutputOpen))
-                        throw new AsynchronousCloseException();
-                }
-                assert IOStatus.check(n);
-            }
-        }
-    }
-
-    // package-private
-    int sendOutOfBandData(byte b) throws IOException {
-        synchronized (writeLock) {
-            ensureWriteOpen();
-            int n = 0;
-            try {
-                begin();
-                synchronized (stateLock) {
-                    if (!isOpen())
-                        return 0;
-                    writerThread = NativeThread.current();
-                }
-                for (;;) {
-                    n = sendOutOfBandData(fd, b);
-                    if ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen())
-                        continue;
-                    return IOStatus.normalize(n);
-                }
-            } finally {
-                writerCleanup();
-                end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));
-                synchronized (stateLock) {
-                    if ((n &lt;= 0) &amp;&amp; (!isOutputOpen))
-                        throw new AsynchronousCloseException();
-                }
-                assert IOStatus.check(n);
-            }
-        }
-    }
-
-    protected void implConfigureBlocking(boolean block) throws IOException {
-        IOUtil.configureBlocking(fd, block);
-    }
-
-    public InetSocketAddress localAddress() {
-        synchronized (stateLock) {
-            return localAddress;
-        }
-    }
-
-    public SocketAddress remoteAddress() {
-        synchronized (stateLock) {
-            return remoteAddress;
-        }
-    }
-
-    @Override
-    public SocketChannel bind(SocketAddress local) throws IOException {
-        synchronized (readLock) {
-            synchronized (writeLock) {
-                synchronized (stateLock) {
-                    if (!isOpen())
-                        throw new ClosedChannelException();
-                    if (state == ST_PENDING)
-                        throw new ConnectionPendingException();
-                    if (localAddress != null)
-                        throw new AlreadyBoundException();
-                    InetSocketAddress isa = (local == null) ?
-                        new InetSocketAddress(0) : Net.checkAddress(local);
-                    SecurityManager sm = System.getSecurityManager();
-                    if (sm != null) {
-                        sm.checkListen(isa.getPort());
-                    }
-                    NetHooks.beforeTcpBind(fd, isa.getAddress(), isa.getPort());
-                    Net.bind(fd, isa.getAddress(), isa.getPort());
-                    localAddress = Net.localAddress(fd);
-                }
-            }
-        }
-        return this;
-    }
-
-    public boolean isConnected() {
-        synchronized (stateLock) {
-            return (state == ST_CONNECTED);
-        }
-    }
-
-    public boolean isConnectionPending() {
-        synchronized (stateLock) {
-            return (state == ST_PENDING);
-        }
-    }
-
-    void ensureOpenAndUnconnected() throws IOException { // package-private
-        synchronized (stateLock) {
-            if (!isOpen())
-                throw new ClosedChannelException();
-            if (state == ST_CONNECTED)
-                throw new AlreadyConnectedException();
-            if (state == ST_PENDING)
-                throw new ConnectionPendingException();
-        }
-    }
-
-    public boolean connect(SocketAddress sa) throws IOException {
-        int localPort = 0;
-
-        synchronized (readLock) {
-            synchronized (writeLock) {
-                ensureOpenAndUnconnected();
-                InetSocketAddress isa = Net.checkAddress(sa);
-                SecurityManager sm = System.getSecurityManager();
-                if (sm != null)
-                    sm.checkConnect(isa.getAddress().getHostAddress(),
-                                    isa.getPort());
-                synchronized (blockingLock()) {
-                    int n = 0;
-                    try {
-                        try {
-                            begin();
-                            synchronized (stateLock) {
-                                if (!isOpen()) {
-                                    return false;
-                                }
-                                // notify hook only if unbound
-                                if (localAddress == null) {
-                                    NetHooks.beforeTcpConnect(fd,
-                                                           isa.getAddress(),
-                                                           isa.getPort());
-                                }
-                                readerThread = NativeThread.current();
-                            }
-                            for (;;) {
-                                InetAddress ia = isa.getAddress();
-                                if (ia.isAnyLocalAddress())
-                                    ia = InetAddress.getLocalHost();
-                                n = Net.connect(fd,
-                                                ia,
-                                                isa.getPort());
-                                if (  (n == IOStatus.INTERRUPTED)
-                                      &amp;&amp; isOpen())
-                                    continue;
-                                break;
-                            }
-
-                        } finally {
-                            readerCleanup();
-                            end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));
-                            assert IOStatus.check(n);
-                        }
-                    } catch (IOException x) {
-                        // If an exception was thrown, close the channel after
-                        // invoking end() so as to avoid bogus
-                        // AsynchronousCloseExceptions
-                        close();
-                        throw x;
-                    }
-                    synchronized (stateLock) {
-                        remoteAddress = isa;
-                        if (n &gt; 0) {
-
-                            // Connection succeeded; disallow further
-                            // invocation
-                            state = ST_CONNECTED;
-                            if (isOpen())
-                                localAddress = Net.localAddress(fd);
-                            return true;
-                        }
-                        // If nonblocking and no exception then connection
-                        // pending; disallow another invocation
-                        if (!isBlocking())
-                            state = ST_PENDING;
-                        else
-                            assert false;
-                    }
-                }
-                return false;
-            }
-        }
-    }
-
-    public boolean finishConnect() throws IOException {
-        synchronized (readLock) {
-            synchronized (writeLock) {
-                synchronized (stateLock) {
-                    if (!isOpen())
-                        throw new ClosedChannelException();
-                    if (state == ST_CONNECTED)
-                        return true;
-                    if (state != ST_PENDING)
-                        throw new NoConnectionPendingException();
-                }
-                int n = 0;
-                try {
-                    try {
-                        begin();
-                        synchronized (blockingLock()) {
-                            synchronized (stateLock) {
-                                if (!isOpen()) {
-                                    return false;
-                                }
-                                readerThread = NativeThread.current();
-                            }
-                            if (!isBlocking()) {
-                                for (;;) {
-                                    n = checkConnect(fd, false,
-                                                     readyToConnect);
-                                    if (  (n == IOStatus.INTERRUPTED)
-                                          &amp;&amp; isOpen())
-                                        continue;
-                                    break;
-                                }
-                            } else {
-                                for (;;) {
-                                    n = checkConnect(fd, true,
-                                                     readyToConnect);
-                                    if (n == 0) {
-                                        // Loop in case of
-                                        // spurious notifications
-                                        continue;
-                                    }
-                                    if (  (n == IOStatus.INTERRUPTED)
-                                          &amp;&amp; isOpen())
-                                        continue;
-                                    break;
-                                }
-                            }
-                        }
-                    } finally {
-                        synchronized (stateLock) {
-                            readerThread = 0;
-                            if (state == ST_KILLPENDING) {
-                                kill();
-                                // poll()/getsockopt() does not report
-                                // error (throws exception, with n = 0)
-                                // on Linux platform after dup2 and
-                                // signal-wakeup. Force n to 0 so the
-                                // end() can throw appropriate exception
-                                n = 0;
-                            }
-                        }
-                        end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));
-                        assert IOStatus.check(n);
-                    }
-                } catch (IOException x) {
-                    // If an exception was thrown, close the channel after
-                    // invoking end() so as to avoid bogus
-                    // AsynchronousCloseExceptions
-                    close();
-                    throw x;
-                }
-                if (n &gt; 0) {
-                    synchronized (stateLock) {
-                        state = ST_CONNECTED;
-                        if (isOpen())
-                            localAddress = Net.localAddress(fd);
-                    }
-                    return true;
-                }
-                return false;
-            }
-        }
-    }
-
-    @Override
-    public SocketChannel shutdownInput() throws IOException {
-        synchronized (stateLock) {
-            if (!isOpen())
-                throw new ClosedChannelException();
-            if (!isConnected())
-                throw new NotYetConnectedException();
-            if (isInputOpen) {
-                Net.shutdown(fd, Net.SHUT_RD);
-                if (readerThread != 0)
-                    NativeThread.signal(readerThread);
-                isInputOpen = false;
-            }
-            return this;
-        }
-    }
-
-    @Override
-    public SocketChannel shutdownOutput() throws IOException {
-        synchronized (stateLock) {
-            if (!isOpen())
-                throw new ClosedChannelException();
-            if (!isConnected())
-                throw new NotYetConnectedException();
-            if (isOutputOpen) {
-                Net.shutdown(fd, Net.SHUT_WR);
-                if (writerThread != 0)
-                    NativeThread.signal(writerThread);
-                isOutputOpen = false;
-            }
-            return this;
-        }
-    }
-
-    public boolean isInputOpen() {
-        synchronized (stateLock) {
-            return isInputOpen;
-        }
-    }
-
-    public boolean isOutputOpen() {
-        synchronized (stateLock) {
-            return isOutputOpen;
-        }
-    }
-
-    // AbstractInterruptibleChannel synchronizes invocations of this method
-    // using AbstractInterruptibleChannel.closeLock, and also ensures that this
-    // method is only ever invoked once.  Before we get to this method, isOpen
-    // (which is volatile) will have been set to false.
-    //
-    protected void implCloseSelectableChannel() throws IOException {
-        synchronized (stateLock) {
-            isInputOpen = false;
-            isOutputOpen = false;
-
-            // Close the underlying file descriptor and dup it to a known fd
-            // that's already closed.  This prevents other operations on this
-            // channel from using the old fd, which might be recycled in the
-            // meantime and allocated to an entirely different channel.
-            //
-            if (state != ST_KILLED)
-                nd.preClose(fd);
-
-            // Signal native threads, if needed.  If a target thread is not
-            // currently blocked in an I/O operation then no harm is done since
-            // the signal handler doesn't actually do anything.
-            //
-            if (readerThread != 0)
-                NativeThread.signal(readerThread);
-
-            if (writerThread != 0)
-                NativeThread.signal(writerThread);
-
-            // If this channel is not registered then it's safe to close the fd
-            // immediately since we know at this point that no thread is
-            // blocked in an I/O operation upon the channel and, since the
-            // channel is marked closed, no thread will start another such
-            // operation.  If this channel is registered then we don't close
-            // the fd since it might be in use by a selector.  In that case
-            // closing this channel caused its keys to be cancelled, so the
-            // last selector to deregister a key for this channel will invoke
-            // kill() to close the fd.
-            //
-            if (!isRegistered())
-                kill();
-        }
-    }
-
-    public void kill() throws IOException {
-        synchronized (stateLock) {
-            if (state == ST_KILLED)
-                return;
-            if (state == ST_UNINITIALIZED) {
-                state = ST_KILLED;
-                return;
-            }
-            assert !isOpen() &amp;&amp; !isRegistered();
-
-            // Postpone the kill if there is a waiting reader
-            // or writer thread. See the comments in read() for
-            // more detailed explanation.
-            if (readerThread == 0 &amp;&amp; writerThread == 0) {
-                nd.close(fd);
-                state = ST_KILLED;
-            } else {
-                state = ST_KILLPENDING;
-            }
-        }
-    }
-
-    /**
-     * Translates native poll revent ops into a ready operation ops
-     */
-    public boolean translateReadyOps(int ops, int initialOps,
-                                     SelectionKeyImpl sk) {
-        int intOps = sk.nioInterestOps(); // Do this just once, it synchronizes
-        int oldOps = sk.nioReadyOps();
-        int newOps = initialOps;
-
-        if ((ops &amp; PollArrayWrapper.POLLNVAL) != 0) {
-            // This should only happen if this channel is pre-closed while a
-            // selection operation is in progress
-            // ## Throw an error if this channel has not been pre-closed
-            return false;
-        }
-
-        if ((ops &amp; (PollArrayWrapper.POLLERR
-                    | PollArrayWrapper.POLLHUP)) != 0) {
-            newOps = intOps;
-            sk.nioReadyOps(newOps);
-            // No need to poll again in checkConnect,
-            // the error will be detected there
-            readyToConnect = true;
-            return (newOps &amp; ~oldOps) != 0;
-        }
-
-        if (((ops &amp; PollArrayWrapper.POLLIN) != 0) &amp;&amp;
-            ((intOps &amp; SelectionKey.OP_READ) != 0) &amp;&amp;
-            (state == ST_CONNECTED))
-            newOps |= SelectionKey.OP_READ;
-
-        if (((ops &amp; PollArrayWrapper.POLLCONN) != 0) &amp;&amp;
-            ((intOps &amp; SelectionKey.OP_CONNECT) != 0) &amp;&amp;
-            ((state == ST_UNCONNECTED) || (state == ST_PENDING))) {
-            newOps |= SelectionKey.OP_CONNECT;
-            readyToConnect = true;
-        }
-
-        if (((ops &amp; PollArrayWrapper.POLLOUT) != 0) &amp;&amp;
-            ((intOps &amp; SelectionKey.OP_WRITE) != 0) &amp;&amp;
-            (state == ST_CONNECTED))
-            newOps |= SelectionKey.OP_WRITE;
-
-        sk.nioReadyOps(newOps);
-        return (newOps &amp; ~oldOps) != 0;
-    }
-
-    public boolean translateAndUpdateReadyOps(int ops, SelectionKeyImpl sk) {
-        return translateReadyOps(ops, sk.nioReadyOps(), sk);
-    }
-
-    public boolean translateAndSetReadyOps(int ops, SelectionKeyImpl sk) {
-        return translateReadyOps(ops, 0, sk);
-    }
-
-    // package-private
-    int poll(int events, long timeout) throws IOException {
-        assert Thread.holdsLock(blockingLock()) &amp;&amp; !isBlocking();
-
-        synchronized (readLock) {
-            int n = 0;
-            try {
-                begin();
-                synchronized (stateLock) {
-                    if (!isOpen())
-                        return 0;
-                    readerThread = NativeThread.current();
-                }
-                n = Net.poll(fd, events, timeout);
-            } finally {
-                readerCleanup();
-                end(n &gt; 0);
-            }
-            return n;
-        }
-    }
-
-    /**
-     * Translates an interest operation set into a native poll event set
-     */
-    public void translateAndSetInterestOps(int ops, SelectionKeyImpl sk) {
-        int newOps = 0;
-        if ((ops &amp; SelectionKey.OP_READ) != 0)
-            newOps |= PollArrayWrapper.POLLIN;
-        if ((ops &amp; SelectionKey.OP_WRITE) != 0)
-            newOps |= PollArrayWrapper.POLLOUT;
-        if ((ops &amp; SelectionKey.OP_CONNECT) != 0)
-            newOps |= PollArrayWrapper.POLLCONN;
-        sk.selector.putEventOps(sk, newOps);
-    }
-
-    public FileDescriptor getFD() {
-        return fd;
-    }
-
-    public int getFDVal() {
-        return fdVal;
-    }
-
-    @Override
-    public String toString() {
-        StringBuffer sb = new StringBuffer();
-        sb.append(this.getClass().getSuperclass().getName());
-        sb.append('[');
-        if (!isOpen())
-            sb.append(&quot;closed&quot;);
-        else {
-            synchronized (stateLock) {
-                switch (state) {
-                case ST_UNCONNECTED:
-                    sb.append(&quot;unconnected&quot;);
-                    break;
-                case ST_PENDING:
-                    sb.append(&quot;connection-pending&quot;);
-                    break;
-                case ST_CONNECTED:
-                    sb.append(&quot;connected&quot;);
-                    if (!isInputOpen)
-                        sb.append(&quot; ishut&quot;);
-                    if (!isOutputOpen)
-                        sb.append(&quot; oshut&quot;);
-                    break;
-                }
-                InetSocketAddress addr = localAddress();
-                if (addr != null) {
-                    sb.append(&quot; local=&quot;);
-                    sb.append(Net.getRevealedLocalAddressAsString(addr));
-                }
-                if (remoteAddress() != null) {
-                    sb.append(&quot; remote=&quot;);
-                    sb.append(remoteAddress().toString());
-                }
-            }
-        }
-        sb.append(']');
-        return sb.toString();
-    }
-
-
-    // -- Native methods --
-
-    private static native int checkConnect(FileDescriptor fd,
-                                           boolean block, boolean ready)
-        throws IOException;
-
-    private static native int sendOutOfBandData(FileDescriptor fd, byte data)
-        throws IOException;
-
-    static {
-        IOUtil.load();
-        nd = new SocketDispatcher();
-    }
-
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package sun.nio.ch;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.io.FileDescriptor;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.io.IOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.net.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.nio.ByteBuffer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.nio.channels.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.nio.channels.spi.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.util.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import sun.net.NetHooks;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre> * An implementation of SocketChannels</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>class SocketChannelImpl</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>    extends SocketChannel</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre>    implements SelChImpl</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre>{</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre>    // Used to make native read and write calls</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre>    private static NativeDispatcher nd;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre>    // Our file descriptor object</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>    private final FileDescriptor fd;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre>    // fd value needed for dev/poll. This value will remain valid</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre>    // even after the value in the file descriptor object has been set to -1</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>    private final int fdVal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>    // IDs of native threads doing reads and writes, for signalling</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>    private volatile long readerThread = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre>    private volatile long writerThread = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>    // Lock held by current reading or connecting thread</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre>    private final Object readLock = new Object();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>    // Lock held by current writing or connecting thread</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>    private final Object writeLock = new Object();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>    // Lock held by any thread that modifies the state fields declared below</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>    // DO NOT invoke a blocking I/O operation while holding this lock!</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>    private final Object stateLock = new Object();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>    // -- The following fields are protected by stateLock</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>    // set true when exclusive binding is on and SO_REUSEADDR is emulated</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>    private boolean isReuseAddress;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>    // State, increases monotonically</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>    private static final int ST_UNINITIALIZED = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>    private static final int ST_UNCONNECTED = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>    private static final int ST_PENDING = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>    private static final int ST_CONNECTED = 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>    private static final int ST_KILLPENDING = 3;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>    private static final int ST_KILLED = 4;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>    private int state = ST_UNINITIALIZED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>    // Binding</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>    private InetSocketAddress localAddress;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>    private InetSocketAddress remoteAddress;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>    // Input/Output open</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>    private boolean isInputOpen = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>    private boolean isOutputOpen = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>    private boolean readyToConnect = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>    // Socket adaptor, created on demand</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>    private Socket socket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>    // -- End of fields protected by stateLock</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>    // Constructor for normal connecting sockets</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>    SocketChannelImpl(SelectorProvider sp) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>        super(sp);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>        this.fd = Net.socket(true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>        this.fdVal = IOUtil.fdVal(fd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>        this.state = ST_UNCONNECTED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>    SocketChannelImpl(SelectorProvider sp,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>                      FileDescriptor fd,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>                      boolean bound)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>        throws IOException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>        super(sp);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>        this.fd = fd;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>        this.fdVal = IOUtil.fdVal(fd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>        this.state = ST_UNCONNECTED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>        if (bound)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>            this.localAddress = Net.localAddress(fd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>    // Constructor for sockets obtained from server sockets</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>    SocketChannelImpl(SelectorProvider sp,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>                      FileDescriptor fd, InetSocketAddress remote)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>        throws IOException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>        super(sp);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>        this.fd = fd;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>        this.fdVal = IOUtil.fdVal(fd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>        this.state = ST_CONNECTED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>        this.localAddress = Net.localAddress(fd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>        this.remoteAddress = remote;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>    public Socket socket() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>            if (socket == null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>                socket = SocketAdaptor.create(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>            return socket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>    public SocketAddress getLocalAddress() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>            if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>                throw new ClosedChannelException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>            return  Net.getRevealedLocalAddress(localAddress);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>    public SocketAddress getRemoteAddress() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>            if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>                throw new ClosedChannelException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>            return remoteAddress;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>    public &lt;T&gt; SocketChannel setOption(SocketOption&lt;T&gt; name, T value)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>        throws IOException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>        if (name == null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>            throw new NullPointerException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>        if (!supportedOptions().contains(name))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>            throw new UnsupportedOperationException(&quot;'&quot; + name + &quot;' not supported&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>            if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>                throw new ClosedChannelException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>            // special handling for IP_TOS: no-op when IPv6</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>            if (name == StandardSocketOptions.IP_TOS) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>                if (!Net.isIPv6Available())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>                    Net.setSocketOption(fd, StandardProtocolFamily.INET, name, value);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>                return this;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>            } else if (name == StandardSocketOptions.SO_REUSEADDR &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>                           Net.useExclusiveBind())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>            {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>                // SO_REUSEADDR emulated when using exclusive bind</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>                isReuseAddress = (Boolean)value;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>                return this;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>            // no options that require special handling</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>            Net.setSocketOption(fd, Net.UNSPEC, name, value);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>            return this;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>    @SuppressWarnings(&quot;unchecked&quot;)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>    public &lt;T&gt; T getOption(SocketOption&lt;T&gt; name)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>        throws IOException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>        if (name == null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>            throw new NullPointerException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>        if (!supportedOptions().contains(name))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>            throw new UnsupportedOperationException(&quot;'&quot; + name + &quot;' not supported&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>            if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>                throw new ClosedChannelException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>            if (name == StandardSocketOptions.SO_REUSEADDR &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>                    Net.useExclusiveBind())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>            {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>                // SO_REUSEADDR emulated when using exclusive bind</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>                return (T)Boolean.valueOf(isReuseAddress);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>            // special handling for IP_TOS: always return 0 when IPv6</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>            if (name == StandardSocketOptions.IP_TOS) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>                return (Net.isIPv6Available()) ? (T) Integer.valueOf(0) :</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>                    (T) Net.getSocketOption(fd, StandardProtocolFamily.INET, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>            // no options that require special handling</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>            return (T) Net.getSocketOption(fd, Net.UNSPEC, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>    private static class DefaultOptionsHolder {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>        static final Set&lt;SocketOption&lt;?&gt;&gt; defaultOptions = defaultOptions();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>        private static Set&lt;SocketOption&lt;?&gt;&gt; defaultOptions() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>            HashSet&lt;SocketOption&lt;?&gt;&gt; set = new HashSet&lt;SocketOption&lt;?&gt;&gt;(8);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>            set.add(StandardSocketOptions.SO_SNDBUF);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>            set.add(StandardSocketOptions.SO_RCVBUF);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>            set.add(StandardSocketOptions.SO_KEEPALIVE);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>            set.add(StandardSocketOptions.SO_REUSEADDR);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>            set.add(StandardSocketOptions.SO_LINGER);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>            set.add(StandardSocketOptions.TCP_NODELAY);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>            // additional options required by socket adaptor</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>            set.add(StandardSocketOptions.IP_TOS);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>            set.add(ExtendedSocketOption.SO_OOBINLINE);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>            return Collections.unmodifiableSet(set);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>    public final Set&lt;SocketOption&lt;?&gt;&gt; supportedOptions() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>        return DefaultOptionsHolder.defaultOptions;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>    private boolean ensureReadOpen() throws ClosedChannelException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>            if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>                throw new ClosedChannelException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>            if (!isConnected())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>                throw new NotYetConnectedException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>            if (!isInputOpen)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>                return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>            else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>                return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>    private void ensureWriteOpen() throws ClosedChannelException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>            if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>                throw new ClosedChannelException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>            if (!isOutputOpen)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>                throw new ClosedChannelException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>            if (!isConnected())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>                throw new NotYetConnectedException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>    private void readerCleanup() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>            readerThread = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>            if (state == ST_KILLPENDING)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>                kill();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>    private void writerCleanup() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>            writerThread = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>            if (state == ST_KILLPENDING)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>                kill();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>    public int read(ByteBuffer buf) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>        if (buf == null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>            throw new NullPointerException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>        synchronized (readLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>            if (!ensureReadOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>                return -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>            int n = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>                // Set up the interruption machinery; see</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>                // AbstractInterruptibleChannel for details</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>                //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>                begin();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>                synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>                    if (!isOpen()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>                    // Either the current thread is already interrupted, so</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>                    // begin() closed the channel, or another thread closed the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>                    // channel since we checked it a few bytecodes ago.  In</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>                    // either case the value returned here is irrelevant since</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>                    // the invocation of end() in the finally block will throw</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>                    // an appropriate exception.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>                    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>                        return 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>                    // Save this thread so that it can be signalled on those</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>                    // platforms that require it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>                    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>                    readerThread = NativeThread.current();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>                // Between the previous test of isOpen() and the return of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>                // IOUtil.read invocation below, this channel might be closed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>                // or this thread might be interrupted.  We rely upon the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>                // implicit synchronization point in the kernel read() call to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>                // make sure that the right thing happens.  In either case the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>                // implCloseSelectableChannel method is ultimately invoked in</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>                // some other thread, so there are three possibilities:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>                //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>                //   - implCloseSelectableChannel() invokes nd.preClose()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>                //     before this thread invokes read(), in which case the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>                //     read returns immediately with either EOF or an error,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>                //     the latter of which will cause an IOException to be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>                //     thrown.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>                //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>                //   - implCloseSelectableChannel() invokes nd.preClose() after</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>                //     this thread is blocked in read().  On some operating</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>                //     systems (e.g., Solaris and Windows) this causes the read</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>                //     to return immediately with either EOF or an error</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>                //     indication.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>                //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>                //   - implCloseSelectableChannel() invokes nd.preClose() after</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>                //     this thread is blocked in read() but the operating</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>                //     system (e.g., Linux) doesn't support preemptive close,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>                //     so implCloseSelectableChannel() proceeds to signal this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>                //     thread, thereby causing the read to return immediately</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>                //     with IOStatus.INTERRUPTED.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>                //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>                // In all three cases the invocation of end() in the finally</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>                // clause will notice that the channel has been closed and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>                // throw an appropriate exception (AsynchronousCloseException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>                // or ClosedByInterruptException) if necessary.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>                //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>                // *There is A fourth possibility. implCloseSelectableChannel()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>                // invokes nd.preClose(), signals reader/writer thred and quickly</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>                // moves on to nd.close() in kill(), which does a real close.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>                // Then a third thread accepts a new connection, opens file or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>                // whatever that causes the released &quot;fd&quot; to be recycled. All</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>                // above happens just between our last isOpen() check and the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>                // next kernel read reached, with the recycled &quot;fd&quot;. The solution</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>                // is to postpone the real kill() if there is a reader or/and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>                // writer thread(s) over there &quot;waiting&quot;, leave the cleanup/kill</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>                // to the reader or writer thread. (the preClose() still happens</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>                // so the connection gets cut off as usual).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>                //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>                // For socket channels there is the additional wrinkle that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>                // asynchronous shutdown works much like asynchronous close,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>                // except that the channel is shutdown rather than completely</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>                // closed.  This is analogous to the first two cases above,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>                // except that the shutdown operation plays the role of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>                // nd.preClose().</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>                for (;;) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>                    n = IOUtil.read(fd, buf, -1, nd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>                    if ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>                        // The system call was interrupted but the channel</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>                        // is still open, so retry</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>                        continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>                    return IOStatus.normalize(n);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>            } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>                readerCleanup();        // Clear reader thread</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>                // The end method, which is defined in our superclass</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>                // AbstractInterruptibleChannel, resets the interruption</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>                // machinery.  If its argument is true then it returns</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>                // normally; otherwise it checks the interrupt and open state</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>                // of this channel and throws an appropriate exception if</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>                // necessary.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>                //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>                // So, if we actually managed to do any I/O in the above try</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>                // block then we pass true to the end method.  We also pass</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>                // true if the channel was in non-blocking mode when the I/O</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>                // operation was initiated but no data could be transferred;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>                // this prevents spurious exceptions from being thrown in the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>                // rare event that a channel is closed or a thread is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>                // interrupted at the exact moment that a non-blocking I/O</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>                // request is made.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>                //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>                end(n &gt; 0 || (n == IOStatus.UNAVAILABLE));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>                // Extra case for socket channels: Asynchronous shutdown</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>                //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>                synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>                    if ((n &lt;= 0) &amp;&amp; (!isInputOpen))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>                        return IOStatus.EOF;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>                assert IOStatus.check(n);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>    public long read(ByteBuffer[] dsts, int offset, int length)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>        throws IOException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>        if ((offset &lt; 0) || (length &lt; 0) || (offset &gt; dsts.length - length))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>            throw new IndexOutOfBoundsException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>        synchronized (readLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>            if (!ensureReadOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>                return -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>            long n = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>                begin();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>                synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>                    if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>                        return 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>                    readerThread = NativeThread.current();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>                for (;;) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>                    n = IOUtil.read(fd, dsts, offset, length, nd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>                    if ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>                        continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>                    return IOStatus.normalize(n);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>            } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>                readerCleanup();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>                end(n &gt; 0 || (n == IOStatus.UNAVAILABLE));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>                synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>                    if ((n &lt;= 0) &amp;&amp; (!isInputOpen))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>                        return IOStatus.EOF;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>                assert IOStatus.check(n);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>    public int write(ByteBuffer buf) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>        if (buf == null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>            throw new NullPointerException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>        synchronized (writeLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>            ensureWriteOpen();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>            int n = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>                begin();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>                synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>                    if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>                        return 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>                    writerThread = NativeThread.current();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>                for (;;) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>                    n = IOUtil.write(fd, buf, -1, nd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>                    if ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>                        continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>                    return IOStatus.normalize(n);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>            } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>                writerCleanup();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>                end(n &gt; 0 || (n == IOStatus.UNAVAILABLE));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>                synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>                    if ((n &lt;= 0) &amp;&amp; (!isOutputOpen))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>                        throw new AsynchronousCloseException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>                assert IOStatus.check(n);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>    public long write(ByteBuffer[] srcs, int offset, int length)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>        throws IOException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>        if ((offset &lt; 0) || (length &lt; 0) || (offset &gt; srcs.length - length))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>            throw new IndexOutOfBoundsException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>        synchronized (writeLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>            ensureWriteOpen();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>            long n = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>                begin();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>                synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>                    if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>                        return 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>                    writerThread = NativeThread.current();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>                for (;;) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>                    n = IOUtil.write(fd, srcs, offset, length, nd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>                    if ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>                        continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>                    return IOStatus.normalize(n);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre>            } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>                writerCleanup();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>                end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>                synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>                    if ((n &lt;= 0) &amp;&amp; (!isOutputOpen))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>                        throw new AsynchronousCloseException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>                assert IOStatus.check(n);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre>    // package-private</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>    int sendOutOfBandData(byte b) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>        synchronized (writeLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>            ensureWriteOpen();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>            int n = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>                begin();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>                synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>                    if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>                        return 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>                    writerThread = NativeThread.current();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>                for (;;) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>                    n = sendOutOfBandData(fd, b);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>                    if ((n == IOStatus.INTERRUPTED) &amp;&amp; isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>                        continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>                    return IOStatus.normalize(n);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>            } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>                writerCleanup();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>                end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>                synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>                    if ((n &lt;= 0) &amp;&amp; (!isOutputOpen))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>                        throw new AsynchronousCloseException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>                assert IOStatus.check(n);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>    protected void implConfigureBlocking(boolean block) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>        IOUtil.configureBlocking(fd, block);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>    public InetSocketAddress localAddress() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>            return localAddress;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>    public SocketAddress remoteAddress() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>            return remoteAddress;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>    public SocketChannel bind(SocketAddress local) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre>        synchronized (readLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>            synchronized (writeLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre>                synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>                    if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>                        throw new ClosedChannelException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>                    if (state == ST_PENDING)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>                        throw new ConnectionPendingException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre>                    if (localAddress != null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>                        throw new AlreadyBoundException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre>                    InetSocketAddress isa = (local == null) ?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>                        new InetSocketAddress(0) : Net.checkAddress(local);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>                    SecurityManager sm = System.getSecurityManager();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>                    if (sm != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>                        sm.checkListen(isa.getPort());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>                    NetHooks.beforeTcpBind(fd, isa.getAddress(), isa.getPort());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>                    Net.bind(fd, isa.getAddress(), isa.getPort());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>                    localAddress = Net.localAddress(fd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>        return this;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>    public boolean isConnected() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre>            return (state == ST_CONNECTED);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>    public boolean isConnectionPending() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>            return (state == ST_PENDING);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>    void ensureOpenAndUnconnected() throws IOException { // package-private</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>            if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>                throw new ClosedChannelException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>            if (state == ST_CONNECTED)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>                throw new AlreadyConnectedException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre>            if (state == ST_PENDING)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>                throw new ConnectionPendingException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>    public boolean connect(SocketAddress sa) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>        int localPort = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>        synchronized (readLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>            synchronized (writeLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>                ensureOpenAndUnconnected();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>                InetSocketAddress isa = Net.checkAddress(sa);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>                SecurityManager sm = System.getSecurityManager();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>                if (sm != null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>                    sm.checkConnect(isa.getAddress().getHostAddress(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>                                    isa.getPort());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre>                synchronized (blockingLock()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>                    int n = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre>                    try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre>                        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>                            begin();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>                            synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>                                if (!isOpen()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre>                                    return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>                                // notify hook only if unbound</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre>                                if (localAddress == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>                                    NetHooks.beforeTcpConnect(fd,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre>                                                           isa.getAddress(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>                                                           isa.getPort());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre>                                readerThread = NativeThread.current();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>                            for (;;) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre>                                InetAddress ia = isa.getAddress();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>                                if (ia.isAnyLocalAddress())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>                                    ia = InetAddress.getLocalHost();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>                                n = Net.connect(fd,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>                                                ia,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>                                                isa.getPort());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre>                                if (  (n == IOStatus.INTERRUPTED)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>                                      &amp;&amp; isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>                                    continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>                                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>                        } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>                            readerCleanup();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>                            end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre>                            assert IOStatus.check(n);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre>                    } catch (IOException x) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>                        // If an exception was thrown, close the channel after</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre>                        // invoking end() so as to avoid bogus</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>                        // AsynchronousCloseExceptions</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>                        close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>                        throw x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>                    synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre>                        remoteAddress = isa;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>                        if (n &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>                            // Connection succeeded; disallow further</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre>                            // invocation</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>                            state = ST_CONNECTED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>                            if (isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre>                                localAddress = Net.localAddress(fd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>                            return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>                        // If nonblocking and no exception then connection</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>                        // pending; disallow another invocation</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre>                        if (!isBlocking())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre>                            state = ST_PENDING;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre>                        else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>                            assert false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre>                return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre>    public boolean finishConnect() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>        synchronized (readLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre>            synchronized (writeLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre>                synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre>                    if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>                        throw new ClosedChannelException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre>                    if (state == ST_CONNECTED)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>                        return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre>                    if (state != ST_PENDING)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre>                        throw new NoConnectionPendingException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre>                int n = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre>                    try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre>                        begin();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>                        synchronized (blockingLock()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre>                            synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre>                                if (!isOpen()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>                                    return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre>                                readerThread = NativeThread.current();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>                            if (!isBlocking()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre>                                for (;;) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre>                                    n = checkConnect(fd, false,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>                                                     readyToConnect);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre>                                    if (  (n == IOStatus.INTERRUPTED)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre>                                          &amp;&amp; isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre>                                        continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre>                                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre>                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="719" href="#"></a></td>
+<td><pre>                            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="720" href="#"></a></td>
+<td><pre>                                for (;;) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="721" href="#"></a></td>
+<td><pre>                                    n = checkConnect(fd, true,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="722" href="#"></a></td>
+<td><pre>                                                     readyToConnect);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="723" href="#"></a></td>
+<td><pre>                                    if (n == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="724" href="#"></a></td>
+<td><pre>                                        // Loop in case of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="725" href="#"></a></td>
+<td><pre>                                        // spurious notifications</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="726" href="#"></a></td>
+<td><pre>                                        continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="727" href="#"></a></td>
+<td><pre>                                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="728" href="#"></a></td>
+<td><pre>                                    if (  (n == IOStatus.INTERRUPTED)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="729" href="#"></a></td>
+<td><pre>                                          &amp;&amp; isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="730" href="#"></a></td>
+<td><pre>                                        continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="731" href="#"></a></td>
+<td><pre>                                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="732" href="#"></a></td>
+<td><pre>                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="733" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="734" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="735" href="#"></a></td>
+<td><pre>                    } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="736" href="#"></a></td>
+<td><pre>                        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="737" href="#"></a></td>
+<td><pre>                            readerThread = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="738" href="#"></a></td>
+<td><pre>                            if (state == ST_KILLPENDING) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="739" href="#"></a></td>
+<td><pre>                                kill();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="740" href="#"></a></td>
+<td><pre>                                // poll()/getsockopt() does not report</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="741" href="#"></a></td>
+<td><pre>                                // error (throws exception, with n = 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="742" href="#"></a></td>
+<td><pre>                                // on Linux platform after dup2 and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="743" href="#"></a></td>
+<td><pre>                                // signal-wakeup. Force n to 0 so the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="744" href="#"></a></td>
+<td><pre>                                // end() can throw appropriate exception</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="745" href="#"></a></td>
+<td><pre>                                n = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="746" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="747" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="748" href="#"></a></td>
+<td><pre>                        end((n &gt; 0) || (n == IOStatus.UNAVAILABLE));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="749" href="#"></a></td>
+<td><pre>                        assert IOStatus.check(n);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="750" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="751" href="#"></a></td>
+<td><pre>                } catch (IOException x) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="752" href="#"></a></td>
+<td><pre>                    // If an exception was thrown, close the channel after</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="753" href="#"></a></td>
+<td><pre>                    // invoking end() so as to avoid bogus</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="754" href="#"></a></td>
+<td><pre>                    // AsynchronousCloseExceptions</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="755" href="#"></a></td>
+<td><pre>                    close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="756" href="#"></a></td>
+<td><pre>                    throw x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="757" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="758" href="#"></a></td>
+<td><pre>                if (n &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="759" href="#"></a></td>
+<td><pre>                    synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="760" href="#"></a></td>
+<td><pre>                        state = ST_CONNECTED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="761" href="#"></a></td>
+<td><pre>                        if (isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="762" href="#"></a></td>
+<td><pre>                            localAddress = Net.localAddress(fd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="763" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="764" href="#"></a></td>
+<td><pre>                    return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="765" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="766" href="#"></a></td>
+<td><pre>                return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="767" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="768" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="769" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="770" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="771" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="772" href="#"></a></td>
+<td><pre>    public SocketChannel shutdownInput() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="773" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="774" href="#"></a></td>
+<td><pre>            if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="775" href="#"></a></td>
+<td><pre>                throw new ClosedChannelException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="776" href="#"></a></td>
+<td><pre>            if (!isConnected())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="777" href="#"></a></td>
+<td><pre>                throw new NotYetConnectedException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="778" href="#"></a></td>
+<td><pre>            if (isInputOpen) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="779" href="#"></a></td>
+<td><pre>                Net.shutdown(fd, Net.SHUT_RD);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="780" href="#"></a></td>
+<td><pre>                if (readerThread != 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="781" href="#"></a></td>
+<td><pre>                    NativeThread.signal(readerThread);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="782" href="#"></a></td>
+<td><pre>                isInputOpen = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="783" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="784" href="#"></a></td>
+<td><pre>            return this;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="785" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="786" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="787" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="788" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="789" href="#"></a></td>
+<td><pre>    public SocketChannel shutdownOutput() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="790" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="791" href="#"></a></td>
+<td><pre>            if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="792" href="#"></a></td>
+<td><pre>                throw new ClosedChannelException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="793" href="#"></a></td>
+<td><pre>            if (!isConnected())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="794" href="#"></a></td>
+<td><pre>                throw new NotYetConnectedException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="795" href="#"></a></td>
+<td><pre>            if (isOutputOpen) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="796" href="#"></a></td>
+<td><pre>                Net.shutdown(fd, Net.SHUT_WR);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="797" href="#"></a></td>
+<td><pre>                if (writerThread != 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="798" href="#"></a></td>
+<td><pre>                    NativeThread.signal(writerThread);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="799" href="#"></a></td>
+<td><pre>                isOutputOpen = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="800" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="801" href="#"></a></td>
+<td><pre>            return this;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="802" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="803" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="804" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="805" href="#"></a></td>
+<td><pre>    public boolean isInputOpen() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="806" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="807" href="#"></a></td>
+<td><pre>            return isInputOpen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="808" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="809" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="810" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="811" href="#"></a></td>
+<td><pre>    public boolean isOutputOpen() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="812" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="813" href="#"></a></td>
+<td><pre>            return isOutputOpen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="814" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="815" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="816" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="817" href="#"></a></td>
+<td><pre>    // AbstractInterruptibleChannel synchronizes invocations of this method</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="818" href="#"></a></td>
+<td><pre>    // using AbstractInterruptibleChannel.closeLock, and also ensures that this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="819" href="#"></a></td>
+<td><pre>    // method is only ever invoked once.  Before we get to this method, isOpen</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="820" href="#"></a></td>
+<td><pre>    // (which is volatile) will have been set to false.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="821" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="822" href="#"></a></td>
+<td><pre>    protected void implCloseSelectableChannel() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="823" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="824" href="#"></a></td>
+<td><pre>            isInputOpen = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="825" href="#"></a></td>
+<td><pre>            isOutputOpen = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="826" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="827" href="#"></a></td>
+<td><pre>            // Close the underlying file descriptor and dup it to a known fd</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="828" href="#"></a></td>
+<td><pre>            // that's already closed.  This prevents other operations on this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="829" href="#"></a></td>
+<td><pre>            // channel from using the old fd, which might be recycled in the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="830" href="#"></a></td>
+<td><pre>            // meantime and allocated to an entirely different channel.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="831" href="#"></a></td>
+<td><pre>            //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="832" href="#"></a></td>
+<td><pre>            if (state != ST_KILLED)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="833" href="#"></a></td>
+<td><pre>                nd.preClose(fd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="834" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="835" href="#"></a></td>
+<td><pre>            // Signal native threads, if needed.  If a target thread is not</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="836" href="#"></a></td>
+<td><pre>            // currently blocked in an I/O operation then no harm is done since</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="837" href="#"></a></td>
+<td><pre>            // the signal handler doesn't actually do anything.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="838" href="#"></a></td>
+<td><pre>            //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="839" href="#"></a></td>
+<td><pre>            if (readerThread != 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="840" href="#"></a></td>
+<td><pre>                NativeThread.signal(readerThread);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="841" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="842" href="#"></a></td>
+<td><pre>            if (writerThread != 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="843" href="#"></a></td>
+<td><pre>                NativeThread.signal(writerThread);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="844" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="845" href="#"></a></td>
+<td><pre>            // If this channel is not registered then it's safe to close the fd</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="846" href="#"></a></td>
+<td><pre>            // immediately since we know at this point that no thread is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="847" href="#"></a></td>
+<td><pre>            // blocked in an I/O operation upon the channel and, since the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="848" href="#"></a></td>
+<td><pre>            // channel is marked closed, no thread will start another such</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="849" href="#"></a></td>
+<td><pre>            // operation.  If this channel is registered then we don't close</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="850" href="#"></a></td>
+<td><pre>            // the fd since it might be in use by a selector.  In that case</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="851" href="#"></a></td>
+<td><pre>            // closing this channel caused its keys to be cancelled, so the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="852" href="#"></a></td>
+<td><pre>            // last selector to deregister a key for this channel will invoke</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="853" href="#"></a></td>
+<td><pre>            // kill() to close the fd.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="854" href="#"></a></td>
+<td><pre>            //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="855" href="#"></a></td>
+<td><pre>            if (!isRegistered())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="856" href="#"></a></td>
+<td><pre>                kill();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="857" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="858" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="859" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="860" href="#"></a></td>
+<td><pre>    public void kill() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="861" href="#"></a></td>
+<td><pre>        synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="862" href="#"></a></td>
+<td><pre>            if (state == ST_KILLED)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="863" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="864" href="#"></a></td>
+<td><pre>            if (state == ST_UNINITIALIZED) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="865" href="#"></a></td>
+<td><pre>                state = ST_KILLED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="866" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="867" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="868" href="#"></a></td>
+<td><pre>            assert !isOpen() &amp;&amp; !isRegistered();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="869" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="870" href="#"></a></td>
+<td><pre>            // Postpone the kill if there is a waiting reader</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="871" href="#"></a></td>
+<td><pre>            // or writer thread. See the comments in read() for</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="872" href="#"></a></td>
+<td><pre>            // more detailed explanation.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="873" href="#"></a></td>
+<td><pre>            if (readerThread == 0 &amp;&amp; writerThread == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="874" href="#"></a></td>
+<td><pre>                nd.close(fd);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="875" href="#"></a></td>
+<td><pre>                state = ST_KILLED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="876" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="877" href="#"></a></td>
+<td><pre>                state = ST_KILLPENDING;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="878" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="879" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="880" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="881" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="882" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="883" href="#"></a></td>
+<td><pre>     * Translates native poll revent ops into a ready operation ops</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="884" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="885" href="#"></a></td>
+<td><pre>    public boolean translateReadyOps(int ops, int initialOps,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="886" href="#"></a></td>
+<td><pre>                                     SelectionKeyImpl sk) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="887" href="#"></a></td>
+<td><pre>        int intOps = sk.nioInterestOps(); // Do this just once, it synchronizes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="888" href="#"></a></td>
+<td><pre>        int oldOps = sk.nioReadyOps();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="889" href="#"></a></td>
+<td><pre>        int newOps = initialOps;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="890" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="891" href="#"></a></td>
+<td><pre>        if ((ops &amp; PollArrayWrapper.POLLNVAL) != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="892" href="#"></a></td>
+<td><pre>            // This should only happen if this channel is pre-closed while a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="893" href="#"></a></td>
+<td><pre>            // selection operation is in progress</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="894" href="#"></a></td>
+<td><pre>            // ## Throw an error if this channel has not been pre-closed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="895" href="#"></a></td>
+<td><pre>            return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="896" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="897" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="898" href="#"></a></td>
+<td><pre>        if ((ops &amp; (PollArrayWrapper.POLLERR</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="899" href="#"></a></td>
+<td><pre>                    | PollArrayWrapper.POLLHUP)) != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="900" href="#"></a></td>
+<td><pre>            newOps = intOps;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="901" href="#"></a></td>
+<td><pre>            sk.nioReadyOps(newOps);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="902" href="#"></a></td>
+<td><pre>            // No need to poll again in checkConnect,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="903" href="#"></a></td>
+<td><pre>            // the error will be detected there</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="904" href="#"></a></td>
+<td><pre>            readyToConnect = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="905" href="#"></a></td>
+<td><pre>            return (newOps &amp; ~oldOps) != 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="906" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="907" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="908" href="#"></a></td>
+<td><pre>        if (((ops &amp; PollArrayWrapper.POLLIN) != 0) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="909" href="#"></a></td>
+<td><pre>            ((intOps &amp; SelectionKey.OP_READ) != 0) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="910" href="#"></a></td>
+<td><pre>            (state == ST_CONNECTED))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="911" href="#"></a></td>
+<td><pre>            newOps |= SelectionKey.OP_READ;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="912" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="913" href="#"></a></td>
+<td><pre>        if (((ops &amp; PollArrayWrapper.POLLCONN) != 0) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="914" href="#"></a></td>
+<td><pre>            ((intOps &amp; SelectionKey.OP_CONNECT) != 0) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="915" href="#"></a></td>
+<td><pre>            ((state == ST_UNCONNECTED) || (state == ST_PENDING))) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="916" href="#"></a></td>
+<td><pre>            newOps |= SelectionKey.OP_CONNECT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="917" href="#"></a></td>
+<td><pre>            readyToConnect = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="918" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="919" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="920" href="#"></a></td>
+<td><pre>        if (((ops &amp; PollArrayWrapper.POLLOUT) != 0) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="921" href="#"></a></td>
+<td><pre>            ((intOps &amp; SelectionKey.OP_WRITE) != 0) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="922" href="#"></a></td>
+<td><pre>            (state == ST_CONNECTED))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="923" href="#"></a></td>
+<td><pre>            newOps |= SelectionKey.OP_WRITE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="924" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="925" href="#"></a></td>
+<td><pre>        sk.nioReadyOps(newOps);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="926" href="#"></a></td>
+<td><pre>        return (newOps &amp; ~oldOps) != 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="927" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="928" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="929" href="#"></a></td>
+<td><pre>    public boolean translateAndUpdateReadyOps(int ops, SelectionKeyImpl sk) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="930" href="#"></a></td>
+<td><pre>        return translateReadyOps(ops, sk.nioReadyOps(), sk);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="931" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="932" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="933" href="#"></a></td>
+<td><pre>    public boolean translateAndSetReadyOps(int ops, SelectionKeyImpl sk) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="934" href="#"></a></td>
+<td><pre>        return translateReadyOps(ops, 0, sk);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="935" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="936" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="937" href="#"></a></td>
+<td><pre>    // package-private</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="938" href="#"></a></td>
+<td><pre>    int poll(int events, long timeout) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="939" href="#"></a></td>
+<td><pre>        assert Thread.holdsLock(blockingLock()) &amp;&amp; !isBlocking();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="940" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="941" href="#"></a></td>
+<td><pre>        synchronized (readLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="942" href="#"></a></td>
+<td><pre>            int n = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="943" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="944" href="#"></a></td>
+<td><pre>                begin();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="945" href="#"></a></td>
+<td><pre>                synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="946" href="#"></a></td>
+<td><pre>                    if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="947" href="#"></a></td>
+<td><pre>                        return 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="948" href="#"></a></td>
+<td><pre>                    readerThread = NativeThread.current();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="949" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="950" href="#"></a></td>
+<td><pre>                n = Net.poll(fd, events, timeout);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="951" href="#"></a></td>
+<td><pre>            } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="952" href="#"></a></td>
+<td><pre>                readerCleanup();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="953" href="#"></a></td>
+<td><pre>                end(n &gt; 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="954" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="955" href="#"></a></td>
+<td><pre>            return n;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="956" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="957" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="958" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="959" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="960" href="#"></a></td>
+<td><pre>     * Translates an interest operation set into a native poll event set</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="961" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="962" href="#"></a></td>
+<td><pre>    public void translateAndSetInterestOps(int ops, SelectionKeyImpl sk) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="963" href="#"></a></td>
+<td><pre>        int newOps = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="964" href="#"></a></td>
+<td><pre>        if ((ops &amp; SelectionKey.OP_READ) != 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="965" href="#"></a></td>
+<td><pre>            newOps |= PollArrayWrapper.POLLIN;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="966" href="#"></a></td>
+<td><pre>        if ((ops &amp; SelectionKey.OP_WRITE) != 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="967" href="#"></a></td>
+<td><pre>            newOps |= PollArrayWrapper.POLLOUT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="968" href="#"></a></td>
+<td><pre>        if ((ops &amp; SelectionKey.OP_CONNECT) != 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="969" href="#"></a></td>
+<td><pre>            newOps |= PollArrayWrapper.POLLCONN;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="970" href="#"></a></td>
+<td><pre>        sk.selector.putEventOps(sk, newOps);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="971" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="972" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="973" href="#"></a></td>
+<td><pre>    public FileDescriptor getFD() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="974" href="#"></a></td>
+<td><pre>        return fd;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="975" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="976" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="977" href="#"></a></td>
+<td><pre>    public int getFDVal() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="978" href="#"></a></td>
+<td><pre>        return fdVal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="979" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="980" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="981" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="982" href="#"></a></td>
+<td><pre>    public String toString() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="983" href="#"></a></td>
+<td><pre>        StringBuffer sb = new StringBuffer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="984" href="#"></a></td>
+<td><pre>        sb.append(this.getClass().getSuperclass().getName());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="985" href="#"></a></td>
+<td><pre>        sb.append('[');</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="986" href="#"></a></td>
+<td><pre>        if (!isOpen())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="987" href="#"></a></td>
+<td><pre>            sb.append(&quot;closed&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="988" href="#"></a></td>
+<td><pre>        else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="989" href="#"></a></td>
+<td><pre>            synchronized (stateLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="990" href="#"></a></td>
+<td><pre>                switch (state) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="991" href="#"></a></td>
+<td><pre>                case ST_UNCONNECTED:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="992" href="#"></a></td>
+<td><pre>                    sb.append(&quot;unconnected&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="993" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="994" href="#"></a></td>
+<td><pre>                case ST_PENDING:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="995" href="#"></a></td>
+<td><pre>                    sb.append(&quot;connection-pending&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="996" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="997" href="#"></a></td>
+<td><pre>                case ST_CONNECTED:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="998" href="#"></a></td>
+<td><pre>                    sb.append(&quot;connected&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="999" href="#"></a></td>
+<td><pre>                    if (!isInputOpen)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1000" href="#"></a></td>
+<td><pre>                        sb.append(&quot; ishut&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1001" href="#"></a></td>
+<td><pre>                    if (!isOutputOpen)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1002" href="#"></a></td>
+<td><pre>                        sb.append(&quot; oshut&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1003" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1004" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1005" href="#"></a></td>
+<td><pre>                InetSocketAddress addr = localAddress();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1006" href="#"></a></td>
+<td><pre>                if (addr != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1007" href="#"></a></td>
+<td><pre>                    sb.append(&quot; local=&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1008" href="#"></a></td>
+<td><pre>                    sb.append(Net.getRevealedLocalAddressAsString(addr));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1009" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1010" href="#"></a></td>
+<td><pre>                if (remoteAddress() != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1011" href="#"></a></td>
+<td><pre>                    sb.append(&quot; remote=&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1012" href="#"></a></td>
+<td><pre>                    sb.append(remoteAddress().toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1013" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1014" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1015" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1016" href="#"></a></td>
+<td><pre>        sb.append(']');</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1017" href="#"></a></td>
+<td><pre>        return sb.toString();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1018" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1019" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1020" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1021" href="#"></a></td>
+<td><pre>    // -- Native methods --</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1022" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1023" href="#"></a></td>
+<td><pre>    private static native int checkConnect(FileDescriptor fd,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1024" href="#"></a></td>
+<td><pre>                                           boolean block, boolean ready)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1025" href="#"></a></td>
+<td><pre>        throws IOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1026" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1027" href="#"></a></td>
+<td><pre>    private static native int sendOutOfBandData(FileDescriptor fd, byte data)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1028" href="#"></a></td>
+<td><pre>        throws IOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1029" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1030" href="#"></a></td>
+<td><pre>    static {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1031" href="#"></a></td>
+<td><pre>        IOUtil.load();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1032" href="#"></a></td>
+<td><pre>        nd = new SocketDispatcher();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1033" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1034" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1035" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

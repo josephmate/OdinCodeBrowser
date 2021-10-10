@@ -3,845 +3,3359 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2004, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package sun.security.ssl;
-
-import java.lang.ref.*;
-import java.util.*;
-import static java.util.Locale.ENGLISH;
-import java.util.concurrent.atomic.AtomicLong;
-import java.net.Socket;
-
-import java.security.*;
-import java.security.KeyStore.*;
-import java.security.cert.*;
-import java.security.cert.Certificate;
-
-import javax.net.ssl.*;
-
-import sun.security.provider.certpath.AlgorithmChecker;
-
-/**
- * The new X509 key manager implementation. The main differences to the
- * old SunX509 key manager are:
- *  . it is based around the KeyStore.Builder API. This allows it to use
- *    other forms of KeyStore protection or password input (e.g. a
- *    CallbackHandler) or to have keys within one KeyStore protected by
- *    different keys.
- *  . it can use multiple KeyStores at the same time.
- *  . it is explicitly designed to accommodate KeyStores that change over
- *    the lifetime of the process.
- *  . it makes an effort to choose the key that matches best, i.e. one that
- *    is not expired and has the appropriate certificate extensions.
- *
- * Note that this code is not explicitly performance optimzied yet.
- *
- * @author  Andreas Sterbenz
- */
-final class X509KeyManagerImpl extends X509ExtendedKeyManager
-        implements X509KeyManager {
-
-    private static final Debug debug = Debug.getInstance(&quot;ssl&quot;);
-
-    private final static boolean useDebug =
-                            (debug != null) &amp;&amp; Debug.isOn(&quot;keymanager&quot;);
-
-    // for unit testing only, set via privileged reflection
-    private static Date verificationDate;
-
-    // list of the builders
-    private final List&lt;Builder&gt; builders;
-
-    // counter to generate unique ids for the aliases
-    private final AtomicLong uidCounter;
-
-    // cached entries
-    private final Map&lt;String,Reference&lt;PrivateKeyEntry&gt;&gt; entryCacheMap;
-
-    X509KeyManagerImpl(Builder builder) {
-        this(Collections.singletonList(builder));
-    }
-
-    X509KeyManagerImpl(List&lt;Builder&gt; builders) {
-        this.builders = builders;
-        uidCounter = new AtomicLong();
-        entryCacheMap = Collections.synchronizedMap
-                        (new SizedMap&lt;String,Reference&lt;PrivateKeyEntry&gt;&gt;());
-    }
-
-    // LinkedHashMap with a max size of 10
-    // see LinkedHashMap JavaDocs
-    private static class SizedMap&lt;K,V&gt; extends LinkedHashMap&lt;K,V&gt; {
-        private static final long serialVersionUID = -8211222668790986062L;
-
-        @Override protected boolean removeEldestEntry(Map.Entry&lt;K,V&gt; eldest) {
-            return size() &gt; 10;
-        }
-    }
-
-    //
-    // public methods
-    //
-
-    @Override
-    public X509Certificate[] getCertificateChain(String alias) {
-        PrivateKeyEntry entry = getEntry(alias);
-        return entry == null ? null :
-                (X509Certificate[])entry.getCertificateChain();
-    }
-
-    @Override
-    public PrivateKey getPrivateKey(String alias) {
-        PrivateKeyEntry entry = getEntry(alias);
-        return entry == null ? null : entry.getPrivateKey();
-    }
-
-    @Override
-    public String chooseClientAlias(String[] keyTypes, Principal[] issuers,
-            Socket socket) {
-        return chooseAlias(getKeyTypes(keyTypes), issuers, CheckType.CLIENT,
-                        getAlgorithmConstraints(socket));
-    }
-
-    @Override
-    public String chooseEngineClientAlias(String[] keyTypes,
-            Principal[] issuers, SSLEngine engine) {
-        return chooseAlias(getKeyTypes(keyTypes), issuers, CheckType.CLIENT,
-                        getAlgorithmConstraints(engine));
-    }
-
-    @Override
-    public String chooseServerAlias(String keyType,
-            Principal[] issuers, Socket socket) {
-        return chooseAlias(getKeyTypes(keyType), issuers, CheckType.SERVER,
-            getAlgorithmConstraints(socket),
-            X509TrustManagerImpl.getRequestedServerNames(socket),
-            &quot;HTTPS&quot;);    // The SNI HostName is a fully qualified domain name.
-                         // The certificate selection scheme for SNI HostName
-                         // is similar to HTTPS endpoint identification scheme
-                         // implemented in this provider.
-                         //
-                         // Using HTTPS endpoint identification scheme to guide
-                         // the selection of an appropriate authentication
-                         // certificate according to requested SNI extension.
-                         //
-                         // It is not a really HTTPS endpoint identification.
-    }
-
-    @Override
-    public String chooseEngineServerAlias(String keyType,
-            Principal[] issuers, SSLEngine engine) {
-        return chooseAlias(getKeyTypes(keyType), issuers, CheckType.SERVER,
-            getAlgorithmConstraints(engine),
-            X509TrustManagerImpl.getRequestedServerNames(engine),
-            &quot;HTTPS&quot;);    // The SNI HostName is a fully qualified domain name.
-                         // The certificate selection scheme for SNI HostName
-                         // is similar to HTTPS endpoint identification scheme
-                         // implemented in this provider.
-                         //
-                         // Using HTTPS endpoint identification scheme to guide
-                         // the selection of an appropriate authentication
-                         // certificate according to requested SNI extension.
-                         //
-                         // It is not a really HTTPS endpoint identification.
-    }
-
-    @Override
-    public String[] getClientAliases(String keyType, Principal[] issuers) {
-        return getAliases(keyType, issuers, CheckType.CLIENT, null);
-    }
-
-    @Override
-    public String[] getServerAliases(String keyType, Principal[] issuers) {
-        return getAliases(keyType, issuers, CheckType.SERVER, null);
-    }
-
-    //
-    // implementation private methods
-    //
-
-    // Gets algorithm constraints of the socket.
-    private AlgorithmConstraints getAlgorithmConstraints(Socket socket) {
-        if (socket != null &amp;&amp; socket.isConnected() &amp;&amp;
-                                        socket instanceof SSLSocket) {
-
-            SSLSocket sslSocket = (SSLSocket)socket;
-            SSLSession session = sslSocket.getHandshakeSession();
-
-            if (session != null) {
-                ProtocolVersion protocolVersion =
-                    ProtocolVersion.valueOf(session.getProtocol());
-                if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {
-                    String[] peerSupportedSignAlgs = null;
-
-                    if (session instanceof ExtendedSSLSession) {
-                        ExtendedSSLSession extSession =
-                            (ExtendedSSLSession)session;
-                        peerSupportedSignAlgs =
-                            extSession.getPeerSupportedSignatureAlgorithms();
-                    }
-
-                    return new SSLAlgorithmConstraints(
-                        sslSocket, peerSupportedSignAlgs, true);
-                }
-            }
-
-            return new SSLAlgorithmConstraints(sslSocket, true);
-        }
-
-        return new SSLAlgorithmConstraints((SSLSocket)null, true);
-    }
-
-    // Gets algorithm constraints of the engine.
-    private AlgorithmConstraints getAlgorithmConstraints(SSLEngine engine) {
-        if (engine != null) {
-            SSLSession session = engine.getHandshakeSession();
-            if (session != null) {
-                ProtocolVersion protocolVersion =
-                    ProtocolVersion.valueOf(session.getProtocol());
-                if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {
-                    String[] peerSupportedSignAlgs = null;
-
-                    if (session instanceof ExtendedSSLSession) {
-                        ExtendedSSLSession extSession =
-                            (ExtendedSSLSession)session;
-                        peerSupportedSignAlgs =
-                            extSession.getPeerSupportedSignatureAlgorithms();
-                    }
-
-                    return new SSLAlgorithmConstraints(
-                        engine, peerSupportedSignAlgs, true);
-                }
-            }
-        }
-
-        return new SSLAlgorithmConstraints(engine, true);
-    }
-
-    // we construct the alias we return to JSSE as seen in the code below
-    // a unique id is included to allow us to reliably cache entries
-    // between the calls to getCertificateChain() and getPrivateKey()
-    // even if tokens are inserted or removed
-    private String makeAlias(EntryStatus entry) {
-        return uidCounter.incrementAndGet() + &quot;.&quot; + entry.builderIndex + &quot;.&quot;
-                + entry.alias;
-    }
-
-    private PrivateKeyEntry getEntry(String alias) {
-        // if the alias is null, return immediately
-        if (alias == null) {
-            return null;
-        }
-
-        // try to get the entry from cache
-        Reference&lt;PrivateKeyEntry&gt; ref = entryCacheMap.get(alias);
-        PrivateKeyEntry entry = (ref != null) ? ref.get() : null;
-        if (entry != null) {
-            return entry;
-        }
-
-        // parse the alias
-        int firstDot = alias.indexOf('.');
-        int secondDot = alias.indexOf('.', firstDot + 1);
-        if ((firstDot == -1) || (secondDot == firstDot)) {
-            // invalid alias
-            return null;
-        }
-        try {
-            int builderIndex = Integer.parseInt
-                                (alias.substring(firstDot + 1, secondDot));
-            String keyStoreAlias = alias.substring(secondDot + 1);
-            Builder builder = builders.get(builderIndex);
-            KeyStore ks = builder.getKeyStore();
-            Entry newEntry = ks.getEntry
-                    (keyStoreAlias, builder.getProtectionParameter(alias));
-            if (newEntry instanceof PrivateKeyEntry == false) {
-                // unexpected type of entry
-                return null;
-            }
-            entry = (PrivateKeyEntry)newEntry;
-            entryCacheMap.put(alias, new SoftReference&lt;PrivateKeyEntry&gt;(entry));
-            return entry;
-        } catch (Exception e) {
-            // ignore
-            return null;
-        }
-    }
-
-    // Class to help verify that the public key algorithm (and optionally
-    // the signature algorithm) of a certificate matches what we need.
-    private static class KeyType {
-
-        final String keyAlgorithm;
-
-        // In TLS 1.2, the signature algorithm  has been obsoleted by the
-        // supported_signature_algorithms, and the certificate type no longer
-        // restricts the algorithm used to sign the certificate.
-        // However, because we don't support certificate type checking other
-        // than rsa_sign, dss_sign and ecdsa_sign, we don't have to check the
-        // protocol version here.
-        final String sigKeyAlgorithm;
-
-        KeyType(String algorithm) {
-            int k = algorithm.indexOf(&quot;_&quot;);
-            if (k == -1) {
-                keyAlgorithm = algorithm;
-                sigKeyAlgorithm = null;
-            } else {
-                keyAlgorithm = algorithm.substring(0, k);
-                sigKeyAlgorithm = algorithm.substring(k + 1);
-            }
-        }
-
-        boolean matches(Certificate[] chain) {
-            if (!chain[0].getPublicKey().getAlgorithm().equals(keyAlgorithm)) {
-                return false;
-            }
-            if (sigKeyAlgorithm == null) {
-                return true;
-            }
-            if (chain.length &gt; 1) {
-                // if possible, check the public key in the issuer cert
-                return sigKeyAlgorithm.equals(
-                        chain[1].getPublicKey().getAlgorithm());
-            } else {
-                // Check the signature algorithm of the certificate itself.
-                // Look for the &quot;withRSA&quot; in &quot;SHA1withRSA&quot;, etc.
-                X509Certificate issuer = (X509Certificate)chain[0];
-                String sigAlgName = issuer.getSigAlgName().toUpperCase(ENGLISH);
-                String pattern = &quot;WITH&quot; + sigKeyAlgorithm.toUpperCase(ENGLISH);
-                return sigAlgName.contains(pattern);
-            }
-        }
-    }
-
-    private static List&lt;KeyType&gt; getKeyTypes(String ... keyTypes) {
-        if ((keyTypes == null) ||
-                (keyTypes.length == 0) || (keyTypes[0] == null)) {
-            return null;
-        }
-        List&lt;KeyType&gt; list = new ArrayList&lt;&gt;(keyTypes.length);
-        for (String keyType : keyTypes) {
-            list.add(new KeyType(keyType));
-        }
-        return list;
-    }
-
-    /*
-     * Return the best alias that fits the given parameters.
-     * The algorithm we use is:
-     *   . scan through all the aliases in all builders in order
-     *   . as soon as we find a perfect match, return
-     *     (i.e. a match with a cert that has appropriate key usage,
-     *      qualified endpoint identity, and is not expired).
-     *   . if we do not find a perfect match, keep looping and remember
-     *     the imperfect matches
-     *   . at the end, sort the imperfect matches. we prefer expired certs
-     *     with appropriate key usage to certs with the wrong key usage.
-     *     return the first one of them.
-     */
-    private String chooseAlias(List&lt;KeyType&gt; keyTypeList, Principal[] issuers,
-            CheckType checkType, AlgorithmConstraints constraints) {
-
-        return chooseAlias(keyTypeList, issuers,
-                                    checkType, constraints, null, null);
-    }
-
-    private String chooseAlias(List&lt;KeyType&gt; keyTypeList, Principal[] issuers,
-            CheckType checkType, AlgorithmConstraints constraints,
-            List&lt;SNIServerName&gt; requestedServerNames, String idAlgorithm) {
-
-        if (keyTypeList == null || keyTypeList.isEmpty()) {
-            return null;
-        }
-
-        Set&lt;Principal&gt; issuerSet = getIssuerSet(issuers);
-        List&lt;EntryStatus&gt; allResults = null;
-        for (int i = 0, n = builders.size(); i &lt; n; i++) {
-            try {
-                List&lt;EntryStatus&gt; results = getAliases(i, keyTypeList,
-                            issuerSet, false, checkType, constraints,
-                            requestedServerNames, idAlgorithm);
-                if (results != null) {
-                    // the results will either be a single perfect match
-                    // or 1 or more imperfect matches
-                    // if it's a perfect match, return immediately
-                    EntryStatus status = results.get(0);
-                    if (status.checkResult == CheckResult.OK) {
-                        if (useDebug) {
-                            debug.println(&quot;KeyMgr: choosing key: &quot; + status);
-                        }
-                        return makeAlias(status);
-                    }
-                    if (allResults == null) {
-                        allResults = new ArrayList&lt;EntryStatus&gt;();
-                    }
-                    allResults.addAll(results);
-                }
-            } catch (Exception e) {
-                // ignore
-            }
-        }
-        if (allResults == null) {
-            if (useDebug) {
-                debug.println(&quot;KeyMgr: no matching key found&quot;);
-            }
-            return null;
-        }
-        Collections.sort(allResults);
-        if (useDebug) {
-            debug.println(&quot;KeyMgr: no good matching key found, &quot;
-                        + &quot;returning best match out of:&quot;);
-            debug.println(allResults.toString());
-        }
-        return makeAlias(allResults.get(0));
-    }
-
-    /*
-     * Return all aliases that (approximately) fit the parameters.
-     * These are perfect matches plus imperfect matches (expired certificates
-     * and certificates with the wrong extensions).
-     * The perfect matches will be first in the array.
-     */
-    public String[] getAliases(String keyType, Principal[] issuers,
-            CheckType checkType, AlgorithmConstraints constraints) {
-        if (keyType == null) {
-            return null;
-        }
-
-        Set&lt;Principal&gt; issuerSet = getIssuerSet(issuers);
-        List&lt;KeyType&gt; keyTypeList = getKeyTypes(keyType);
-        List&lt;EntryStatus&gt; allResults = null;
-        for (int i = 0, n = builders.size(); i &lt; n; i++) {
-            try {
-                List&lt;EntryStatus&gt; results = getAliases(i, keyTypeList,
-                                    issuerSet, true, checkType, constraints,
-                                    null, null);
-                if (results != null) {
-                    if (allResults == null) {
-                        allResults = new ArrayList&lt;EntryStatus&gt;();
-                    }
-                    allResults.addAll(results);
-                }
-            } catch (Exception e) {
-                // ignore
-            }
-        }
-        if (allResults == null || allResults.isEmpty()) {
-            if (useDebug) {
-                debug.println(&quot;KeyMgr: no matching alias found&quot;);
-            }
-            return null;
-        }
-        Collections.sort(allResults);
-        if (useDebug) {
-            debug.println(&quot;KeyMgr: getting aliases: &quot; + allResults);
-        }
-        return toAliases(allResults);
-    }
-
-    // turn candidate entries into unique aliases we can return to JSSE
-    private String[] toAliases(List&lt;EntryStatus&gt; results) {
-        String[] s = new String[results.size()];
-        int i = 0;
-        for (EntryStatus result : results) {
-            s[i++] = makeAlias(result);
-        }
-        return s;
-    }
-
-    // make a Set out of the array
-    private Set&lt;Principal&gt; getIssuerSet(Principal[] issuers) {
-        if ((issuers != null) &amp;&amp; (issuers.length != 0)) {
-            return new HashSet&lt;&gt;(Arrays.asList(issuers));
-        } else {
-            return null;
-        }
-    }
-
-    // a candidate match
-    // identifies the entry by builder and alias
-    // and includes the result of the certificate check
-    private static class EntryStatus implements Comparable&lt;EntryStatus&gt; {
-
-        final int builderIndex;
-        final int keyIndex;
-        final String alias;
-        final CheckResult checkResult;
-
-        EntryStatus(int builderIndex, int keyIndex, String alias,
-                Certificate[] chain, CheckResult checkResult) {
-            this.builderIndex = builderIndex;
-            this.keyIndex = keyIndex;
-            this.alias = alias;
-            this.checkResult = checkResult;
-        }
-
-        @Override
-        public int compareTo(EntryStatus other) {
-            int result = this.checkResult.compareTo(other.checkResult);
-            return (result == 0) ? (this.keyIndex - other.keyIndex) : result;
-        }
-
-        @Override
-        public String toString() {
-            String s = alias + &quot; (verified: &quot; + checkResult + &quot;)&quot;;
-            if (builderIndex == 0) {
-                return s;
-            } else {
-                return &quot;Builder #&quot; + builderIndex + &quot;, alias: &quot; + s;
-            }
-        }
-    }
-
-    // enum for the type of certificate check we want to perform
-    // (client or server)
-    // also includes the check code itself
-    private static enum CheckType {
-
-        // enum constant for &quot;no check&quot; (currently not used)
-        NONE(Collections.&lt;String&gt;emptySet()),
-
-        // enum constant for &quot;tls client&quot; check
-        // valid EKU for TLS client: any, tls_client
-        CLIENT(new HashSet&lt;String&gt;(Arrays.asList(new String[] {
-            &quot;2.5.29.37.0&quot;, &quot;1.3.6.1.5.5.7.3.2&quot; }))),
-
-        // enum constant for &quot;tls server&quot; check
-        // valid EKU for TLS server: any, tls_server, ns_sgc, ms_sgc
-        SERVER(new HashSet&lt;String&gt;(Arrays.asList(new String[] {
-            &quot;2.5.29.37.0&quot;, &quot;1.3.6.1.5.5.7.3.1&quot;, &quot;2.16.840.1.113730.4.1&quot;,
-            &quot;1.3.6.1.4.1.311.10.3.3&quot; })));
-
-        // set of valid EKU values for this type
-        final Set&lt;String&gt; validEku;
-
-        CheckType(Set&lt;String&gt; validEku) {
-            this.validEku = validEku;
-        }
-
-        private static boolean getBit(boolean[] keyUsage, int bit) {
-            return (bit &lt; keyUsage.length) &amp;&amp; keyUsage[bit];
-        }
-
-        // check if this certificate is appropriate for this type of use
-        // first check extensions, if they match, check expiration
-        // note: we may want to move this code into the sun.security.validator
-        // package
-        CheckResult check(X509Certificate cert, Date date,
-                List&lt;SNIServerName&gt; serverNames, String idAlgorithm) {
-
-            if (this == NONE) {
-                return CheckResult.OK;
-            }
-
-            // check extensions
-            try {
-                // check extended key usage
-                List&lt;String&gt; certEku = cert.getExtendedKeyUsage();
-                if ((certEku != null) &amp;&amp;
-                        Collections.disjoint(validEku, certEku)) {
-                    // if extension present and it does not contain any of
-                    // the valid EKU OIDs, return extension_mismatch
-                    return CheckResult.EXTENSION_MISMATCH;
-                }
-
-                // check key usage
-                boolean[] ku = cert.getKeyUsage();
-                if (ku != null) {
-                    String algorithm = cert.getPublicKey().getAlgorithm();
-                    boolean kuSignature = getBit(ku, 0);
-                    switch (algorithm) {
-                        case &quot;RSA&quot;:
-                            // require either signature bit
-                            // or if server also allow key encipherment bit
-                            if (kuSignature == false) {
-                                if ((this == CLIENT) || (getBit(ku, 2) == false)) {
-                                    return CheckResult.EXTENSION_MISMATCH;
-                                }
-                            }
-                            break;
-                        case &quot;DSA&quot;:
-                            // require signature bit
-                            if (kuSignature == false) {
-                                return CheckResult.EXTENSION_MISMATCH;
-                            }
-                            break;
-                        case &quot;DH&quot;:
-                            // require keyagreement bit
-                            if (getBit(ku, 4) == false) {
-                                return CheckResult.EXTENSION_MISMATCH;
-                            }
-                            break;
-                        case &quot;EC&quot;:
-                            // require signature bit
-                            if (kuSignature == false) {
-                                return CheckResult.EXTENSION_MISMATCH;
-                            }
-                            // For servers, also require key agreement.
-                            // This is not totally accurate as the keyAgreement
-                            // bit is only necessary for static ECDH key
-                            // exchange and not ephemeral ECDH. We leave it in
-                            // for now until there are signs that this check
-                            // causes problems for real world EC certificates.
-                            if ((this == SERVER) &amp;&amp; (getBit(ku, 4) == false)) {
-                                return CheckResult.EXTENSION_MISMATCH;
-                            }
-                            break;
-                    }
-                }
-            } catch (CertificateException e) {
-                // extensions unparseable, return failure
-                return CheckResult.EXTENSION_MISMATCH;
-            }
-
-            try {
-                cert.checkValidity(date);
-            } catch (CertificateException e) {
-                return CheckResult.EXPIRED;
-            }
-
-            if (serverNames != null &amp;&amp; !serverNames.isEmpty()) {
-                for (SNIServerName serverName : serverNames) {
-                    if (serverName.getType() ==
-                                StandardConstants.SNI_HOST_NAME) {
-                        if (!(serverName instanceof SNIHostName)) {
-                            try {
-                                serverName =
-                                    new SNIHostName(serverName.getEncoded());
-                            } catch (IllegalArgumentException iae) {
-                                // unlikely to happen, just in case ...
-                                if (useDebug) {
-                                    debug.println(
-                                       &quot;Illegal server name: &quot; + serverName);
-                                }
-
-                                return CheckResult.INSENSITIVE;
-                            }
-                        }
-                        String hostname =
-                                ((SNIHostName)serverName).getAsciiName();
-
-                        try {
-                            X509TrustManagerImpl.checkIdentity(hostname,
-                                                        cert, idAlgorithm);
-                        } catch (CertificateException e) {
-                            if (useDebug) {
-                                debug.println(
-                                   &quot;Certificate identity does not match &quot; +
-                                   &quot;Server Name Inidication (SNI): &quot; +
-                                   hostname);
-                            }
-                            return CheckResult.INSENSITIVE;
-                        }
-
-                        break;
-                    }
-                }
-            }
-
-            return CheckResult.OK;
-        }
-    }
-
-    // enum for the result of the extension check
-    // NOTE: the order of the constants is important as they are used
-    // for sorting, i.e. OK is best, followed by EXPIRED and EXTENSION_MISMATCH
-    private static enum CheckResult {
-        OK,                     // ok or not checked
-        INSENSITIVE,            // server name indication insensitive
-        EXPIRED,                // extensions valid but cert expired
-        EXTENSION_MISMATCH,     // extensions invalid (expiration not checked)
-    }
-
-    /*
-     * Return a List of all candidate matches in the specified builder
-     * that fit the parameters.
-     * We exclude entries in the KeyStore if they are not:
-     *  . private key entries
-     *  . the certificates are not X509 certificates
-     *  . the algorithm of the key in the EE cert doesn't match one of keyTypes
-     *  . none of the certs is issued by a Principal in issuerSet
-     * Using those entries would not be possible or they would almost
-     * certainly be rejected by the peer.
-     *
-     * In addition to those checks, we also check the extensions in the EE
-     * cert and its expiration. Even if there is a mismatch, we include
-     * such certificates because they technically work and might be accepted
-     * by the peer. This leads to more graceful failure and better error
-     * messages if the cert expires from one day to the next.
-     *
-     * The return values are:
-     *   . null, if there are no matching entries at all
-     *   . if 'findAll' is 'false' and there is a perfect match, a List
-     *     with a single element (early return)
-     *   . if 'findAll' is 'false' and there is NO perfect match, a List
-     *     with all the imperfect matches (expired, wrong extensions)
-     *   . if 'findAll' is 'true', a List with all perfect and imperfect
-     *     matches
-     */
-    private List&lt;EntryStatus&gt; getAliases(int builderIndex,
-            List&lt;KeyType&gt; keyTypes, Set&lt;Principal&gt; issuerSet,
-            boolean findAll, CheckType checkType,
-            AlgorithmConstraints constraints,
-            List&lt;SNIServerName&gt; requestedServerNames,
-            String idAlgorithm) throws Exception {
-
-        Builder builder = builders.get(builderIndex);
-        KeyStore ks = builder.getKeyStore();
-        List&lt;EntryStatus&gt; results = null;
-        Date date = verificationDate;
-        boolean preferred = false;
-        for (Enumeration&lt;String&gt; e = ks.aliases(); e.hasMoreElements(); ) {
-            String alias = e.nextElement();
-            // check if it is a key entry (private key or secret key)
-            if (ks.isKeyEntry(alias) == false) {
-                continue;
-            }
-
-            Certificate[] chain = ks.getCertificateChain(alias);
-            if ((chain == null) || (chain.length == 0)) {
-                // must be secret key entry, ignore
-                continue;
-            }
-
-            boolean incompatible = false;
-            for (Certificate cert : chain) {
-                if (cert instanceof X509Certificate == false) {
-                    // not an X509Certificate, ignore this alias
-                    incompatible = true;
-                    break;
-                }
-            }
-            if (incompatible) {
-                continue;
-            }
-
-            // check keytype
-            int keyIndex = -1;
-            int j = 0;
-            for (KeyType keyType : keyTypes) {
-                if (keyType.matches(chain)) {
-                    keyIndex = j;
-                    break;
-                }
-                j++;
-            }
-            if (keyIndex == -1) {
-                if (useDebug) {
-                    debug.println(&quot;Ignoring alias &quot; + alias
-                                + &quot;: key algorithm does not match&quot;);
-                }
-                continue;
-            }
-            // check issuers
-            if (issuerSet != null) {
-                boolean found = false;
-                for (Certificate cert : chain) {
-                    X509Certificate xcert = (X509Certificate)cert;
-                    if (issuerSet.contains(xcert.getIssuerX500Principal())) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (found == false) {
-                    if (useDebug) {
-                        debug.println(&quot;Ignoring alias &quot; + alias
-                                    + &quot;: issuers do not match&quot;);
-                    }
-                    continue;
-                }
-            }
-
-            // check the algorithm constraints
-            if (constraints != null &amp;&amp;
-                    !conformsToAlgorithmConstraints(constraints, chain)) {
-
-                if (useDebug) {
-                    debug.println(&quot;Ignoring alias &quot; + alias +
-                            &quot;: certificate list does not conform to &quot; +
-                            &quot;algorithm constraints&quot;);
-                }
-                continue;
-            }
-
-            if (date == null) {
-                date = new Date();
-            }
-            CheckResult checkResult =
-                    checkType.check((X509Certificate)chain[0], date,
-                                    requestedServerNames, idAlgorithm);
-            EntryStatus status =
-                    new EntryStatus(builderIndex, keyIndex,
-                                        alias, chain, checkResult);
-            if (!preferred &amp;&amp; checkResult == CheckResult.OK &amp;&amp; keyIndex == 0) {
-                preferred = true;
-            }
-            if (preferred &amp;&amp; (findAll == false)) {
-                // if we have a good match and do not need all matches,
-                // return immediately
-                return Collections.singletonList(status);
-            } else {
-                if (results == null) {
-                    results = new ArrayList&lt;EntryStatus&gt;();
-                }
-                results.add(status);
-            }
-        }
-        return results;
-    }
-
-    private static boolean conformsToAlgorithmConstraints(
-            AlgorithmConstraints constraints, Certificate[] chain) {
-
-        AlgorithmChecker checker = new AlgorithmChecker(constraints);
-        try {
-            checker.init(false);
-        } catch (CertPathValidatorException cpve) {
-            // unlikely to happen
-            return false;
-        }
-
-        // It is a forward checker, so we need to check from trust to target.
-        for (int i = chain.length - 1; i &gt;= 0; i--) {
-            Certificate cert = chain[i];
-            try {
-                // We don't care about the unresolved critical extensions.
-                checker.check(cert, Collections.&lt;String&gt;emptySet());
-            } catch (CertPathValidatorException cpve) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2004, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package sun.security.ssl;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.lang.ref.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.util.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import static java.util.Locale.ENGLISH;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.util.concurrent.atomic.AtomicLong;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.net.Socket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.security.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import java.security.KeyStore.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.security.cert.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import java.security.cert.Certificate;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import javax.net.ssl.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre>import sun.security.provider.certpath.AlgorithmChecker;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre> * The new X509 key manager implementation. The main differences to the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre> * old SunX509 key manager are:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre> *  . it is based around the KeyStore.Builder API. This allows it to use</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre> *    other forms of KeyStore protection or password input (e.g. a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre> *    CallbackHandler) or to have keys within one KeyStore protected by</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre> *    different keys.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre> *  . it can use multiple KeyStores at the same time.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre> *  . it is explicitly designed to accommodate KeyStores that change over</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre> *    the lifetime of the process.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre> *  . it makes an effort to choose the key that matches best, i.e. one that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre> *    is not expired and has the appropriate certificate extensions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre> * Note that this code is not explicitly performance optimzied yet.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre> * @author  Andreas Sterbenz</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>final class X509KeyManagerImpl extends X509ExtendedKeyManager</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>        implements X509KeyManager {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>    private static final Debug debug = Debug.getInstance(&quot;ssl&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>    private final static boolean useDebug =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>                            (debug != null) &amp;&amp; Debug.isOn(&quot;keymanager&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>    // for unit testing only, set via privileged reflection</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>    private static Date verificationDate;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>    // list of the builders</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>    private final List&lt;Builder&gt; builders;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>    // counter to generate unique ids for the aliases</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>    private final AtomicLong uidCounter;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>    // cached entries</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>    private final Map&lt;String,Reference&lt;PrivateKeyEntry&gt;&gt; entryCacheMap;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>    X509KeyManagerImpl(Builder builder) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>        this(Collections.singletonList(builder));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>    X509KeyManagerImpl(List&lt;Builder&gt; builders) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>        this.builders = builders;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>        uidCounter = new AtomicLong();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>        entryCacheMap = Collections.synchronizedMap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>                        (new SizedMap&lt;String,Reference&lt;PrivateKeyEntry&gt;&gt;());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>    // LinkedHashMap with a max size of 10</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>    // see LinkedHashMap JavaDocs</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>    private static class SizedMap&lt;K,V&gt; extends LinkedHashMap&lt;K,V&gt; {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>        private static final long serialVersionUID = -8211222668790986062L;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>        @Override protected boolean removeEldestEntry(Map.Entry&lt;K,V&gt; eldest) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>            return size() &gt; 10;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>    // public methods</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>    public X509Certificate[] getCertificateChain(String alias) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>        PrivateKeyEntry entry = getEntry(alias);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>        return entry == null ? null :</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>                (X509Certificate[])entry.getCertificateChain();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>    public PrivateKey getPrivateKey(String alias) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>        PrivateKeyEntry entry = getEntry(alias);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>        return entry == null ? null : entry.getPrivateKey();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>    public String chooseClientAlias(String[] keyTypes, Principal[] issuers,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>            Socket socket) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>        return chooseAlias(getKeyTypes(keyTypes), issuers, CheckType.CLIENT,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>                        getAlgorithmConstraints(socket));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>    public String chooseEngineClientAlias(String[] keyTypes,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>            Principal[] issuers, SSLEngine engine) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>        return chooseAlias(getKeyTypes(keyTypes), issuers, CheckType.CLIENT,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>                        getAlgorithmConstraints(engine));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>    public String chooseServerAlias(String keyType,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>            Principal[] issuers, Socket socket) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>        return chooseAlias(getKeyTypes(keyType), issuers, CheckType.SERVER,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>            getAlgorithmConstraints(socket),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>            X509TrustManagerImpl.getRequestedServerNames(socket),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>            &quot;HTTPS&quot;);    // The SNI HostName is a fully qualified domain name.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>                         // The certificate selection scheme for SNI HostName</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>                         // is similar to HTTPS endpoint identification scheme</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>                         // implemented in this provider.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>                         //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>                         // Using HTTPS endpoint identification scheme to guide</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>                         // the selection of an appropriate authentication</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>                         // certificate according to requested SNI extension.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>                         //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>                         // It is not a really HTTPS endpoint identification.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>    public String chooseEngineServerAlias(String keyType,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>            Principal[] issuers, SSLEngine engine) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>        return chooseAlias(getKeyTypes(keyType), issuers, CheckType.SERVER,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>            getAlgorithmConstraints(engine),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>            X509TrustManagerImpl.getRequestedServerNames(engine),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>            &quot;HTTPS&quot;);    // The SNI HostName is a fully qualified domain name.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>                         // The certificate selection scheme for SNI HostName</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>                         // is similar to HTTPS endpoint identification scheme</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>                         // implemented in this provider.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>                         //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>                         // Using HTTPS endpoint identification scheme to guide</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>                         // the selection of an appropriate authentication</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>                         // certificate according to requested SNI extension.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>                         //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>                         // It is not a really HTTPS endpoint identification.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>    public String[] getClientAliases(String keyType, Principal[] issuers) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>        return getAliases(keyType, issuers, CheckType.CLIENT, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>    public String[] getServerAliases(String keyType, Principal[] issuers) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>        return getAliases(keyType, issuers, CheckType.SERVER, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>    // implementation private methods</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>    // Gets algorithm constraints of the socket.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>    private AlgorithmConstraints getAlgorithmConstraints(Socket socket) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>        if (socket != null &amp;&amp; socket.isConnected() &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>                                        socket instanceof SSLSocket) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>            SSLSocket sslSocket = (SSLSocket)socket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>            SSLSession session = sslSocket.getHandshakeSession();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>            if (session != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>                ProtocolVersion protocolVersion =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>                    ProtocolVersion.valueOf(session.getProtocol());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>                if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>                    String[] peerSupportedSignAlgs = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>                    if (session instanceof ExtendedSSLSession) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>                        ExtendedSSLSession extSession =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>                            (ExtendedSSLSession)session;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>                        peerSupportedSignAlgs =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>                            extSession.getPeerSupportedSignatureAlgorithms();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>                    return new SSLAlgorithmConstraints(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>                        sslSocket, peerSupportedSignAlgs, true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>            return new SSLAlgorithmConstraints(sslSocket, true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>        return new SSLAlgorithmConstraints((SSLSocket)null, true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>    // Gets algorithm constraints of the engine.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>    private AlgorithmConstraints getAlgorithmConstraints(SSLEngine engine) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>        if (engine != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>            SSLSession session = engine.getHandshakeSession();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>            if (session != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>                ProtocolVersion protocolVersion =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>                    ProtocolVersion.valueOf(session.getProtocol());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>                if (protocolVersion.v &gt;= ProtocolVersion.TLS12.v) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>                    String[] peerSupportedSignAlgs = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>                    if (session instanceof ExtendedSSLSession) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>                        ExtendedSSLSession extSession =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>                            (ExtendedSSLSession)session;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>                        peerSupportedSignAlgs =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>                            extSession.getPeerSupportedSignatureAlgorithms();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>                    return new SSLAlgorithmConstraints(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>                        engine, peerSupportedSignAlgs, true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>        return new SSLAlgorithmConstraints(engine, true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>    // we construct the alias we return to JSSE as seen in the code below</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>    // a unique id is included to allow us to reliably cache entries</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>    // between the calls to getCertificateChain() and getPrivateKey()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>    // even if tokens are inserted or removed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>    private String makeAlias(EntryStatus entry) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>        return uidCounter.incrementAndGet() + &quot;.&quot; + entry.builderIndex + &quot;.&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>                + entry.alias;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>    private PrivateKeyEntry getEntry(String alias) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>        // if the alias is null, return immediately</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>        if (alias == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>        // try to get the entry from cache</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>        Reference&lt;PrivateKeyEntry&gt; ref = entryCacheMap.get(alias);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>        PrivateKeyEntry entry = (ref != null) ? ref.get() : null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>        if (entry != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>            return entry;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>        // parse the alias</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>        int firstDot = alias.indexOf('.');</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>        int secondDot = alias.indexOf('.', firstDot + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>        if ((firstDot == -1) || (secondDot == firstDot)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>            // invalid alias</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>            int builderIndex = Integer.parseInt</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>                                (alias.substring(firstDot + 1, secondDot));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>            String keyStoreAlias = alias.substring(secondDot + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>            Builder builder = builders.get(builderIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>            KeyStore ks = builder.getKeyStore();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>            Entry newEntry = ks.getEntry</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>                    (keyStoreAlias, builder.getProtectionParameter(alias));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>            if (newEntry instanceof PrivateKeyEntry == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>                // unexpected type of entry</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>                return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>            entry = (PrivateKeyEntry)newEntry;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>            entryCacheMap.put(alias, new SoftReference&lt;PrivateKeyEntry&gt;(entry));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>            return entry;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>            // ignore</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>    // Class to help verify that the public key algorithm (and optionally</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>    // the signature algorithm) of a certificate matches what we need.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>    private static class KeyType {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>        final String keyAlgorithm;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>        // In TLS 1.2, the signature algorithm  has been obsoleted by the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>        // supported_signature_algorithms, and the certificate type no longer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>        // restricts the algorithm used to sign the certificate.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>        // However, because we don't support certificate type checking other</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>        // than rsa_sign, dss_sign and ecdsa_sign, we don't have to check the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>        // protocol version here.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>        final String sigKeyAlgorithm;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>        KeyType(String algorithm) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>            int k = algorithm.indexOf(&quot;_&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>            if (k == -1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>                keyAlgorithm = algorithm;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>                sigKeyAlgorithm = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>                keyAlgorithm = algorithm.substring(0, k);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>                sigKeyAlgorithm = algorithm.substring(k + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>        boolean matches(Certificate[] chain) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>            if (!chain[0].getPublicKey().getAlgorithm().equals(keyAlgorithm)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>                return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>            if (sigKeyAlgorithm == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>                return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>            if (chain.length &gt; 1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>                // if possible, check the public key in the issuer cert</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>                return sigKeyAlgorithm.equals(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>                        chain[1].getPublicKey().getAlgorithm());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>                // Check the signature algorithm of the certificate itself.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>                // Look for the &quot;withRSA&quot; in &quot;SHA1withRSA&quot;, etc.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>                X509Certificate issuer = (X509Certificate)chain[0];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>                String sigAlgName = issuer.getSigAlgName().toUpperCase(ENGLISH);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>                String pattern = &quot;WITH&quot; + sigKeyAlgorithm.toUpperCase(ENGLISH);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>                return sigAlgName.contains(pattern);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>    private static List&lt;KeyType&gt; getKeyTypes(String ... keyTypes) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>        if ((keyTypes == null) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>                (keyTypes.length == 0) || (keyTypes[0] == null)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>        List&lt;KeyType&gt; list = new ArrayList&lt;&gt;(keyTypes.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>        for (String keyType : keyTypes) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>            list.add(new KeyType(keyType));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>        return list;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>     * Return the best alias that fits the given parameters.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>     * The algorithm we use is:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>     *   . scan through all the aliases in all builders in order</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>     *   . as soon as we find a perfect match, return</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>     *     (i.e. a match with a cert that has appropriate key usage,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>     *      qualified endpoint identity, and is not expired).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>     *   . if we do not find a perfect match, keep looping and remember</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>     *     the imperfect matches</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>     *   . at the end, sort the imperfect matches. we prefer expired certs</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>     *     with appropriate key usage to certs with the wrong key usage.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>     *     return the first one of them.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>    private String chooseAlias(List&lt;KeyType&gt; keyTypeList, Principal[] issuers,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>            CheckType checkType, AlgorithmConstraints constraints) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>        return chooseAlias(keyTypeList, issuers,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>                                    checkType, constraints, null, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>    private String chooseAlias(List&lt;KeyType&gt; keyTypeList, Principal[] issuers,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>            CheckType checkType, AlgorithmConstraints constraints,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>            List&lt;SNIServerName&gt; requestedServerNames, String idAlgorithm) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>        if (keyTypeList == null || keyTypeList.isEmpty()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>        Set&lt;Principal&gt; issuerSet = getIssuerSet(issuers);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>        List&lt;EntryStatus&gt; allResults = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>        for (int i = 0, n = builders.size(); i &lt; n; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>                List&lt;EntryStatus&gt; results = getAliases(i, keyTypeList,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>                            issuerSet, false, checkType, constraints,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>                            requestedServerNames, idAlgorithm);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>                if (results != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>                    // the results will either be a single perfect match</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>                    // or 1 or more imperfect matches</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>                    // if it's a perfect match, return immediately</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>                    EntryStatus status = results.get(0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>                    if (status.checkResult == CheckResult.OK) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>                        if (useDebug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>                            debug.println(&quot;KeyMgr: choosing key: &quot; + status);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>                        return makeAlias(status);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>                    if (allResults == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>                        allResults = new ArrayList&lt;EntryStatus&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>                    allResults.addAll(results);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>            } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>                // ignore</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>        if (allResults == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>            if (useDebug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>                debug.println(&quot;KeyMgr: no matching key found&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>        Collections.sort(allResults);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>        if (useDebug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>            debug.println(&quot;KeyMgr: no good matching key found, &quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>                        + &quot;returning best match out of:&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>            debug.println(allResults.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>        return makeAlias(allResults.get(0));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>     * Return all aliases that (approximately) fit the parameters.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>     * These are perfect matches plus imperfect matches (expired certificates</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>     * and certificates with the wrong extensions).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>     * The perfect matches will be first in the array.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>    public String[] getAliases(String keyType, Principal[] issuers,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>            CheckType checkType, AlgorithmConstraints constraints) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>        if (keyType == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>        Set&lt;Principal&gt; issuerSet = getIssuerSet(issuers);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>        List&lt;KeyType&gt; keyTypeList = getKeyTypes(keyType);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>        List&lt;EntryStatus&gt; allResults = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>        for (int i = 0, n = builders.size(); i &lt; n; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>                List&lt;EntryStatus&gt; results = getAliases(i, keyTypeList,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>                                    issuerSet, true, checkType, constraints,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>                                    null, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>                if (results != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>                    if (allResults == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>                        allResults = new ArrayList&lt;EntryStatus&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>                    allResults.addAll(results);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>            } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>                // ignore</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>        if (allResults == null || allResults.isEmpty()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>            if (useDebug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>                debug.println(&quot;KeyMgr: no matching alias found&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>        Collections.sort(allResults);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>        if (useDebug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>            debug.println(&quot;KeyMgr: getting aliases: &quot; + allResults);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>        return toAliases(allResults);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>    // turn candidate entries into unique aliases we can return to JSSE</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>    private String[] toAliases(List&lt;EntryStatus&gt; results) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>        String[] s = new String[results.size()];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>        int i = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>        for (EntryStatus result : results) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>            s[i++] = makeAlias(result);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>        return s;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>    // make a Set out of the array</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>    private Set&lt;Principal&gt; getIssuerSet(Principal[] issuers) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>        if ((issuers != null) &amp;&amp; (issuers.length != 0)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>            return new HashSet&lt;&gt;(Arrays.asList(issuers));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>    // a candidate match</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>    // identifies the entry by builder and alias</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>    // and includes the result of the certificate check</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>    private static class EntryStatus implements Comparable&lt;EntryStatus&gt; {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>        final int builderIndex;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>        final int keyIndex;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>        final String alias;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>        final CheckResult checkResult;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>        EntryStatus(int builderIndex, int keyIndex, String alias,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>                Certificate[] chain, CheckResult checkResult) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>            this.builderIndex = builderIndex;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>            this.keyIndex = keyIndex;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>            this.alias = alias;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>            this.checkResult = checkResult;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>        public int compareTo(EntryStatus other) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>            int result = this.checkResult.compareTo(other.checkResult);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>            return (result == 0) ? (this.keyIndex - other.keyIndex) : result;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>        public String toString() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>            String s = alias + &quot; (verified: &quot; + checkResult + &quot;)&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>            if (builderIndex == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>                return s;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>                return &quot;Builder #&quot; + builderIndex + &quot;, alias: &quot; + s;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre>    // enum for the type of certificate check we want to perform</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>    // (client or server)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>    // also includes the check code itself</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>    private static enum CheckType {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>        // enum constant for &quot;no check&quot; (currently not used)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>        NONE(Collections.&lt;String&gt;emptySet()),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>        // enum constant for &quot;tls client&quot; check</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>        // valid EKU for TLS client: any, tls_client</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>        CLIENT(new HashSet&lt;String&gt;(Arrays.asList(new String[] {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>            &quot;2.5.29.37.0&quot;, &quot;1.3.6.1.5.5.7.3.2&quot; }))),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>        // enum constant for &quot;tls server&quot; check</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>        // valid EKU for TLS server: any, tls_server, ns_sgc, ms_sgc</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>        SERVER(new HashSet&lt;String&gt;(Arrays.asList(new String[] {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>            &quot;2.5.29.37.0&quot;, &quot;1.3.6.1.5.5.7.3.1&quot;, &quot;2.16.840.1.113730.4.1&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>            &quot;1.3.6.1.4.1.311.10.3.3&quot; })));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>        // set of valid EKU values for this type</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>        final Set&lt;String&gt; validEku;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>        CheckType(Set&lt;String&gt; validEku) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>            this.validEku = validEku;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>        private static boolean getBit(boolean[] keyUsage, int bit) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>            return (bit &lt; keyUsage.length) &amp;&amp; keyUsage[bit];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>        // check if this certificate is appropriate for this type of use</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>        // first check extensions, if they match, check expiration</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>        // note: we may want to move this code into the sun.security.validator</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>        // package</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>        CheckResult check(X509Certificate cert, Date date,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>                List&lt;SNIServerName&gt; serverNames, String idAlgorithm) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>            if (this == NONE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>                return CheckResult.OK;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>            // check extensions</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>                // check extended key usage</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>                List&lt;String&gt; certEku = cert.getExtendedKeyUsage();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>                if ((certEku != null) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>                        Collections.disjoint(validEku, certEku)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>                    // if extension present and it does not contain any of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre>                    // the valid EKU OIDs, return extension_mismatch</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>                    return CheckResult.EXTENSION_MISMATCH;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>                // check key usage</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>                boolean[] ku = cert.getKeyUsage();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>                if (ku != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre>                    String algorithm = cert.getPublicKey().getAlgorithm();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>                    boolean kuSignature = getBit(ku, 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre>                    switch (algorithm) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>                        case &quot;RSA&quot;:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>                            // require either signature bit</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>                            // or if server also allow key encipherment bit</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>                            if (kuSignature == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>                                if ((this == CLIENT) || (getBit(ku, 2) == false)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>                                    return CheckResult.EXTENSION_MISMATCH;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>                            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>                        case &quot;DSA&quot;:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>                            // require signature bit</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>                            if (kuSignature == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>                                return CheckResult.EXTENSION_MISMATCH;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>                            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>                        case &quot;DH&quot;:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre>                            // require keyagreement bit</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre>                            if (getBit(ku, 4) == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>                                return CheckResult.EXTENSION_MISMATCH;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>                            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>                        case &quot;EC&quot;:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>                            // require signature bit</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>                            if (kuSignature == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>                                return CheckResult.EXTENSION_MISMATCH;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>                            // For servers, also require key agreement.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>                            // This is not totally accurate as the keyAgreement</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>                            // bit is only necessary for static ECDH key</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>                            // exchange and not ephemeral ECDH. We leave it in</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>                            // for now until there are signs that this check</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>                            // causes problems for real world EC certificates.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre>                            if ((this == SERVER) &amp;&amp; (getBit(ku, 4) == false)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>                                return CheckResult.EXTENSION_MISMATCH;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>                            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>            } catch (CertificateException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>                // extensions unparseable, return failure</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>                return CheckResult.EXTENSION_MISMATCH;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>                cert.checkValidity(date);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>            } catch (CertificateException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>                return CheckResult.EXPIRED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>            if (serverNames != null &amp;&amp; !serverNames.isEmpty()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre>                for (SNIServerName serverName : serverNames) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre>                    if (serverName.getType() ==</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>                                StandardConstants.SNI_HOST_NAME) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>                        if (!(serverName instanceof SNIHostName)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>                            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre>                                serverName =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>                                    new SNIHostName(serverName.getEncoded());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>                            } catch (IllegalArgumentException iae) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre>                                // unlikely to happen, just in case ...</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>                                if (useDebug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre>                                    debug.println(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>                                       &quot;Illegal server name: &quot; + serverName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>                                return CheckResult.INSENSITIVE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>                        String hostname =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>                                ((SNIHostName)serverName).getAsciiName();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>                        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>                            X509TrustManagerImpl.checkIdentity(hostname,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre>                                                        cert, idAlgorithm);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>                        } catch (CertificateException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>                            if (useDebug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>                                debug.println(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>                                   &quot;Certificate identity does not match &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>                                   &quot;Server Name Inidication (SNI): &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>                                   hostname);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>                            return CheckResult.INSENSITIVE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre>                        break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>            return CheckResult.OK;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>    // enum for the result of the extension check</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre>    // NOTE: the order of the constants is important as they are used</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>    // for sorting, i.e. OK is best, followed by EXPIRED and EXTENSION_MISMATCH</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre>    private static enum CheckResult {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>        OK,                     // ok or not checked</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>        INSENSITIVE,            // server name indication insensitive</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre>        EXPIRED,                // extensions valid but cert expired</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>        EXTENSION_MISMATCH,     // extensions invalid (expiration not checked)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre>     * Return a List of all candidate matches in the specified builder</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre>     * that fit the parameters.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre>     * We exclude entries in the KeyStore if they are not:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>     *  . private key entries</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>     *  . the certificates are not X509 certificates</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre>     *  . the algorithm of the key in the EE cert doesn't match one of keyTypes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre>     *  . none of the certs is issued by a Principal in issuerSet</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre>     * Using those entries would not be possible or they would almost</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>     * certainly be rejected by the peer.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre>     * In addition to those checks, we also check the extensions in the EE</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre>     * cert and its expiration. Even if there is a mismatch, we include</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>     * such certificates because they technically work and might be accepted</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre>     * by the peer. This leads to more graceful failure and better error</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre>     * messages if the cert expires from one day to the next.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>     * The return values are:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre>     *   . null, if there are no matching entries at all</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>     *   . if 'findAll' is 'false' and there is a perfect match, a List</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre>     *     with a single element (early return)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre>     *   . if 'findAll' is 'false' and there is NO perfect match, a List</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre>     *     with all the imperfect matches (expired, wrong extensions)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre>     *   . if 'findAll' is 'true', a List with all perfect and imperfect</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>     *     matches</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre>    private List&lt;EntryStatus&gt; getAliases(int builderIndex,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>            List&lt;KeyType&gt; keyTypes, Set&lt;Principal&gt; issuerSet,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre>            boolean findAll, CheckType checkType,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre>            AlgorithmConstraints constraints,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>            List&lt;SNIServerName&gt; requestedServerNames,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>            String idAlgorithm) throws Exception {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre>        Builder builder = builders.get(builderIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>        KeyStore ks = builder.getKeyStore();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre>        List&lt;EntryStatus&gt; results = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre>        Date date = verificationDate;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>        boolean preferred = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre>        for (Enumeration&lt;String&gt; e = ks.aliases(); e.hasMoreElements(); ) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre>            String alias = e.nextElement();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre>            // check if it is a key entry (private key or secret key)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre>            if (ks.isKeyEntry(alias) == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre>                continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="719" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="720" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="721" href="#"></a></td>
+<td><pre>            Certificate[] chain = ks.getCertificateChain(alias);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="722" href="#"></a></td>
+<td><pre>            if ((chain == null) || (chain.length == 0)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="723" href="#"></a></td>
+<td><pre>                // must be secret key entry, ignore</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="724" href="#"></a></td>
+<td><pre>                continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="725" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="726" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="727" href="#"></a></td>
+<td><pre>            boolean incompatible = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="728" href="#"></a></td>
+<td><pre>            for (Certificate cert : chain) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="729" href="#"></a></td>
+<td><pre>                if (cert instanceof X509Certificate == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="730" href="#"></a></td>
+<td><pre>                    // not an X509Certificate, ignore this alias</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="731" href="#"></a></td>
+<td><pre>                    incompatible = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="732" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="733" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="734" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="735" href="#"></a></td>
+<td><pre>            if (incompatible) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="736" href="#"></a></td>
+<td><pre>                continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="737" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="738" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="739" href="#"></a></td>
+<td><pre>            // check keytype</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="740" href="#"></a></td>
+<td><pre>            int keyIndex = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="741" href="#"></a></td>
+<td><pre>            int j = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="742" href="#"></a></td>
+<td><pre>            for (KeyType keyType : keyTypes) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="743" href="#"></a></td>
+<td><pre>                if (keyType.matches(chain)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="744" href="#"></a></td>
+<td><pre>                    keyIndex = j;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="745" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="746" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="747" href="#"></a></td>
+<td><pre>                j++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="748" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="749" href="#"></a></td>
+<td><pre>            if (keyIndex == -1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="750" href="#"></a></td>
+<td><pre>                if (useDebug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="751" href="#"></a></td>
+<td><pre>                    debug.println(&quot;Ignoring alias &quot; + alias</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="752" href="#"></a></td>
+<td><pre>                                + &quot;: key algorithm does not match&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="753" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="754" href="#"></a></td>
+<td><pre>                continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="755" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="756" href="#"></a></td>
+<td><pre>            // check issuers</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="757" href="#"></a></td>
+<td><pre>            if (issuerSet != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="758" href="#"></a></td>
+<td><pre>                boolean found = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="759" href="#"></a></td>
+<td><pre>                for (Certificate cert : chain) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="760" href="#"></a></td>
+<td><pre>                    X509Certificate xcert = (X509Certificate)cert;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="761" href="#"></a></td>
+<td><pre>                    if (issuerSet.contains(xcert.getIssuerX500Principal())) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="762" href="#"></a></td>
+<td><pre>                        found = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="763" href="#"></a></td>
+<td><pre>                        break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="764" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="765" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="766" href="#"></a></td>
+<td><pre>                if (found == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="767" href="#"></a></td>
+<td><pre>                    if (useDebug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="768" href="#"></a></td>
+<td><pre>                        debug.println(&quot;Ignoring alias &quot; + alias</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="769" href="#"></a></td>
+<td><pre>                                    + &quot;: issuers do not match&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="770" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="771" href="#"></a></td>
+<td><pre>                    continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="772" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="773" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="774" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="775" href="#"></a></td>
+<td><pre>            // check the algorithm constraints</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="776" href="#"></a></td>
+<td><pre>            if (constraints != null &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="777" href="#"></a></td>
+<td><pre>                    !conformsToAlgorithmConstraints(constraints, chain)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="778" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="779" href="#"></a></td>
+<td><pre>                if (useDebug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="780" href="#"></a></td>
+<td><pre>                    debug.println(&quot;Ignoring alias &quot; + alias +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="781" href="#"></a></td>
+<td><pre>                            &quot;: certificate list does not conform to &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="782" href="#"></a></td>
+<td><pre>                            &quot;algorithm constraints&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="783" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="784" href="#"></a></td>
+<td><pre>                continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="785" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="786" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="787" href="#"></a></td>
+<td><pre>            if (date == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="788" href="#"></a></td>
+<td><pre>                date = new Date();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="789" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="790" href="#"></a></td>
+<td><pre>            CheckResult checkResult =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="791" href="#"></a></td>
+<td><pre>                    checkType.check((X509Certificate)chain[0], date,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="792" href="#"></a></td>
+<td><pre>                                    requestedServerNames, idAlgorithm);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="793" href="#"></a></td>
+<td><pre>            EntryStatus status =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="794" href="#"></a></td>
+<td><pre>                    new EntryStatus(builderIndex, keyIndex,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="795" href="#"></a></td>
+<td><pre>                                        alias, chain, checkResult);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="796" href="#"></a></td>
+<td><pre>            if (!preferred &amp;&amp; checkResult == CheckResult.OK &amp;&amp; keyIndex == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="797" href="#"></a></td>
+<td><pre>                preferred = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="798" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="799" href="#"></a></td>
+<td><pre>            if (preferred &amp;&amp; (findAll == false)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="800" href="#"></a></td>
+<td><pre>                // if we have a good match and do not need all matches,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="801" href="#"></a></td>
+<td><pre>                // return immediately</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="802" href="#"></a></td>
+<td><pre>                return Collections.singletonList(status);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="803" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="804" href="#"></a></td>
+<td><pre>                if (results == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="805" href="#"></a></td>
+<td><pre>                    results = new ArrayList&lt;EntryStatus&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="806" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="807" href="#"></a></td>
+<td><pre>                results.add(status);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="808" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="809" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="810" href="#"></a></td>
+<td><pre>        return results;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="811" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="812" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="813" href="#"></a></td>
+<td><pre>    private static boolean conformsToAlgorithmConstraints(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="814" href="#"></a></td>
+<td><pre>            AlgorithmConstraints constraints, Certificate[] chain) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="815" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="816" href="#"></a></td>
+<td><pre>        AlgorithmChecker checker = new AlgorithmChecker(constraints);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="817" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="818" href="#"></a></td>
+<td><pre>            checker.init(false);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="819" href="#"></a></td>
+<td><pre>        } catch (CertPathValidatorException cpve) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="820" href="#"></a></td>
+<td><pre>            // unlikely to happen</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="821" href="#"></a></td>
+<td><pre>            return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="822" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="823" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="824" href="#"></a></td>
+<td><pre>        // It is a forward checker, so we need to check from trust to target.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="825" href="#"></a></td>
+<td><pre>        for (int i = chain.length - 1; i &gt;= 0; i--) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="826" href="#"></a></td>
+<td><pre>            Certificate cert = chain[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="827" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="828" href="#"></a></td>
+<td><pre>                // We don't care about the unresolved critical extensions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="829" href="#"></a></td>
+<td><pre>                checker.check(cert, Collections.&lt;String&gt;emptySet());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="830" href="#"></a></td>
+<td><pre>            } catch (CertPathValidatorException cpve) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="831" href="#"></a></td>
+<td><pre>                return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="832" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="833" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="834" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="835" href="#"></a></td>
+<td><pre>        return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="836" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="837" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="838" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

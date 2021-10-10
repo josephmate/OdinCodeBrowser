@@ -3,834 +3,3315 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2003, 2014, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package sun.security.provider.certpath;
-
-import java.io.*;
-import java.security.*;
-import java.security.cert.CertificateException;
-import java.security.cert.CertificateParsingException;
-import java.security.cert.CertPathValidatorException;
-import java.security.cert.CertPathValidatorException.BasicReason;
-import java.security.cert.CRLReason;
-import java.security.cert.TrustAnchor;
-import java.security.cert.X509Certificate;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import javax.security.auth.x500.X500Principal;
-
-import sun.misc.HexDumpEncoder;
-import sun.security.action.GetIntegerAction;
-import sun.security.x509.*;
-import sun.security.util.*;
-
-/**
- * This class is used to process an OCSP response.
- * The OCSP Response is defined
- * in RFC 2560 and the ASN.1 encoding is as follows:
- * &lt;pre&gt;
- *
- *  OCSPResponse ::= SEQUENCE {
- *      responseStatus         OCSPResponseStatus,
- *      responseBytes          [0] EXPLICIT ResponseBytes OPTIONAL }
- *
- *   OCSPResponseStatus ::= ENUMERATED {
- *       successful            (0),  --Response has valid confirmations
- *       malformedRequest      (1),  --Illegal confirmation request
- *       internalError         (2),  --Internal error in issuer
- *       tryLater              (3),  --Try again later
- *                                   --(4) is not used
- *       sigRequired           (5),  --Must sign the request
- *       unauthorized          (6)   --Request unauthorized
- *   }
- *
- *   ResponseBytes ::=       SEQUENCE {
- *       responseType   OBJECT IDENTIFIER,
- *       response       OCTET STRING }
- *
- *   BasicOCSPResponse       ::= SEQUENCE {
- *      tbsResponseData      ResponseData,
- *      signatureAlgorithm   AlgorithmIdentifier,
- *      signature            BIT STRING,
- *      certs                [0] EXPLICIT SEQUENCE OF Certificate OPTIONAL }
- *
- *   The value for signature SHALL be computed on the hash of the DER
- *   encoding ResponseData.
- *
- *   ResponseData ::= SEQUENCE {
- *      version              [0] EXPLICIT Version DEFAULT v1,
- *      responderID              ResponderID,
- *      producedAt               GeneralizedTime,
- *      responses                SEQUENCE OF SingleResponse,
- *      responseExtensions   [1] EXPLICIT Extensions OPTIONAL }
- *
- *   ResponderID ::= CHOICE {
- *      byName               [1] Name,
- *      byKey                [2] KeyHash }
- *
- *   KeyHash ::= OCTET STRING -- SHA-1 hash of responder's public key
- *   (excluding the tag and length fields)
- *
- *   SingleResponse ::= SEQUENCE {
- *      certID                       CertID,
- *      certStatus                   CertStatus,
- *      thisUpdate                   GeneralizedTime,
- *      nextUpdate         [0]       EXPLICIT GeneralizedTime OPTIONAL,
- *      singleExtensions   [1]       EXPLICIT Extensions OPTIONAL }
- *
- *   CertStatus ::= CHOICE {
- *       good        [0]     IMPLICIT NULL,
- *       revoked     [1]     IMPLICIT RevokedInfo,
- *       unknown     [2]     IMPLICIT UnknownInfo }
- *
- *   RevokedInfo ::= SEQUENCE {
- *       revocationTime              GeneralizedTime,
- *       revocationReason    [0]     EXPLICIT CRLReason OPTIONAL }
- *
- *   UnknownInfo ::= NULL -- this can be replaced with an enumeration
- *
- * &lt;/pre&gt;
- *
- * @author      Ram Marti
- */
-
-public final class OCSPResponse {
-
-    public enum ResponseStatus {
-        SUCCESSFUL,            // Response has valid confirmations
-        MALFORMED_REQUEST,     // Illegal request
-        INTERNAL_ERROR,        // Internal error in responder
-        TRY_LATER,             // Try again later
-        UNUSED,                // is not used
-        SIG_REQUIRED,          // Must sign the request
-        UNAUTHORIZED           // Request unauthorized
-    };
-    private static ResponseStatus[] rsvalues = ResponseStatus.values();
-
-    private static final Debug debug = Debug.getInstance(&quot;certpath&quot;);
-    private static final boolean dump = debug != null &amp;&amp; Debug.isOn(&quot;ocsp&quot;);
-    private static final ObjectIdentifier OCSP_BASIC_RESPONSE_OID =
-        ObjectIdentifier.newInternal(new int[] { 1, 3, 6, 1, 5, 5, 7, 48, 1, 1});
-    private static final int CERT_STATUS_GOOD = 0;
-    private static final int CERT_STATUS_REVOKED = 1;
-    private static final int CERT_STATUS_UNKNOWN = 2;
-
-    // ResponderID CHOICE tags
-    private static final int NAME_TAG = 1;
-    private static final int KEY_TAG = 2;
-
-    // Object identifier for the OCSPSigning key purpose
-    private static final String KP_OCSP_SIGNING_OID = &quot;1.3.6.1.5.5.7.3.9&quot;;
-
-    // Default maximum clock skew in milliseconds (15 minutes)
-    // allowed when checking validity of OCSP responses
-    private static final int DEFAULT_MAX_CLOCK_SKEW = 900000;
-
-    /**
-     * Integer value indicating the maximum allowable clock skew, in seconds,
-     * to be used for the OCSP check.
-     */
-    private static final int MAX_CLOCK_SKEW = initializeClockSkew();
-
-    /**
-     * Initialize the maximum allowable clock skew by getting the OCSP
-     * clock skew system property. If the property has not been set, or if its
-     * value is negative, set the skew to the default.
-     */
-    private static int initializeClockSkew() {
-        Integer tmp = java.security.AccessController.doPrivileged(
-                new GetIntegerAction(&quot;com.sun.security.ocsp.clockSkew&quot;));
-        if (tmp == null || tmp &lt; 0) {
-            return DEFAULT_MAX_CLOCK_SKEW;
-        }
-        // Convert to milliseconds, as the system property will be
-        // specified in seconds
-        return tmp * 1000;
-    }
-
-    // an array of all of the CRLReasons (used in SingleResponse)
-    private static CRLReason[] values = CRLReason.values();
-
-    private final ResponseStatus responseStatus;
-    private final Map&lt;CertId, SingleResponse&gt; singleResponseMap;
-    private final AlgorithmId sigAlgId;
-    private final byte[] signature;
-    private final byte[] tbsResponseData;
-    private final byte[] responseNonce;
-    private List&lt;X509CertImpl&gt; certs;
-    private X509CertImpl signerCert = null;
-    private X500Principal responderName = null;
-    private KeyIdentifier responderKeyId = null;
-
-    /*
-     * Create an OCSP response from its ASN.1 DER encoding.
-     */
-    OCSPResponse(byte[] bytes) throws IOException {
-        if (dump) {
-            HexDumpEncoder hexEnc = new HexDumpEncoder();
-            debug.println(&quot;OCSPResponse bytes...\n\n&quot; +
-                hexEnc.encode(bytes) + &quot;\n&quot;);
-        }
-        DerValue der = new DerValue(bytes);
-        if (der.tag != DerValue.tag_Sequence) {
-            throw new IOException(&quot;Bad encoding in OCSP response: &quot; +
-                &quot;expected ASN.1 SEQUENCE tag.&quot;);
-        }
-        DerInputStream derIn = der.getData();
-
-        // responseStatus
-        int status = derIn.getEnumerated();
-        if (status &gt;= 0 &amp;&amp; status &lt; rsvalues.length) {
-            responseStatus = rsvalues[status];
-        } else {
-            // unspecified responseStatus
-            throw new IOException(&quot;Unknown OCSPResponse status: &quot; + status);
-        }
-        if (debug != null) {
-            debug.println(&quot;OCSP response status: &quot; + responseStatus);
-        }
-        if (responseStatus != ResponseStatus.SUCCESSFUL) {
-            // no need to continue, responseBytes are not set.
-            singleResponseMap = Collections.emptyMap();
-            certs = new ArrayList&lt;X509CertImpl&gt;();
-            sigAlgId = null;
-            signature = null;
-            tbsResponseData = null;
-            responseNonce = null;
-            return;
-        }
-
-        // responseBytes
-        der = derIn.getDerValue();
-        if (!der.isContextSpecific((byte)0)) {
-            throw new IOException(&quot;Bad encoding in responseBytes element &quot; +
-                &quot;of OCSP response: expected ASN.1 context specific tag 0.&quot;);
-        }
-        DerValue tmp = der.data.getDerValue();
-        if (tmp.tag != DerValue.tag_Sequence) {
-            throw new IOException(&quot;Bad encoding in responseBytes element &quot; +
-                &quot;of OCSP response: expected ASN.1 SEQUENCE tag.&quot;);
-        }
-
-        // responseType
-        derIn = tmp.data;
-        ObjectIdentifier responseType = derIn.getOID();
-        if (responseType.equals((Object)OCSP_BASIC_RESPONSE_OID)) {
-            if (debug != null) {
-                debug.println(&quot;OCSP response type: basic&quot;);
-            }
-        } else {
-            if (debug != null) {
-                debug.println(&quot;OCSP response type: &quot; + responseType);
-            }
-            throw new IOException(&quot;Unsupported OCSP response type: &quot; +
-                                  responseType);
-        }
-
-        // BasicOCSPResponse
-        DerInputStream basicOCSPResponse =
-            new DerInputStream(derIn.getOctetString());
-
-        DerValue[] seqTmp = basicOCSPResponse.getSequence(2);
-        if (seqTmp.length &lt; 3) {
-            throw new IOException(&quot;Unexpected BasicOCSPResponse value&quot;);
-        }
-
-        DerValue responseData = seqTmp[0];
-
-        // Need the DER encoded ResponseData to verify the signature later
-        tbsResponseData = seqTmp[0].toByteArray();
-
-        // tbsResponseData
-        if (responseData.tag != DerValue.tag_Sequence) {
-            throw new IOException(&quot;Bad encoding in tbsResponseData &quot; +
-                &quot;element of OCSP response: expected ASN.1 SEQUENCE tag.&quot;);
-        }
-        DerInputStream seqDerIn = responseData.data;
-        DerValue seq = seqDerIn.getDerValue();
-
-        // version
-        if (seq.isContextSpecific((byte)0)) {
-            // seq[0] is version
-            if (seq.isConstructed() &amp;&amp; seq.isContextSpecific()) {
-                //System.out.println (&quot;version is available&quot;);
-                seq = seq.data.getDerValue();
-                int version = seq.getInteger();
-                if (seq.data.available() != 0) {
-                    throw new IOException(&quot;Bad encoding in version &quot; +
-                        &quot; element of OCSP response: bad format&quot;);
-                }
-                seq = seqDerIn.getDerValue();
-            }
-        }
-
-        // responderID
-        short tag = (byte)(seq.tag &amp; 0x1f);
-        if (tag == NAME_TAG) {
-            responderName = new X500Principal(seq.getData().toByteArray());
-            if (debug != null) {
-                debug.println(&quot;Responder's name: &quot; + responderName);
-            }
-        } else if (tag == KEY_TAG) {
-            responderKeyId = new KeyIdentifier(seq.getData().getOctetString());
-            if (debug != null) {
-                debug.println(&quot;Responder's key ID: &quot; +
-                    Debug.toString(responderKeyId.getIdentifier()));
-            }
-        } else {
-            throw new IOException(&quot;Bad encoding in responderID element of &quot; +
-                &quot;OCSP response: expected ASN.1 context specific tag 0 or 1&quot;);
-        }
-
-        // producedAt
-        seq = seqDerIn.getDerValue();
-        if (debug != null) {
-            Date producedAtDate = seq.getGeneralizedTime();
-            debug.println(&quot;OCSP response produced at: &quot; + producedAtDate);
-        }
-
-        // responses
-        DerValue[] singleResponseDer = seqDerIn.getSequence(1);
-        singleResponseMap = new HashMap&lt;&gt;(singleResponseDer.length);
-        if (debug != null) {
-            debug.println(&quot;OCSP number of SingleResponses: &quot;
-                          + singleResponseDer.length);
-        }
-        for (int i = 0; i &lt; singleResponseDer.length; i++) {
-            SingleResponse singleResponse =
-                new SingleResponse(singleResponseDer[i]);
-            singleResponseMap.put(singleResponse.getCertId(), singleResponse);
-        }
-
-        // responseExtensions
-        byte[] nonce = null;
-        if (seqDerIn.available() &gt; 0) {
-            seq = seqDerIn.getDerValue();
-            if (seq.isContextSpecific((byte)1)) {
-                DerValue[] responseExtDer = seq.data.getSequence(3);
-                for (int i = 0; i &lt; responseExtDer.length; i++) {
-                    Extension ext = new Extension(responseExtDer[i]);
-                    if (debug != null) {
-                        debug.println(&quot;OCSP extension: &quot; + ext);
-                    }
-                    // Only the NONCE extension is recognized
-                    if (ext.getExtensionId().equals((Object)
-                        OCSP.NONCE_EXTENSION_OID))
-                    {
-                        nonce = ext.getExtensionValue();
-                    } else if (ext.isCritical())  {
-                        throw new IOException(
-                            &quot;Unsupported OCSP critical extension: &quot; +
-                            ext.getExtensionId());
-                    }
-                }
-            }
-        }
-        responseNonce = nonce;
-
-        // signatureAlgorithmId
-        sigAlgId = AlgorithmId.parse(seqTmp[1]);
-
-        // signature
-        signature = seqTmp[2].getBitString();
-
-        // if seq[3] is available , then it is a sequence of certificates
-        if (seqTmp.length &gt; 3) {
-            // certs are available
-            DerValue seqCert = seqTmp[3];
-            if (!seqCert.isContextSpecific((byte)0)) {
-                throw new IOException(&quot;Bad encoding in certs element of &quot; +
-                    &quot;OCSP response: expected ASN.1 context specific tag 0.&quot;);
-            }
-            DerValue[] derCerts = seqCert.getData().getSequence(3);
-            certs = new ArrayList&lt;X509CertImpl&gt;(derCerts.length);
-            try {
-                for (int i = 0; i &lt; derCerts.length; i++) {
-                    X509CertImpl cert =
-                        new X509CertImpl(derCerts[i].toByteArray());
-                    certs.add(cert);
-
-                    if (debug != null) {
-                        debug.println(&quot;OCSP response cert #&quot; + (i + 1) + &quot;: &quot; +
-                            cert.getSubjectX500Principal());
-                    }
-                }
-            } catch (CertificateException ce) {
-                throw new IOException(&quot;Bad encoding in X509 Certificate&quot;, ce);
-            }
-        } else {
-            certs = new ArrayList&lt;X509CertImpl&gt;();
-        }
-    }
-
-    void verify(List&lt;CertId&gt; certIds, X509Certificate issuerCert,
-                X509Certificate responderCert, Date date, byte[] nonce)
-        throws CertPathValidatorException
-    {
-        switch (responseStatus) {
-            case SUCCESSFUL:
-                break;
-            case TRY_LATER:
-            case INTERNAL_ERROR:
-                throw new CertPathValidatorException(
-                    &quot;OCSP response error: &quot; + responseStatus, null, null, -1,
-                    BasicReason.UNDETERMINED_REVOCATION_STATUS);
-            case UNAUTHORIZED:
-            default:
-                throw new CertPathValidatorException(&quot;OCSP response error: &quot; +
-                                                     responseStatus);
-        }
-
-        // Check that the response includes a response for all of the
-        // certs that were supplied in the request
-        for (CertId certId : certIds) {
-            SingleResponse sr = getSingleResponse(certId);
-            if (sr == null) {
-                if (debug != null) {
-                    debug.println(&quot;No response found for CertId: &quot; + certId);
-                }
-                throw new CertPathValidatorException(
-                    &quot;OCSP response does not include a response for a &quot; +
-                    &quot;certificate supplied in the OCSP request&quot;);
-            }
-            if (debug != null) {
-                debug.println(&quot;Status of certificate (with serial number &quot; +
-                    certId.getSerialNumber() + &quot;) is: &quot; + sr.getCertStatus());
-            }
-        }
-
-        // Locate the signer cert
-        if (signerCert == null) {
-            // Add the Issuing CA cert and/or Trusted Responder cert to the list
-            // of certs from the OCSP response
-            try {
-                certs.add(X509CertImpl.toImpl(issuerCert));
-                if (responderCert != null) {
-                    certs.add(X509CertImpl.toImpl(responderCert));
-                }
-            } catch (CertificateException ce) {
-                throw new CertPathValidatorException(
-                    &quot;Invalid issuer or trusted responder certificate&quot;, ce);
-            }
-
-            if (responderName != null) {
-                for (X509CertImpl cert : certs) {
-                    if (cert.getSubjectX500Principal().equals(responderName)) {
-                        signerCert = cert;
-                        break;
-                    }
-                }
-            } else if (responderKeyId != null) {
-                for (X509CertImpl cert : certs) {
-                    // Match responder's key identifier against the cert's SKID
-                    // This will match if the SKID is encoded using the 160-bit
-                    // SHA-1 hash method as defined in RFC 5280.
-                    KeyIdentifier certKeyId = cert.getSubjectKeyId();
-                    if (certKeyId != null &amp;&amp; responderKeyId.equals(certKeyId)) {
-                        signerCert = cert;
-                        break;
-                    } else {
-                        // The certificate does not have a SKID or may have
-                        // been using a different algorithm (ex: see RFC 7093).
-                        // Check if the responder's key identifier matches
-                        // against a newly generated key identifier of the
-                        // cert's public key using the 160-bit SHA-1 method.
-                        try {
-                            certKeyId = new KeyIdentifier(cert.getPublicKey());
-                        } catch (IOException e) {
-                            // ignore
-                        }
-                        if (responderKeyId.equals(certKeyId)) {
-                            signerCert = cert;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check whether the signer cert returned by the responder is trusted
-        if (signerCert != null) {
-            // Check if the response is signed by the issuing CA
-            if (signerCert.equals(issuerCert)) {
-                if (debug != null) {
-                    debug.println(&quot;OCSP response is signed by the target's &quot; +
-                        &quot;Issuing CA&quot;);
-                }
-                // cert is trusted, now verify the signed response
-
-            // Check if the response is signed by a trusted responder
-            } else if (signerCert.equals(responderCert)) {
-                if (debug != null) {
-                    debug.println(&quot;OCSP response is signed by a Trusted &quot; +
-                        &quot;Responder&quot;);
-                }
-                // cert is trusted, now verify the signed response
-
-            // Check if the response is signed by an authorized responder
-            } else if (signerCert.getIssuerX500Principal().equals(
-                       issuerCert.getSubjectX500Principal())) {
-
-                // Check for the OCSPSigning key purpose
-                try {
-                    List&lt;String&gt; keyPurposes = signerCert.getExtendedKeyUsage();
-                    if (keyPurposes == null ||
-                        !keyPurposes.contains(KP_OCSP_SIGNING_OID)) {
-                        throw new CertPathValidatorException(
-                            &quot;Responder's certificate not valid for signing &quot; +
-                            &quot;OCSP responses&quot;);
-                    }
-                } catch (CertificateParsingException cpe) {
-                    // assume cert is not valid for signing
-                    throw new CertPathValidatorException(
-                        &quot;Responder's certificate not valid for signing &quot; +
-                        &quot;OCSP responses&quot;, cpe);
-                }
-
-                // Check algorithm constraints specified in security property
-                // &quot;jdk.certpath.disabledAlgorithms&quot;.
-                AlgorithmChecker algChecker = new AlgorithmChecker(
-                                    new TrustAnchor(issuerCert, null));
-                algChecker.init(false);
-                algChecker.check(signerCert, Collections.&lt;String&gt;emptySet());
-
-                // check the validity
-                try {
-                    if (date == null) {
-                        signerCert.checkValidity();
-                    } else {
-                        signerCert.checkValidity(date);
-                    }
-                } catch (CertificateException e) {
-                    throw new CertPathValidatorException(
-                        &quot;Responder's certificate not within the &quot; +
-                        &quot;validity period&quot;, e);
-                }
-
-                // check for revocation
-                //
-                // A CA may specify that an OCSP client can trust a
-                // responder for the lifetime of the responder's
-                // certificate. The CA does so by including the
-                // extension id-pkix-ocsp-nocheck.
-                //
-                Extension noCheck =
-                    signerCert.getExtension(PKIXExtensions.OCSPNoCheck_Id);
-                if (noCheck != null) {
-                    if (debug != null) {
-                        debug.println(&quot;Responder's certificate includes &quot; +
-                            &quot;the extension id-pkix-ocsp-nocheck.&quot;);
-                    }
-                } else {
-                    // we should do the revocation checking of the
-                    // authorized responder in a future update.
-                }
-
-                // verify the signature
-                try {
-                    signerCert.verify(issuerCert.getPublicKey());
-                    if (debug != null) {
-                        debug.println(&quot;OCSP response is signed by an &quot; +
-                            &quot;Authorized Responder&quot;);
-                    }
-                    // cert is trusted, now verify the signed response
-
-                } catch (GeneralSecurityException e) {
-                    signerCert = null;
-                }
-            } else {
-                throw new CertPathValidatorException(
-                    &quot;Responder's certificate is not authorized to sign &quot; +
-                    &quot;OCSP responses&quot;);
-            }
-        }
-
-        // Confirm that the signed response was generated using the public
-        // key from the trusted responder cert
-        if (signerCert != null) {
-            // Check algorithm constraints specified in security property
-            // &quot;jdk.certpath.disabledAlgorithms&quot;.
-            AlgorithmChecker.check(signerCert.getPublicKey(), sigAlgId);
-
-            if (!verifySignature(signerCert)) {
-                throw new CertPathValidatorException(
-                    &quot;Error verifying OCSP Response's signature&quot;);
-            }
-        } else {
-            // Need responder's cert in order to verify the signature
-            throw new CertPathValidatorException(
-                &quot;Unable to verify OCSP Response's signature&quot;);
-        }
-
-        // Check freshness of OCSPResponse
-        if (nonce != null) {
-            if (responseNonce != null &amp;&amp; !Arrays.equals(nonce, responseNonce)) {
-                throw new CertPathValidatorException(&quot;Nonces don't match&quot;);
-            }
-        }
-
-        long now = (date == null) ? System.currentTimeMillis() : date.getTime();
-        Date nowPlusSkew = new Date(now + MAX_CLOCK_SKEW);
-        Date nowMinusSkew = new Date(now - MAX_CLOCK_SKEW);
-        for (SingleResponse sr : singleResponseMap.values()) {
-            if (debug != null) {
-                String until = &quot;&quot;;
-                if (sr.nextUpdate != null) {
-                    until = &quot; until &quot; + sr.nextUpdate;
-                }
-                debug.println(&quot;Response's validity interval is from &quot; +
-                              sr.thisUpdate + until);
-            }
-
-            // Check that the test date is within the validity interval
-            if ((sr.thisUpdate != null &amp;&amp; nowPlusSkew.before(sr.thisUpdate)) ||
-                (sr.nextUpdate != null &amp;&amp; nowMinusSkew.after(sr.nextUpdate)))
-            {
-                throw new CertPathValidatorException(
-                                      &quot;Response is unreliable: its validity &quot; +
-                                      &quot;interval is out-of-date&quot;);
-            }
-        }
-    }
-
-    /**
-     * Returns the OCSP ResponseStatus.
-     */
-    ResponseStatus getResponseStatus() {
-        return responseStatus;
-    }
-
-    /*
-     * Verify the signature of the OCSP response.
-     */
-    private boolean verifySignature(X509Certificate cert)
-        throws CertPathValidatorException {
-
-        try {
-            Signature respSignature = Signature.getInstance(sigAlgId.getName());
-            respSignature.initVerify(cert.getPublicKey());
-            respSignature.update(tbsResponseData);
-
-            if (respSignature.verify(signature)) {
-                if (debug != null) {
-                    debug.println(&quot;Verified signature of OCSP Response&quot;);
-                }
-                return true;
-
-            } else {
-                if (debug != null) {
-                    debug.println(
-                        &quot;Error verifying signature of OCSP Response&quot;);
-                }
-                return false;
-            }
-        } catch (InvalidKeyException | NoSuchAlgorithmException |
-                 SignatureException e)
-        {
-            throw new CertPathValidatorException(e);
-        }
-    }
-
-    /**
-     * Returns the SingleResponse of the specified CertId, or null if
-     * there is no response for that CertId.
-     */
-    SingleResponse getSingleResponse(CertId certId) {
-        return singleResponseMap.get(certId);
-    }
-
-    /*
-     * Returns the certificate for the authority that signed the OCSP response.
-     */
-    X509Certificate getSignerCertificate() {
-        return signerCert; // set in verify()
-    }
-
-    /*
-     * A class representing a single OCSP response.
-     */
-    final static class SingleResponse implements OCSP.RevocationStatus {
-        private final CertId certId;
-        private final CertStatus certStatus;
-        private final Date thisUpdate;
-        private final Date nextUpdate;
-        private final Date revocationTime;
-        private final CRLReason revocationReason;
-        private final Map&lt;String, java.security.cert.Extension&gt; singleExtensions;
-
-        private SingleResponse(DerValue der) throws IOException {
-            if (der.tag != DerValue.tag_Sequence) {
-                throw new IOException(&quot;Bad ASN.1 encoding in SingleResponse&quot;);
-            }
-            DerInputStream tmp = der.data;
-
-            certId = new CertId(tmp.getDerValue().data);
-            DerValue derVal = tmp.getDerValue();
-            short tag = (byte)(derVal.tag &amp; 0x1f);
-            if (tag ==  CERT_STATUS_REVOKED) {
-                certStatus = CertStatus.REVOKED;
-                revocationTime = derVal.data.getGeneralizedTime();
-                if (derVal.data.available() != 0) {
-                    DerValue dv = derVal.data.getDerValue();
-                    tag = (byte)(dv.tag &amp; 0x1f);
-                    if (tag == 0) {
-                        int reason = dv.data.getEnumerated();
-                        // if reason out-of-range just leave as UNSPECIFIED
-                        if (reason &gt;= 0 &amp;&amp; reason &lt; values.length) {
-                            revocationReason = values[reason];
-                        } else {
-                            revocationReason = CRLReason.UNSPECIFIED;
-                        }
-                    } else {
-                        revocationReason = CRLReason.UNSPECIFIED;
-                    }
-                } else {
-                    revocationReason = CRLReason.UNSPECIFIED;
-                }
-                // RevokedInfo
-                if (debug != null) {
-                    debug.println(&quot;Revocation time: &quot; + revocationTime);
-                    debug.println(&quot;Revocation reason: &quot; + revocationReason);
-                }
-            } else {
-                revocationTime = null;
-                revocationReason = CRLReason.UNSPECIFIED;
-                if (tag == CERT_STATUS_GOOD) {
-                    certStatus = CertStatus.GOOD;
-                } else if (tag == CERT_STATUS_UNKNOWN) {
-                    certStatus = CertStatus.UNKNOWN;
-                } else {
-                    throw new IOException(&quot;Invalid certificate status&quot;);
-                }
-            }
-
-            thisUpdate = tmp.getGeneralizedTime();
-
-            if (tmp.available() == 0)  {
-                // we are done
-                nextUpdate = null;
-            } else {
-                derVal = tmp.getDerValue();
-                tag = (byte)(derVal.tag &amp; 0x1f);
-                if (tag == 0) {
-                    // next update
-                    nextUpdate = derVal.data.getGeneralizedTime();
-
-                    if (tmp.available() == 0)  {
-                        // we are done
-                    } else {
-                        derVal = tmp.getDerValue();
-                        tag = (byte)(derVal.tag &amp; 0x1f);
-                    }
-                } else {
-                    nextUpdate = null;
-                }
-            }
-            // singleExtensions
-            if (tmp.available() &gt; 0) {
-                derVal = tmp.getDerValue();
-                if (derVal.isContextSpecific((byte)1)) {
-                    DerValue[] singleExtDer = derVal.data.getSequence(3);
-                    singleExtensions =
-                        new HashMap&lt;String, java.security.cert.Extension&gt;
-                            (singleExtDer.length);
-                    for (int i = 0; i &lt; singleExtDer.length; i++) {
-                        Extension ext = new Extension(singleExtDer[i]);
-                        if (debug != null) {
-                            debug.println(&quot;OCSP single extension: &quot; + ext);
-                        }
-                        // We don't support any extensions yet. Therefore, if it
-                        // is critical we must throw an exception because we
-                        // don't know how to process it.
-                        if (ext.isCritical()) {
-                            throw new IOException(
-                                &quot;Unsupported OCSP critical extension: &quot; +
-                                ext.getExtensionId());
-                        }
-                        singleExtensions.put(ext.getId(), ext);
-                    }
-                } else {
-                    singleExtensions = Collections.emptyMap();
-                }
-            } else {
-                singleExtensions = Collections.emptyMap();
-            }
-        }
-
-        /*
-         * Return the certificate's revocation status code
-         */
-        @Override public CertStatus getCertStatus() {
-            return certStatus;
-        }
-
-        private CertId getCertId() {
-            return certId;
-        }
-
-        @Override public Date getRevocationTime() {
-            return (Date) revocationTime.clone();
-        }
-
-        @Override public CRLReason getRevocationReason() {
-            return revocationReason;
-        }
-
-        @Override
-        public Map&lt;String, java.security.cert.Extension&gt; getSingleExtensions() {
-            return Collections.unmodifiableMap(singleExtensions);
-        }
-
-        /**
-         * Construct a string representation of a single OCSP response.
-         */
-        @Override public String toString() {
-            StringBuilder sb = new StringBuilder();
-            sb.append(&quot;SingleResponse:  \n&quot;);
-            sb.append(certId);
-            sb.append(&quot;\nCertStatus: &quot;+ certStatus + &quot;\n&quot;);
-            if (certStatus == CertStatus.REVOKED) {
-                sb.append(&quot;revocationTime is &quot; + revocationTime + &quot;\n&quot;);
-                sb.append(&quot;revocationReason is &quot; + revocationReason + &quot;\n&quot;);
-            }
-            sb.append(&quot;thisUpdate is &quot; + thisUpdate + &quot;\n&quot;);
-            if (nextUpdate != null) {
-                sb.append(&quot;nextUpdate is &quot; + nextUpdate + &quot;\n&quot;);
-            }
-            return sb.toString();
-        }
-    }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2003, 2014, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package sun.security.provider.certpath;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.io.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.security.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.security.cert.CertificateException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.security.cert.CertificateParsingException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.security.cert.CertPathValidatorException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.security.cert.CertPathValidatorException.BasicReason;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.security.cert.CRLReason;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import java.security.cert.TrustAnchor;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.security.cert.X509Certificate;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import java.util.ArrayList;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import java.util.Arrays;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import java.util.Collections;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre>import java.util.Date;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre>import java.util.HashMap;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>import java.util.List;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>import java.util.Map;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre>import javax.security.auth.x500.X500Principal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>import sun.misc.HexDumpEncoder;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre>import sun.security.action.GetIntegerAction;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre>import sun.security.x509.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre>import sun.security.util.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre> * This class is used to process an OCSP response.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre> * The OCSP Response is defined</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre> * in RFC 2560 and the ASN.1 encoding is as follows:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre> * &lt;pre&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre> *  OCSPResponse ::= SEQUENCE {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre> *      responseStatus         OCSPResponseStatus,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre> *      responseBytes          [0] EXPLICIT ResponseBytes OPTIONAL }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre> *   OCSPResponseStatus ::= ENUMERATED {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre> *       successful            (0),  --Response has valid confirmations</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre> *       malformedRequest      (1),  --Illegal confirmation request</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre> *       internalError         (2),  --Internal error in issuer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre> *       tryLater              (3),  --Try again later</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre> *                                   --(4) is not used</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre> *       sigRequired           (5),  --Must sign the request</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre> *       unauthorized          (6)   --Request unauthorized</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre> *   }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre> *   ResponseBytes ::=       SEQUENCE {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre> *       responseType   OBJECT IDENTIFIER,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre> *       response       OCTET STRING }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre> *   BasicOCSPResponse       ::= SEQUENCE {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre> *      tbsResponseData      ResponseData,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre> *      signatureAlgorithm   AlgorithmIdentifier,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre> *      signature            BIT STRING,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre> *      certs                [0] EXPLICIT SEQUENCE OF Certificate OPTIONAL }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre> *   The value for signature SHALL be computed on the hash of the DER</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre> *   encoding ResponseData.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre> *   ResponseData ::= SEQUENCE {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre> *      version              [0] EXPLICIT Version DEFAULT v1,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre> *      responderID              ResponderID,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre> *      producedAt               GeneralizedTime,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre> *      responses                SEQUENCE OF SingleResponse,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre> *      responseExtensions   [1] EXPLICIT Extensions OPTIONAL }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre> *   ResponderID ::= CHOICE {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre> *      byName               [1] Name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre> *      byKey                [2] KeyHash }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre> *   KeyHash ::= OCTET STRING -- SHA-1 hash of responder's public key</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre> *   (excluding the tag and length fields)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre> *   SingleResponse ::= SEQUENCE {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre> *      certID                       CertID,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre> *      certStatus                   CertStatus,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre> *      thisUpdate                   GeneralizedTime,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre> *      nextUpdate         [0]       EXPLICIT GeneralizedTime OPTIONAL,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre> *      singleExtensions   [1]       EXPLICIT Extensions OPTIONAL }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre> *   CertStatus ::= CHOICE {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre> *       good        [0]     IMPLICIT NULL,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre> *       revoked     [1]     IMPLICIT RevokedInfo,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre> *       unknown     [2]     IMPLICIT UnknownInfo }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre> *   RevokedInfo ::= SEQUENCE {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre> *       revocationTime              GeneralizedTime,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre> *       revocationReason    [0]     EXPLICIT CRLReason OPTIONAL }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre> *   UnknownInfo ::= NULL -- this can be replaced with an enumeration</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre> * &lt;/pre&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre> * @author      Ram Marti</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>public final class OCSPResponse {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>    public enum ResponseStatus {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>        SUCCESSFUL,            // Response has valid confirmations</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>        MALFORMED_REQUEST,     // Illegal request</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>        INTERNAL_ERROR,        // Internal error in responder</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>        TRY_LATER,             // Try again later</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>        UNUSED,                // is not used</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>        SIG_REQUIRED,          // Must sign the request</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>        UNAUTHORIZED           // Request unauthorized</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>    };</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>    private static ResponseStatus[] rsvalues = ResponseStatus.values();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>    private static final Debug debug = Debug.getInstance(&quot;certpath&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>    private static final boolean dump = debug != null &amp;&amp; Debug.isOn(&quot;ocsp&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>    private static final ObjectIdentifier OCSP_BASIC_RESPONSE_OID =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>        ObjectIdentifier.newInternal(new int[] { 1, 3, 6, 1, 5, 5, 7, 48, 1, 1});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>    private static final int CERT_STATUS_GOOD = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>    private static final int CERT_STATUS_REVOKED = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>    private static final int CERT_STATUS_UNKNOWN = 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>    // ResponderID CHOICE tags</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>    private static final int NAME_TAG = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>    private static final int KEY_TAG = 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>    // Object identifier for the OCSPSigning key purpose</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>    private static final String KP_OCSP_SIGNING_OID = &quot;1.3.6.1.5.5.7.3.9&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>    // Default maximum clock skew in milliseconds (15 minutes)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>    // allowed when checking validity of OCSP responses</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>    private static final int DEFAULT_MAX_CLOCK_SKEW = 900000;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>     * Integer value indicating the maximum allowable clock skew, in seconds,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>     * to be used for the OCSP check.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>    private static final int MAX_CLOCK_SKEW = initializeClockSkew();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>     * Initialize the maximum allowable clock skew by getting the OCSP</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>     * clock skew system property. If the property has not been set, or if its</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>     * value is negative, set the skew to the default.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>    private static int initializeClockSkew() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>        Integer tmp = java.security.AccessController.doPrivileged(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>                new GetIntegerAction(&quot;com.sun.security.ocsp.clockSkew&quot;));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>        if (tmp == null || tmp &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>            return DEFAULT_MAX_CLOCK_SKEW;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>        // Convert to milliseconds, as the system property will be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>        // specified in seconds</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>        return tmp * 1000;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>    // an array of all of the CRLReasons (used in SingleResponse)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>    private static CRLReason[] values = CRLReason.values();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>    private final ResponseStatus responseStatus;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>    private final Map&lt;CertId, SingleResponse&gt; singleResponseMap;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>    private final AlgorithmId sigAlgId;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>    private final byte[] signature;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>    private final byte[] tbsResponseData;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>    private final byte[] responseNonce;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>    private List&lt;X509CertImpl&gt; certs;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>    private X509CertImpl signerCert = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>    private X500Principal responderName = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>    private KeyIdentifier responderKeyId = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>     * Create an OCSP response from its ASN.1 DER encoding.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>    OCSPResponse(byte[] bytes) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>        if (dump) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>            HexDumpEncoder hexEnc = new HexDumpEncoder();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>            debug.println(&quot;OCSPResponse bytes...\n\n&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>                hexEnc.encode(bytes) + &quot;\n&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>        DerValue der = new DerValue(bytes);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>        if (der.tag != DerValue.tag_Sequence) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>            throw new IOException(&quot;Bad encoding in OCSP response: &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>                &quot;expected ASN.1 SEQUENCE tag.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>        DerInputStream derIn = der.getData();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>        // responseStatus</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>        int status = derIn.getEnumerated();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>        if (status &gt;= 0 &amp;&amp; status &lt; rsvalues.length) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>            responseStatus = rsvalues[status];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>            // unspecified responseStatus</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>            throw new IOException(&quot;Unknown OCSPResponse status: &quot; + status);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>        if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>            debug.println(&quot;OCSP response status: &quot; + responseStatus);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>        if (responseStatus != ResponseStatus.SUCCESSFUL) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>            // no need to continue, responseBytes are not set.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>            singleResponseMap = Collections.emptyMap();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>            certs = new ArrayList&lt;X509CertImpl&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>            sigAlgId = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>            signature = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>            tbsResponseData = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>            responseNonce = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>        // responseBytes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>        der = derIn.getDerValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>        if (!der.isContextSpecific((byte)0)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>            throw new IOException(&quot;Bad encoding in responseBytes element &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>                &quot;of OCSP response: expected ASN.1 context specific tag 0.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>        DerValue tmp = der.data.getDerValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>        if (tmp.tag != DerValue.tag_Sequence) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>            throw new IOException(&quot;Bad encoding in responseBytes element &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>                &quot;of OCSP response: expected ASN.1 SEQUENCE tag.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>        // responseType</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>        derIn = tmp.data;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>        ObjectIdentifier responseType = derIn.getOID();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>        if (responseType.equals((Object)OCSP_BASIC_RESPONSE_OID)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>            if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>                debug.println(&quot;OCSP response type: basic&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>            if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>                debug.println(&quot;OCSP response type: &quot; + responseType);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>            throw new IOException(&quot;Unsupported OCSP response type: &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>                                  responseType);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>        // BasicOCSPResponse</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>        DerInputStream basicOCSPResponse =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>            new DerInputStream(derIn.getOctetString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>        DerValue[] seqTmp = basicOCSPResponse.getSequence(2);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>        if (seqTmp.length &lt; 3) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>            throw new IOException(&quot;Unexpected BasicOCSPResponse value&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>        DerValue responseData = seqTmp[0];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>        // Need the DER encoded ResponseData to verify the signature later</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>        tbsResponseData = seqTmp[0].toByteArray();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>        // tbsResponseData</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>        if (responseData.tag != DerValue.tag_Sequence) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>            throw new IOException(&quot;Bad encoding in tbsResponseData &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>                &quot;element of OCSP response: expected ASN.1 SEQUENCE tag.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>        DerInputStream seqDerIn = responseData.data;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>        DerValue seq = seqDerIn.getDerValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>        // version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>        if (seq.isContextSpecific((byte)0)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>            // seq[0] is version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>            if (seq.isConstructed() &amp;&amp; seq.isContextSpecific()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>                //System.out.println (&quot;version is available&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>                seq = seq.data.getDerValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>                int version = seq.getInteger();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>                if (seq.data.available() != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>                    throw new IOException(&quot;Bad encoding in version &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>                        &quot; element of OCSP response: bad format&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>                seq = seqDerIn.getDerValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>        // responderID</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>        short tag = (byte)(seq.tag &amp; 0x1f);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>        if (tag == NAME_TAG) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>            responderName = new X500Principal(seq.getData().toByteArray());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>            if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>                debug.println(&quot;Responder's name: &quot; + responderName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>        } else if (tag == KEY_TAG) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>            responderKeyId = new KeyIdentifier(seq.getData().getOctetString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>            if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>                debug.println(&quot;Responder's key ID: &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>                    Debug.toString(responderKeyId.getIdentifier()));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>            throw new IOException(&quot;Bad encoding in responderID element of &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>                &quot;OCSP response: expected ASN.1 context specific tag 0 or 1&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>        // producedAt</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>        seq = seqDerIn.getDerValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>        if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>            Date producedAtDate = seq.getGeneralizedTime();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>            debug.println(&quot;OCSP response produced at: &quot; + producedAtDate);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>        // responses</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>        DerValue[] singleResponseDer = seqDerIn.getSequence(1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>        singleResponseMap = new HashMap&lt;&gt;(singleResponseDer.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>        if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>            debug.println(&quot;OCSP number of SingleResponses: &quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>                          + singleResponseDer.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; singleResponseDer.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>            SingleResponse singleResponse =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>                new SingleResponse(singleResponseDer[i]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>            singleResponseMap.put(singleResponse.getCertId(), singleResponse);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>        // responseExtensions</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>        byte[] nonce = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>        if (seqDerIn.available() &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>            seq = seqDerIn.getDerValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>            if (seq.isContextSpecific((byte)1)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>                DerValue[] responseExtDer = seq.data.getSequence(3);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>                for (int i = 0; i &lt; responseExtDer.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>                    Extension ext = new Extension(responseExtDer[i]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>                    if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>                        debug.println(&quot;OCSP extension: &quot; + ext);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>                    // Only the NONCE extension is recognized</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>                    if (ext.getExtensionId().equals((Object)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>                        OCSP.NONCE_EXTENSION_OID))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>                    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>                        nonce = ext.getExtensionValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>                    } else if (ext.isCritical())  {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>                        throw new IOException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>                            &quot;Unsupported OCSP critical extension: &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>                            ext.getExtensionId());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>        responseNonce = nonce;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>        // signatureAlgorithmId</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>        sigAlgId = AlgorithmId.parse(seqTmp[1]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>        // signature</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>        signature = seqTmp[2].getBitString();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>        // if seq[3] is available , then it is a sequence of certificates</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>        if (seqTmp.length &gt; 3) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>            // certs are available</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>            DerValue seqCert = seqTmp[3];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>            if (!seqCert.isContextSpecific((byte)0)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>                throw new IOException(&quot;Bad encoding in certs element of &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>                    &quot;OCSP response: expected ASN.1 context specific tag 0.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>            DerValue[] derCerts = seqCert.getData().getSequence(3);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>            certs = new ArrayList&lt;X509CertImpl&gt;(derCerts.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>                for (int i = 0; i &lt; derCerts.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>                    X509CertImpl cert =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>                        new X509CertImpl(derCerts[i].toByteArray());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>                    certs.add(cert);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>                    if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>                        debug.println(&quot;OCSP response cert #&quot; + (i + 1) + &quot;: &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>                            cert.getSubjectX500Principal());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>            } catch (CertificateException ce) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>                throw new IOException(&quot;Bad encoding in X509 Certificate&quot;, ce);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>            certs = new ArrayList&lt;X509CertImpl&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>    void verify(List&lt;CertId&gt; certIds, X509Certificate issuerCert,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>                X509Certificate responderCert, Date date, byte[] nonce)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>        throws CertPathValidatorException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>    {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>        switch (responseStatus) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>            case SUCCESSFUL:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>            case TRY_LATER:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>            case INTERNAL_ERROR:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>                throw new CertPathValidatorException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>                    &quot;OCSP response error: &quot; + responseStatus, null, null, -1,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>                    BasicReason.UNDETERMINED_REVOCATION_STATUS);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>            case UNAUTHORIZED:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>            default:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>                throw new CertPathValidatorException(&quot;OCSP response error: &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>                                                     responseStatus);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>        // Check that the response includes a response for all of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>        // certs that were supplied in the request</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>        for (CertId certId : certIds) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>            SingleResponse sr = getSingleResponse(certId);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>            if (sr == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>                if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>                    debug.println(&quot;No response found for CertId: &quot; + certId);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>                throw new CertPathValidatorException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>                    &quot;OCSP response does not include a response for a &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>                    &quot;certificate supplied in the OCSP request&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>            if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>                debug.println(&quot;Status of certificate (with serial number &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>                    certId.getSerialNumber() + &quot;) is: &quot; + sr.getCertStatus());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>        // Locate the signer cert</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>        if (signerCert == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>            // Add the Issuing CA cert and/or Trusted Responder cert to the list</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>            // of certs from the OCSP response</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>                certs.add(X509CertImpl.toImpl(issuerCert));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>                if (responderCert != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>                    certs.add(X509CertImpl.toImpl(responderCert));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>            } catch (CertificateException ce) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>                throw new CertPathValidatorException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>                    &quot;Invalid issuer or trusted responder certificate&quot;, ce);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>            if (responderName != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>                for (X509CertImpl cert : certs) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>                    if (cert.getSubjectX500Principal().equals(responderName)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>                        signerCert = cert;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>                        break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>            } else if (responderKeyId != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>                for (X509CertImpl cert : certs) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>                    // Match responder's key identifier against the cert's SKID</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>                    // This will match if the SKID is encoded using the 160-bit</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>                    // SHA-1 hash method as defined in RFC 5280.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>                    KeyIdentifier certKeyId = cert.getSubjectKeyId();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>                    if (certKeyId != null &amp;&amp; responderKeyId.equals(certKeyId)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>                        signerCert = cert;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>                        break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>                    } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>                        // The certificate does not have a SKID or may have</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>                        // been using a different algorithm (ex: see RFC 7093).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>                        // Check if the responder's key identifier matches</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>                        // against a newly generated key identifier of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>                        // cert's public key using the 160-bit SHA-1 method.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>                        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>                            certKeyId = new KeyIdentifier(cert.getPublicKey());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>                        } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>                            // ignore</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>                        if (responderKeyId.equals(certKeyId)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>                            signerCert = cert;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>                            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>        // Check whether the signer cert returned by the responder is trusted</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>        if (signerCert != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>            // Check if the response is signed by the issuing CA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>            if (signerCert.equals(issuerCert)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>                if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>                    debug.println(&quot;OCSP response is signed by the target's &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>                        &quot;Issuing CA&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>                // cert is trusted, now verify the signed response</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>            // Check if the response is signed by a trusted responder</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>            } else if (signerCert.equals(responderCert)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>                if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>                    debug.println(&quot;OCSP response is signed by a Trusted &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>                        &quot;Responder&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>                // cert is trusted, now verify the signed response</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>            // Check if the response is signed by an authorized responder</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>            } else if (signerCert.getIssuerX500Principal().equals(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>                       issuerCert.getSubjectX500Principal())) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>                // Check for the OCSPSigning key purpose</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>                    List&lt;String&gt; keyPurposes = signerCert.getExtendedKeyUsage();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>                    if (keyPurposes == null ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>                        !keyPurposes.contains(KP_OCSP_SIGNING_OID)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>                        throw new CertPathValidatorException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre>                            &quot;Responder's certificate not valid for signing &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>                            &quot;OCSP responses&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>                } catch (CertificateParsingException cpe) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>                    // assume cert is not valid for signing</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>                    throw new CertPathValidatorException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>                        &quot;Responder's certificate not valid for signing &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>                        &quot;OCSP responses&quot;, cpe);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>                // Check algorithm constraints specified in security property</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>                // &quot;jdk.certpath.disabledAlgorithms&quot;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre>                AlgorithmChecker algChecker = new AlgorithmChecker(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>                                    new TrustAnchor(issuerCert, null));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>                algChecker.init(false);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>                algChecker.check(signerCert, Collections.&lt;String&gt;emptySet());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>                // check the validity</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>                    if (date == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>                        signerCert.checkValidity();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>                    } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>                        signerCert.checkValidity(date);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>                } catch (CertificateException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>                    throw new CertPathValidatorException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>                        &quot;Responder's certificate not within the &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>                        &quot;validity period&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>                // check for revocation</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>                //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>                // A CA may specify that an OCSP client can trust a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>                // responder for the lifetime of the responder's</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>                // certificate. The CA does so by including the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>                // extension id-pkix-ocsp-nocheck.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>                //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>                Extension noCheck =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>                    signerCert.getExtension(PKIXExtensions.OCSPNoCheck_Id);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>                if (noCheck != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>                    if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre>                        debug.println(&quot;Responder's certificate includes &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>                            &quot;the extension id-pkix-ocsp-nocheck.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>                    // we should do the revocation checking of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>                    // authorized responder in a future update.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>                // verify the signature</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>                    signerCert.verify(issuerCert.getPublicKey());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>                    if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>                        debug.println(&quot;OCSP response is signed by an &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>                            &quot;Authorized Responder&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>                    // cert is trusted, now verify the signed response</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>                } catch (GeneralSecurityException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>                    signerCert = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre>                throw new CertPathValidatorException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>                    &quot;Responder's certificate is not authorized to sign &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>                    &quot;OCSP responses&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>        // Confirm that the signed response was generated using the public</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre>        // key from the trusted responder cert</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>        if (signerCert != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>            // Check algorithm constraints specified in security property</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>            // &quot;jdk.certpath.disabledAlgorithms&quot;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>            AlgorithmChecker.check(signerCert.getPublicKey(), sigAlgId);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>            if (!verifySignature(signerCert)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>                throw new CertPathValidatorException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>                    &quot;Error verifying OCSP Response's signature&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>            // Need responder's cert in order to verify the signature</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>            throw new CertPathValidatorException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>                &quot;Unable to verify OCSP Response's signature&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>        // Check freshness of OCSPResponse</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre>        if (nonce != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre>            if (responseNonce != null &amp;&amp; !Arrays.equals(nonce, responseNonce)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>                throw new CertPathValidatorException(&quot;Nonces don't match&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>        long now = (date == null) ? System.currentTimeMillis() : date.getTime();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>        Date nowPlusSkew = new Date(now + MAX_CLOCK_SKEW);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>        Date nowMinusSkew = new Date(now - MAX_CLOCK_SKEW);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>        for (SingleResponse sr : singleResponseMap.values()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>            if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>                String until = &quot;&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>                if (sr.nextUpdate != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>                    until = &quot; until &quot; + sr.nextUpdate;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>                debug.println(&quot;Response's validity interval is from &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre>                              sr.thisUpdate + until);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>            // Check that the test date is within the validity interval</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre>            if ((sr.thisUpdate != null &amp;&amp; nowPlusSkew.before(sr.thisUpdate)) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>                (sr.nextUpdate != null &amp;&amp; nowMinusSkew.after(sr.nextUpdate)))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>            {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>                throw new CertPathValidatorException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>                                      &quot;Response is unreliable: its validity &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>                                      &quot;interval is out-of-date&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>     * Returns the OCSP ResponseStatus.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>    ResponseStatus getResponseStatus() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre>        return responseStatus;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>     * Verify the signature of the OCSP response.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>    private boolean verifySignature(X509Certificate cert)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>        throws CertPathValidatorException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre>            Signature respSignature = Signature.getInstance(sigAlgId.getName());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>            respSignature.initVerify(cert.getPublicKey());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>            respSignature.update(tbsResponseData);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>            if (respSignature.verify(signature)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>                if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre>                    debug.println(&quot;Verified signature of OCSP Response&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>                return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>                if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre>                    debug.println(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>                        &quot;Error verifying signature of OCSP Response&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>                return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>        } catch (InvalidKeyException | NoSuchAlgorithmException |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>                 SignatureException e)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>        {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>            throw new CertPathValidatorException(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre>     * Returns the SingleResponse of the specified CertId, or null if</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>     * there is no response for that CertId.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>    SingleResponse getSingleResponse(CertId certId) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre>        return singleResponseMap.get(certId);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre>     * Returns the certificate for the authority that signed the OCSP response.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre>    X509Certificate getSignerCertificate() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>        return signerCert; // set in verify()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>     * A class representing a single OCSP response.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>    final static class SingleResponse implements OCSP.RevocationStatus {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre>        private final CertId certId;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre>        private final CertStatus certStatus;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre>        private final Date thisUpdate;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>        private final Date nextUpdate;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>        private final Date revocationTime;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre>        private final CRLReason revocationReason;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre>        private final Map&lt;String, java.security.cert.Extension&gt; singleExtensions;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>        private SingleResponse(DerValue der) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre>            if (der.tag != DerValue.tag_Sequence) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre>                throw new IOException(&quot;Bad ASN.1 encoding in SingleResponse&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>            DerInputStream tmp = der.data;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre>            certId = new CertId(tmp.getDerValue().data);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre>            DerValue derVal = tmp.getDerValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>            short tag = (byte)(derVal.tag &amp; 0x1f);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre>            if (tag ==  CERT_STATUS_REVOKED) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>                certStatus = CertStatus.REVOKED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre>                revocationTime = derVal.data.getGeneralizedTime();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre>                if (derVal.data.available() != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre>                    DerValue dv = derVal.data.getDerValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre>                    tag = (byte)(dv.tag &amp; 0x1f);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>                    if (tag == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre>                        int reason = dv.data.getEnumerated();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre>                        // if reason out-of-range just leave as UNSPECIFIED</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>                        if (reason &gt;= 0 &amp;&amp; reason &lt; values.length) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre>                            revocationReason = values[reason];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre>                        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>                            revocationReason = CRLReason.UNSPECIFIED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre>                    } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre>                        revocationReason = CRLReason.UNSPECIFIED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre>                    revocationReason = CRLReason.UNSPECIFIED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre>                // RevokedInfo</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre>                if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre>                    debug.println(&quot;Revocation time: &quot; + revocationTime);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre>                    debug.println(&quot;Revocation reason: &quot; + revocationReason);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="719" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="720" href="#"></a></td>
+<td><pre>                revocationTime = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="721" href="#"></a></td>
+<td><pre>                revocationReason = CRLReason.UNSPECIFIED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="722" href="#"></a></td>
+<td><pre>                if (tag == CERT_STATUS_GOOD) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="723" href="#"></a></td>
+<td><pre>                    certStatus = CertStatus.GOOD;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="724" href="#"></a></td>
+<td><pre>                } else if (tag == CERT_STATUS_UNKNOWN) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="725" href="#"></a></td>
+<td><pre>                    certStatus = CertStatus.UNKNOWN;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="726" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="727" href="#"></a></td>
+<td><pre>                    throw new IOException(&quot;Invalid certificate status&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="728" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="729" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="730" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="731" href="#"></a></td>
+<td><pre>            thisUpdate = tmp.getGeneralizedTime();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="732" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="733" href="#"></a></td>
+<td><pre>            if (tmp.available() == 0)  {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="734" href="#"></a></td>
+<td><pre>                // we are done</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="735" href="#"></a></td>
+<td><pre>                nextUpdate = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="736" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="737" href="#"></a></td>
+<td><pre>                derVal = tmp.getDerValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="738" href="#"></a></td>
+<td><pre>                tag = (byte)(derVal.tag &amp; 0x1f);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="739" href="#"></a></td>
+<td><pre>                if (tag == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="740" href="#"></a></td>
+<td><pre>                    // next update</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="741" href="#"></a></td>
+<td><pre>                    nextUpdate = derVal.data.getGeneralizedTime();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="742" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="743" href="#"></a></td>
+<td><pre>                    if (tmp.available() == 0)  {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="744" href="#"></a></td>
+<td><pre>                        // we are done</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="745" href="#"></a></td>
+<td><pre>                    } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="746" href="#"></a></td>
+<td><pre>                        derVal = tmp.getDerValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="747" href="#"></a></td>
+<td><pre>                        tag = (byte)(derVal.tag &amp; 0x1f);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="748" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="749" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="750" href="#"></a></td>
+<td><pre>                    nextUpdate = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="751" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="752" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="753" href="#"></a></td>
+<td><pre>            // singleExtensions</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="754" href="#"></a></td>
+<td><pre>            if (tmp.available() &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="755" href="#"></a></td>
+<td><pre>                derVal = tmp.getDerValue();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="756" href="#"></a></td>
+<td><pre>                if (derVal.isContextSpecific((byte)1)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="757" href="#"></a></td>
+<td><pre>                    DerValue[] singleExtDer = derVal.data.getSequence(3);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="758" href="#"></a></td>
+<td><pre>                    singleExtensions =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="759" href="#"></a></td>
+<td><pre>                        new HashMap&lt;String, java.security.cert.Extension&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="760" href="#"></a></td>
+<td><pre>                            (singleExtDer.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="761" href="#"></a></td>
+<td><pre>                    for (int i = 0; i &lt; singleExtDer.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="762" href="#"></a></td>
+<td><pre>                        Extension ext = new Extension(singleExtDer[i]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="763" href="#"></a></td>
+<td><pre>                        if (debug != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="764" href="#"></a></td>
+<td><pre>                            debug.println(&quot;OCSP single extension: &quot; + ext);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="765" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="766" href="#"></a></td>
+<td><pre>                        // We don't support any extensions yet. Therefore, if it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="767" href="#"></a></td>
+<td><pre>                        // is critical we must throw an exception because we</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="768" href="#"></a></td>
+<td><pre>                        // don't know how to process it.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="769" href="#"></a></td>
+<td><pre>                        if (ext.isCritical()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="770" href="#"></a></td>
+<td><pre>                            throw new IOException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="771" href="#"></a></td>
+<td><pre>                                &quot;Unsupported OCSP critical extension: &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="772" href="#"></a></td>
+<td><pre>                                ext.getExtensionId());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="773" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="774" href="#"></a></td>
+<td><pre>                        singleExtensions.put(ext.getId(), ext);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="775" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="776" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="777" href="#"></a></td>
+<td><pre>                    singleExtensions = Collections.emptyMap();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="778" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="779" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="780" href="#"></a></td>
+<td><pre>                singleExtensions = Collections.emptyMap();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="781" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="782" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="783" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="784" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="785" href="#"></a></td>
+<td><pre>         * Return the certificate's revocation status code</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="786" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="787" href="#"></a></td>
+<td><pre>        @Override public CertStatus getCertStatus() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="788" href="#"></a></td>
+<td><pre>            return certStatus;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="789" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="790" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="791" href="#"></a></td>
+<td><pre>        private CertId getCertId() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="792" href="#"></a></td>
+<td><pre>            return certId;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="793" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="794" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="795" href="#"></a></td>
+<td><pre>        @Override public Date getRevocationTime() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="796" href="#"></a></td>
+<td><pre>            return (Date) revocationTime.clone();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="797" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="798" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="799" href="#"></a></td>
+<td><pre>        @Override public CRLReason getRevocationReason() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="800" href="#"></a></td>
+<td><pre>            return revocationReason;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="801" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="802" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="803" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="804" href="#"></a></td>
+<td><pre>        public Map&lt;String, java.security.cert.Extension&gt; getSingleExtensions() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="805" href="#"></a></td>
+<td><pre>            return Collections.unmodifiableMap(singleExtensions);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="806" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="807" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="808" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="809" href="#"></a></td>
+<td><pre>         * Construct a string representation of a single OCSP response.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="810" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="811" href="#"></a></td>
+<td><pre>        @Override public String toString() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="812" href="#"></a></td>
+<td><pre>            StringBuilder sb = new StringBuilder();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="813" href="#"></a></td>
+<td><pre>            sb.append(&quot;SingleResponse:  \n&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="814" href="#"></a></td>
+<td><pre>            sb.append(certId);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="815" href="#"></a></td>
+<td><pre>            sb.append(&quot;\nCertStatus: &quot;+ certStatus + &quot;\n&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="816" href="#"></a></td>
+<td><pre>            if (certStatus == CertStatus.REVOKED) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="817" href="#"></a></td>
+<td><pre>                sb.append(&quot;revocationTime is &quot; + revocationTime + &quot;\n&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="818" href="#"></a></td>
+<td><pre>                sb.append(&quot;revocationReason is &quot; + revocationReason + &quot;\n&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="819" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="820" href="#"></a></td>
+<td><pre>            sb.append(&quot;thisUpdate is &quot; + thisUpdate + &quot;\n&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="821" href="#"></a></td>
+<td><pre>            if (nextUpdate != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="822" href="#"></a></td>
+<td><pre>                sb.append(&quot;nextUpdate is &quot; + nextUpdate + &quot;\n&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="823" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="824" href="#"></a></td>
+<td><pre>            return sb.toString();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="825" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="826" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="827" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

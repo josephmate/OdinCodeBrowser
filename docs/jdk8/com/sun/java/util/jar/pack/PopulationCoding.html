@@ -3,507 +3,2007 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2003, 2010, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package com.sun.java.util.jar.pack;
-
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.Set;
-import static com.sun.java.util.jar.pack.Constants.*;
-
-/**
- * Population-based coding.
- * See the section &quot;Encodings of Uncorrelated Values&quot; in the Pack200 spec.
- * @author John Rose
- */
-// This tactic alone reduces the final zipped rt.jar by about a percent.
-class PopulationCoding implements CodingMethod {
-    Histogram vHist;   // histogram of all values
-    int[]     fValues; // list of favored values
-    int       fVlen;   // inclusive max index
-    long[]    symtab;  // int map of favored value -&gt; token [1..#fValues]
-
-    CodingMethod favoredCoding;
-    CodingMethod tokenCoding;
-    CodingMethod unfavoredCoding;
-
-    int L = -1;  //preferred L value for tokenCoding
-
-    public void setFavoredValues(int[] fValues, int fVlen) {
-        // Note:  {f} is allFavoredValues[1..fvlen], not [0..fvlen-1].
-        // This is because zero is an exceptional favored value index.
-        assert(fValues[0] == 0);  // must be empty
-        assert(this.fValues == null);  // do not do this twice
-        this.fValues = fValues;
-        this.fVlen   = fVlen;
-        if (L &gt;= 0) {
-            setL(L);  // reassert
-        }
-    }
-    public void setFavoredValues(int[] fValues) {
-        int lfVlen = fValues.length-1;
-        setFavoredValues(fValues, lfVlen);
-    }
-    public void setHistogram(Histogram vHist) {
-        this.vHist = vHist;
-    }
-    public void setL(int L) {
-        this.L = L;
-        if (L &gt;= 0 &amp;&amp; fValues != null &amp;&amp; tokenCoding == null) {
-            tokenCoding = fitTokenCoding(fVlen, L);
-            assert(tokenCoding != null);
-        }
-    }
-
-    public static Coding fitTokenCoding(int fVlen, int L) {
-        // Find the smallest B s.t. (B,H,0) covers fVlen.
-        if (fVlen &lt; 256)
-            // H/L do not matter when B==1
-            return BandStructure.BYTE1;
-        Coding longest = BandStructure.UNSIGNED5.setL(L);
-        if (!longest.canRepresentUnsigned(fVlen))
-            return null;  // failure; L is too sharp and fVlen too large
-        Coding tc = longest;
-        for (Coding shorter = longest; ; ) {
-            shorter = shorter.setB(shorter.B()-1);
-            if (shorter.umax() &lt; fVlen)
-                break;
-            tc = shorter;  // shorten it by reducing B
-        }
-        return tc;
-    }
-
-    public void setFavoredCoding(CodingMethod favoredCoding) {
-        this.favoredCoding = favoredCoding;
-    }
-    public void setTokenCoding(CodingMethod tokenCoding) {
-        this.tokenCoding = tokenCoding;
-        this.L = -1;
-        if (tokenCoding instanceof Coding &amp;&amp; fValues != null) {
-            Coding tc = (Coding) tokenCoding;
-            if (tc == fitTokenCoding(fVlen, tc.L()))
-                this.L = tc.L();
-            // Otherwise, it's a non-default coding.
-        }
-    }
-    public void setUnfavoredCoding(CodingMethod unfavoredCoding) {
-        this.unfavoredCoding = unfavoredCoding;
-    }
-
-    public int favoredValueMaxLength() {
-        if (L == 0)
-            return Integer.MAX_VALUE;
-        else
-            return BandStructure.UNSIGNED5.setL(L).umax();
-    }
-
-    public void resortFavoredValues() {
-        Coding tc = (Coding) tokenCoding;
-        // Make a local copy before reordering.
-        fValues = BandStructure.realloc(fValues, 1+fVlen);
-        // Resort favoredValues within each byte-size cadre.
-        int fillp = 1;  // skip initial zero
-        for (int n = 1; n &lt;= tc.B(); n++) {
-            int nmax = tc.byteMax(n);
-            if (nmax &gt; fVlen)
-                nmax = fVlen;
-            if (nmax &lt; tc.byteMin(n))
-                break;
-            int low = fillp;
-            int high = nmax+1;
-            if (high == low)  continue;
-            assert(high &gt; low)
-                : high+&quot;!&gt;&quot;+low;
-            assert(tc.getLength(low) == n)
-                : n+&quot; != len(&quot;+(low)+&quot;) == &quot;+
-                  tc.getLength(low);
-            assert(tc.getLength(high-1) == n)
-                : n+&quot; != len(&quot;+(high-1)+&quot;) == &quot;+
-                  tc.getLength(high-1);
-            int midTarget = low + (high-low)/2;
-            int mid = low;
-            // Divide the values into cadres, and sort within each.
-            int prevCount = -1;
-            int prevLimit = low;
-            for (int i = low; i &lt; high; i++) {
-                int val = fValues[i];
-                int count = vHist.getFrequency(val);
-                if (prevCount != count) {
-                    if (n == 1) {
-                        // For the single-byte encoding, keep strict order
-                        // among frequency groups.
-                        Arrays.sort(fValues, prevLimit, i);
-                    } else if (Math.abs(mid - midTarget) &gt;
-                               Math.abs(i   - midTarget)) {
-                        // Find a single inflection point
-                        // close to the middle of the byte-size cadre.
-                        mid = i;
-                    }
-                    prevCount = count;
-                    prevLimit = i;
-                }
-            }
-            if (n == 1) {
-                Arrays.sort(fValues, prevLimit, high);
-            } else {
-                // Sort up to the midpoint, if any.
-                Arrays.sort(fValues, low, mid);
-                Arrays.sort(fValues, mid, high);
-            }
-            assert(tc.getLength(low) == tc.getLength(mid));
-            assert(tc.getLength(low) == tc.getLength(high-1));
-            fillp = nmax+1;
-        }
-        assert(fillp == fValues.length);
-
-        // Reset symtab.
-        symtab = null;
-    }
-
-    public int getToken(int value) {
-        if (symtab == null)
-            symtab = makeSymtab();
-        int pos = Arrays.binarySearch(symtab, (long)value &lt;&lt; 32);
-        if (pos &lt; 0)  pos = -pos-1;
-        if (pos &lt; symtab.length &amp;&amp; value == (int)(symtab[pos] &gt;&gt;&gt; 32))
-            return (int)symtab[pos];
-        else
-            return 0;
-    }
-
-    public int[][] encodeValues(int[] values, int start, int end) {
-        // Compute token sequence.
-        int[] tokens = new int[end-start];
-        int nuv = 0;
-        for (int i = 0; i &lt; tokens.length; i++) {
-            int val = values[start+i];
-            int tok = getToken(val);
-            if (tok != 0)
-                tokens[i] = tok;
-            else
-                nuv += 1;
-        }
-        // Compute unfavored value sequence.
-        int[] unfavoredValues = new int[nuv];
-        nuv = 0;  // reset
-        for (int i = 0; i &lt; tokens.length; i++) {
-            if (tokens[i] != 0)  continue;  // already covered
-            int val = values[start+i];
-            unfavoredValues[nuv++] = val;
-        }
-        assert(nuv == unfavoredValues.length);
-        return new int[][]{ tokens, unfavoredValues };
-    }
-
-    private long[] makeSymtab() {
-        long[] lsymtab = new long[fVlen];
-        for (int token = 1; token &lt;= fVlen; token++) {
-            lsymtab[token-1] = ((long)fValues[token] &lt;&lt; 32) | token;
-        }
-        // Index by value:
-        Arrays.sort(lsymtab);
-        return lsymtab;
-    }
-
-    private Coding getTailCoding(CodingMethod c) {
-        while (c instanceof AdaptiveCoding)
-            c = ((AdaptiveCoding)c).tailCoding;
-        return (Coding) c;
-    }
-
-    // CodingMethod methods.
-    public void writeArrayTo(OutputStream out, int[] a, int start, int end) throws IOException {
-        int[][] vals = encodeValues(a, start, end);
-        writeSequencesTo(out, vals[0], vals[1]);
-    }
-    void writeSequencesTo(OutputStream out, int[] tokens, int[] uValues) throws IOException {
-        favoredCoding.writeArrayTo(out, fValues, 1, 1+fVlen);
-        getTailCoding(favoredCoding).writeTo(out, computeSentinelValue());
-        tokenCoding.writeArrayTo(out, tokens, 0, tokens.length);
-        if (uValues.length &gt; 0)
-            unfavoredCoding.writeArrayTo(out, uValues, 0, uValues.length);
-    }
-
-   int computeSentinelValue() {
-        Coding fc = getTailCoding(favoredCoding);
-        if (fc.isDelta()) {
-            // repeat the last favored value, using delta=0
-            return 0;
-        } else {
-            // else repeat the shorter of the min or last value
-            int min = fValues[1];
-            int last = min;
-            // (remember that fVlen is an inclusive limit in fValues)
-            for (int i = 2; i &lt;= fVlen; i++) {
-                last = fValues[i];
-                min = moreCentral(min, last);
-            }
-            int endVal;
-            if (fc.getLength(min) &lt;= fc.getLength(last))
-                return min;
-            else
-                return last;
-        }
-   }
-
-    public void readArrayFrom(InputStream in, int[] a, int start, int end) throws IOException {
-        // Parameters are fCode, L, uCode.
-        setFavoredValues(readFavoredValuesFrom(in, end-start));
-        // Read the tokens.  Read them into the final array, for the moment.
-        tokenCoding.readArrayFrom(in, a, start, end);
-        // Decode the favored tokens.
-        int headp = 0, tailp = -1;
-        int uVlen = 0;
-        for (int i = start; i &lt; end; i++) {
-            int tok = a[i];
-            if (tok == 0) {
-                // Make a linked list, and decode in a second pass.
-                if (tailp &lt; 0) {
-                    headp = i;
-                } else {
-                    a[tailp] = i;
-                }
-                tailp = i;
-                uVlen += 1;
-            } else {
-                a[i] = fValues[tok];
-            }
-        }
-        // Walk the linked list of &quot;zero&quot; locations, decoding unfavored vals.
-        int[] uValues = new int[uVlen];
-        if (uVlen &gt; 0)
-            unfavoredCoding.readArrayFrom(in, uValues, 0, uVlen);
-        for (int i = 0; i &lt; uVlen; i++) {
-            int nextp = a[headp];
-            a[headp] = uValues[i];
-            headp = nextp;
-        }
-    }
-
-    int[] readFavoredValuesFrom(InputStream in, int maxForDebug) throws IOException {
-        int[] lfValues = new int[1000];  // realloc as needed
-        // The set uniqueValuesForDebug records all favored values.
-        // As each new value is added, we assert that the value
-        // was not already in the set.
-        Set&lt;Integer&gt; uniqueValuesForDebug = null;
-        assert((uniqueValuesForDebug = new HashSet&lt;&gt;()) != null);
-        int fillp = 1;
-        maxForDebug += fillp;
-        int min = Integer.MIN_VALUE;  // farthest from the center
-        //int min2 = Integer.MIN_VALUE;  // emulate buggy 150.7 spec.
-        int last = 0;
-        CodingMethod fcm = favoredCoding;
-        while (fcm instanceof AdaptiveCoding) {
-            AdaptiveCoding ac = (AdaptiveCoding) fcm;
-            int len = ac.headLength;
-            while (fillp + len &gt; lfValues.length) {
-                lfValues = BandStructure.realloc(lfValues);
-            }
-            int newFillp = fillp + len;
-            ac.headCoding.readArrayFrom(in, lfValues, fillp, newFillp);
-            while (fillp &lt; newFillp) {
-                int val = lfValues[fillp++];
-                assert(uniqueValuesForDebug.add(val));
-                assert(fillp &lt;= maxForDebug);
-                last = val;
-                min = moreCentral(min, val);
-                //min2 = moreCentral2(min2, val, min);
-            }
-            fcm = ac.tailCoding;
-        }
-        Coding fc = (Coding) fcm;
-        if (fc.isDelta()) {
-            for (long state = 0;;) {
-                // Read a new value:
-                state += fc.readFrom(in);
-                int val;
-                if (fc.isSubrange())
-                    val = fc.reduceToUnsignedRange(state);
-                else
-                    val = (int)state;
-                state = val;
-                if (fillp &gt; 1 &amp;&amp; (val == last || val == min)) //|| val == min2
-                    break;
-                if (fillp == lfValues.length)
-                    lfValues = BandStructure.realloc(lfValues);
-                lfValues[fillp++] = val;
-                assert(uniqueValuesForDebug.add(val));
-                assert(fillp &lt;= maxForDebug);
-                last = val;
-                min = moreCentral(min, val);
-                //min2 = moreCentral(min2, val);
-            }
-        } else {
-            for (;;) {
-                int val = fc.readFrom(in);
-                if (fillp &gt; 1 &amp;&amp; (val == last || val == min)) //|| val == min2
-                    break;
-                if (fillp == lfValues.length)
-                    lfValues = BandStructure.realloc(lfValues);
-                lfValues[fillp++] = val;
-                assert(uniqueValuesForDebug.add(val));
-                assert(fillp &lt;= maxForDebug);
-                last = val;
-                min = moreCentral(min, val);
-                //min2 = moreCentral2(min2, val, min);
-            }
-        }
-        return BandStructure.realloc(lfValues, fillp);
-    }
-
-    private static int moreCentral(int x, int y) {
-        int kx = (x &gt;&gt; 31) ^ (x &lt;&lt; 1);
-        int ky = (y &gt;&gt; 31) ^ (y &lt;&lt; 1);
-        // bias kx/ky to get an unsigned comparison:
-        kx -= Integer.MIN_VALUE;
-        ky -= Integer.MIN_VALUE;
-        int xy = (kx &lt; ky? x: y);
-        // assert that this ALU-ish version is the same:
-        assert(xy == moreCentralSlow(x, y));
-        return xy;
-    }
-//  private static int moreCentral2(int x, int y, int min) {
-//      // Strict implementation of buggy 150.7 specification.
-//      // The bug is that the spec. says absolute-value ties are broken
-//      // in favor of positive numbers, but the suggested implementation
-//      // (also mentioned in the spec.) breaks ties in favor of negatives.
-//      if (x + y == 0)  return (x &gt; y? x : y);
-//      return min;
-//  }
-    private static int moreCentralSlow(int x, int y) {
-        int ax = x;
-        if (ax &lt; 0)  ax = -ax;
-        if (ax &lt; 0)  return y;  //x is MIN_VALUE
-        int ay = y;
-        if (ay &lt; 0)  ay = -ay;
-        if (ay &lt; 0)  return x;  //y is MIN_VALUE
-        if (ax &lt; ay)  return x;
-        if (ax &gt; ay)  return y;
-        // At this point the absolute values agree, and the negative wins.
-        return x &lt; y ? x : y;
-    }
-
-    static final int[] LValuesCoded
-        = { -1, 4, 8, 16, 32, 64, 128, 192, 224, 240, 248, 252 };
-
-    public byte[] getMetaCoding(Coding dflt) {
-        int K = fVlen;
-        int LCoded = 0;
-        if (tokenCoding instanceof Coding) {
-            Coding tc = (Coding) tokenCoding;
-            if (tc.B() == 1) {
-                LCoded = 1;
-            } else if (L &gt;= 0) {
-                assert(L == tc.L());
-                for (int i = 1; i &lt; LValuesCoded.length; i++) {
-                    if (LValuesCoded[i] == L) { LCoded = i; break; }
-                }
-            }
-        }
-        CodingMethod tokenDflt = null;
-        if (LCoded != 0 &amp;&amp; tokenCoding == fitTokenCoding(fVlen, L)) {
-            // A simple L value is enough to recover the tokenCoding.
-            tokenDflt = tokenCoding;
-        }
-        int FDef = (favoredCoding == dflt)?1:0;
-        int UDef = (unfavoredCoding == dflt || unfavoredCoding == null)?1:0;
-        int TDef = (tokenCoding == tokenDflt)?1:0;
-        int TDefL = (TDef == 1) ? LCoded : 0;
-        assert(TDef == ((TDefL&gt;0)?1:0));
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream(10);
-        bytes.write(_meta_pop + FDef + 2*UDef + 4*TDefL);
-        try {
-            if (FDef == 0)  bytes.write(favoredCoding.getMetaCoding(dflt));
-            if (TDef == 0)  bytes.write(tokenCoding.getMetaCoding(dflt));
-            if (UDef == 0)  bytes.write(unfavoredCoding.getMetaCoding(dflt));
-        } catch (IOException ee) {
-            throw new RuntimeException(ee);
-        }
-        return bytes.toByteArray();
-    }
-    public static int parseMetaCoding(byte[] bytes, int pos, Coding dflt, CodingMethod res[]) {
-        int op = bytes[pos++] &amp; 0xFF;
-        if (op &lt; _meta_pop || op &gt;= _meta_limit)  return pos-1; // backup
-        op -= _meta_pop;
-        int FDef = op % 2;
-        int UDef = (op / 2) % 2;
-        int TDefL = (op / 4);
-        int TDef = (TDefL &gt; 0)?1:0;
-        int L = LValuesCoded[TDefL];
-        CodingMethod[] FCode = {dflt}, TCode = {null}, UCode = {dflt};
-        if (FDef == 0)
-            pos = BandStructure.parseMetaCoding(bytes, pos, dflt, FCode);
-        if (TDef == 0)
-            pos = BandStructure.parseMetaCoding(bytes, pos, dflt, TCode);
-        if (UDef == 0)
-            pos = BandStructure.parseMetaCoding(bytes, pos, dflt, UCode);
-        PopulationCoding pop = new PopulationCoding();
-        pop.L = L;  // might be -1
-        pop.favoredCoding   = FCode[0];
-        pop.tokenCoding     = TCode[0];  // might be null!
-        pop.unfavoredCoding = UCode[0];
-        res[0] = pop;
-        return pos;
-    }
-
-    private String keyString(CodingMethod m) {
-        if (m instanceof Coding)
-            return ((Coding)m).keyString();
-        if (m == null)
-            return &quot;none&quot;;
-        return m.toString();
-    }
-    public String toString() {
-        PropMap p200 = Utils.currentPropMap();
-        boolean verbose
-            = (p200 != null &amp;&amp;
-               p200.getBoolean(Utils.COM_PREFIX+&quot;verbose.pop&quot;));
-        StringBuilder res = new StringBuilder(100);
-        res.append(&quot;pop(&quot;).append(&quot;fVlen=&quot;).append(fVlen);
-        if (verbose &amp;&amp; fValues != null) {
-            res.append(&quot; fV=[&quot;);
-            for (int i = 1; i &lt;= fVlen; i++) {
-                res.append(i==1?&quot;&quot;:&quot;,&quot;).append(fValues[i]);
-            }
-            res.append(&quot;;&quot;).append(computeSentinelValue());
-            res.append(&quot;]&quot;);
-        }
-        res.append(&quot; fc=&quot;).append(keyString(favoredCoding));
-        res.append(&quot; tc=&quot;).append(keyString(tokenCoding));
-        res.append(&quot; uc=&quot;).append(keyString(unfavoredCoding));
-        res.append(&quot;)&quot;);
-        return res.toString();
-    }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2003, 2010, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package com.sun.java.util.jar.pack;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.io.ByteArrayOutputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.io.IOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.io.InputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.io.OutputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.util.Arrays;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.util.HashSet;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.util.Set;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import static com.sun.java.util.jar.pack.Constants.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre> * Population-based coding.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre> * See the section &quot;Encodings of Uncorrelated Values&quot; in the Pack200 spec.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre> * @author John Rose</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>// This tactic alone reduces the final zipped rt.jar by about a percent.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>class PopulationCoding implements CodingMethod {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre>    Histogram vHist;   // histogram of all values</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre>    int[]     fValues; // list of favored values</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>    int       fVlen;   // inclusive max index</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre>    long[]    symtab;  // int map of favored value -&gt; token [1..#fValues]</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre>    CodingMethod favoredCoding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre>    CodingMethod tokenCoding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>    CodingMethod unfavoredCoding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre>    int L = -1;  //preferred L value for tokenCoding</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>    public void setFavoredValues(int[] fValues, int fVlen) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre>        // Note:  {f} is allFavoredValues[1..fvlen], not [0..fvlen-1].</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>        // This is because zero is an exceptional favored value index.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>        assert(fValues[0] == 0);  // must be empty</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre>        assert(this.fValues == null);  // do not do this twice</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>        this.fValues = fValues;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>        this.fVlen   = fVlen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre>        if (L &gt;= 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>            setL(L);  // reassert</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>    public void setFavoredValues(int[] fValues) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>        int lfVlen = fValues.length-1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>        setFavoredValues(fValues, lfVlen);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>    public void setHistogram(Histogram vHist) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>        this.vHist = vHist;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>    public void setL(int L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>        this.L = L;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>        if (L &gt;= 0 &amp;&amp; fValues != null &amp;&amp; tokenCoding == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>            tokenCoding = fitTokenCoding(fVlen, L);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>            assert(tokenCoding != null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>    public static Coding fitTokenCoding(int fVlen, int L) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>        // Find the smallest B s.t. (B,H,0) covers fVlen.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>        if (fVlen &lt; 256)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>            // H/L do not matter when B==1</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>            return BandStructure.BYTE1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>        Coding longest = BandStructure.UNSIGNED5.setL(L);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>        if (!longest.canRepresentUnsigned(fVlen))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>            return null;  // failure; L is too sharp and fVlen too large</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>        Coding tc = longest;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>        for (Coding shorter = longest; ; ) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>            shorter = shorter.setB(shorter.B()-1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>            if (shorter.umax() &lt; fVlen)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>            tc = shorter;  // shorten it by reducing B</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>        return tc;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>    public void setFavoredCoding(CodingMethod favoredCoding) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>        this.favoredCoding = favoredCoding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>    public void setTokenCoding(CodingMethod tokenCoding) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>        this.tokenCoding = tokenCoding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>        this.L = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>        if (tokenCoding instanceof Coding &amp;&amp; fValues != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>            Coding tc = (Coding) tokenCoding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>            if (tc == fitTokenCoding(fVlen, tc.L()))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>                this.L = tc.L();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>            // Otherwise, it's a non-default coding.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>    public void setUnfavoredCoding(CodingMethod unfavoredCoding) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>        this.unfavoredCoding = unfavoredCoding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>    public int favoredValueMaxLength() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>        if (L == 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>            return Integer.MAX_VALUE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>        else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>            return BandStructure.UNSIGNED5.setL(L).umax();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>    public void resortFavoredValues() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>        Coding tc = (Coding) tokenCoding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>        // Make a local copy before reordering.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>        fValues = BandStructure.realloc(fValues, 1+fVlen);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>        // Resort favoredValues within each byte-size cadre.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>        int fillp = 1;  // skip initial zero</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>        for (int n = 1; n &lt;= tc.B(); n++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>            int nmax = tc.byteMax(n);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>            if (nmax &gt; fVlen)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>                nmax = fVlen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>            if (nmax &lt; tc.byteMin(n))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>            int low = fillp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>            int high = nmax+1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>            if (high == low)  continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>            assert(high &gt; low)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>                : high+&quot;!&gt;&quot;+low;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>            assert(tc.getLength(low) == n)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>                : n+&quot; != len(&quot;+(low)+&quot;) == &quot;+</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>                  tc.getLength(low);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>            assert(tc.getLength(high-1) == n)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>                : n+&quot; != len(&quot;+(high-1)+&quot;) == &quot;+</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>                  tc.getLength(high-1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>            int midTarget = low + (high-low)/2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>            int mid = low;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>            // Divide the values into cadres, and sort within each.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>            int prevCount = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>            int prevLimit = low;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>            for (int i = low; i &lt; high; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>                int val = fValues[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>                int count = vHist.getFrequency(val);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>                if (prevCount != count) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>                    if (n == 1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>                        // For the single-byte encoding, keep strict order</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>                        // among frequency groups.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>                        Arrays.sort(fValues, prevLimit, i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>                    } else if (Math.abs(mid - midTarget) &gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>                               Math.abs(i   - midTarget)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>                        // Find a single inflection point</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>                        // close to the middle of the byte-size cadre.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>                        mid = i;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>                    prevCount = count;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>                    prevLimit = i;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>            if (n == 1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>                Arrays.sort(fValues, prevLimit, high);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>                // Sort up to the midpoint, if any.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>                Arrays.sort(fValues, low, mid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>                Arrays.sort(fValues, mid, high);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>            assert(tc.getLength(low) == tc.getLength(mid));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>            assert(tc.getLength(low) == tc.getLength(high-1));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>            fillp = nmax+1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>        assert(fillp == fValues.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>        // Reset symtab.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>        symtab = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>    public int getToken(int value) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>        if (symtab == null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>            symtab = makeSymtab();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>        int pos = Arrays.binarySearch(symtab, (long)value &lt;&lt; 32);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>        if (pos &lt; 0)  pos = -pos-1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>        if (pos &lt; symtab.length &amp;&amp; value == (int)(symtab[pos] &gt;&gt;&gt; 32))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>            return (int)symtab[pos];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>        else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>            return 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>    public int[][] encodeValues(int[] values, int start, int end) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>        // Compute token sequence.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>        int[] tokens = new int[end-start];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>        int nuv = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; tokens.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>            int val = values[start+i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>            int tok = getToken(val);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>            if (tok != 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>                tokens[i] = tok;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>            else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>                nuv += 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>        // Compute unfavored value sequence.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>        int[] unfavoredValues = new int[nuv];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>        nuv = 0;  // reset</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; tokens.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>            if (tokens[i] != 0)  continue;  // already covered</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>            int val = values[start+i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>            unfavoredValues[nuv++] = val;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>        assert(nuv == unfavoredValues.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>        return new int[][]{ tokens, unfavoredValues };</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>    private long[] makeSymtab() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>        long[] lsymtab = new long[fVlen];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>        for (int token = 1; token &lt;= fVlen; token++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>            lsymtab[token-1] = ((long)fValues[token] &lt;&lt; 32) | token;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>        // Index by value:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>        Arrays.sort(lsymtab);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>        return lsymtab;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>    private Coding getTailCoding(CodingMethod c) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>        while (c instanceof AdaptiveCoding)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>            c = ((AdaptiveCoding)c).tailCoding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>        return (Coding) c;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>    // CodingMethod methods.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>    public void writeArrayTo(OutputStream out, int[] a, int start, int end) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>        int[][] vals = encodeValues(a, start, end);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>        writeSequencesTo(out, vals[0], vals[1]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>    void writeSequencesTo(OutputStream out, int[] tokens, int[] uValues) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>        favoredCoding.writeArrayTo(out, fValues, 1, 1+fVlen);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>        getTailCoding(favoredCoding).writeTo(out, computeSentinelValue());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>        tokenCoding.writeArrayTo(out, tokens, 0, tokens.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>        if (uValues.length &gt; 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>            unfavoredCoding.writeArrayTo(out, uValues, 0, uValues.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>   int computeSentinelValue() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>        Coding fc = getTailCoding(favoredCoding);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>        if (fc.isDelta()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>            // repeat the last favored value, using delta=0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>            return 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>            // else repeat the shorter of the min or last value</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>            int min = fValues[1];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>            int last = min;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>            // (remember that fVlen is an inclusive limit in fValues)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>            for (int i = 2; i &lt;= fVlen; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>                last = fValues[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>                min = moreCentral(min, last);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>            int endVal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>            if (fc.getLength(min) &lt;= fc.getLength(last))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>                return min;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>            else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>                return last;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>   }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>    public void readArrayFrom(InputStream in, int[] a, int start, int end) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>        // Parameters are fCode, L, uCode.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>        setFavoredValues(readFavoredValuesFrom(in, end-start));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>        // Read the tokens.  Read them into the final array, for the moment.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>        tokenCoding.readArrayFrom(in, a, start, end);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>        // Decode the favored tokens.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>        int headp = 0, tailp = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>        int uVlen = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>        for (int i = start; i &lt; end; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>            int tok = a[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>            if (tok == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>                // Make a linked list, and decode in a second pass.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>                if (tailp &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>                    headp = i;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>                    a[tailp] = i;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>                tailp = i;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>                uVlen += 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>                a[i] = fValues[tok];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>        // Walk the linked list of &quot;zero&quot; locations, decoding unfavored vals.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>        int[] uValues = new int[uVlen];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>        if (uVlen &gt; 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>            unfavoredCoding.readArrayFrom(in, uValues, 0, uVlen);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; uVlen; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>            int nextp = a[headp];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>            a[headp] = uValues[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>            headp = nextp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>    int[] readFavoredValuesFrom(InputStream in, int maxForDebug) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>        int[] lfValues = new int[1000];  // realloc as needed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>        // The set uniqueValuesForDebug records all favored values.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>        // As each new value is added, we assert that the value</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>        // was not already in the set.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>        Set&lt;Integer&gt; uniqueValuesForDebug = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>        assert((uniqueValuesForDebug = new HashSet&lt;&gt;()) != null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>        int fillp = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>        maxForDebug += fillp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>        int min = Integer.MIN_VALUE;  // farthest from the center</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>        //int min2 = Integer.MIN_VALUE;  // emulate buggy 150.7 spec.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>        int last = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>        CodingMethod fcm = favoredCoding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>        while (fcm instanceof AdaptiveCoding) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>            AdaptiveCoding ac = (AdaptiveCoding) fcm;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>            int len = ac.headLength;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>            while (fillp + len &gt; lfValues.length) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>                lfValues = BandStructure.realloc(lfValues);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>            int newFillp = fillp + len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>            ac.headCoding.readArrayFrom(in, lfValues, fillp, newFillp);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>            while (fillp &lt; newFillp) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>                int val = lfValues[fillp++];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>                assert(uniqueValuesForDebug.add(val));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>                assert(fillp &lt;= maxForDebug);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>                last = val;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>                min = moreCentral(min, val);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>                //min2 = moreCentral2(min2, val, min);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>            fcm = ac.tailCoding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>        Coding fc = (Coding) fcm;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>        if (fc.isDelta()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>            for (long state = 0;;) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>                // Read a new value:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>                state += fc.readFrom(in);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>                int val;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>                if (fc.isSubrange())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>                    val = fc.reduceToUnsignedRange(state);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>                else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>                    val = (int)state;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>                state = val;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>                if (fillp &gt; 1 &amp;&amp; (val == last || val == min)) //|| val == min2</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>                if (fillp == lfValues.length)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>                    lfValues = BandStructure.realloc(lfValues);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>                lfValues[fillp++] = val;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>                assert(uniqueValuesForDebug.add(val));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>                assert(fillp &lt;= maxForDebug);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>                last = val;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>                min = moreCentral(min, val);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>                //min2 = moreCentral(min2, val);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>            for (;;) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>                int val = fc.readFrom(in);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>                if (fillp &gt; 1 &amp;&amp; (val == last || val == min)) //|| val == min2</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>                if (fillp == lfValues.length)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>                    lfValues = BandStructure.realloc(lfValues);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>                lfValues[fillp++] = val;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>                assert(uniqueValuesForDebug.add(val));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>                assert(fillp &lt;= maxForDebug);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>                last = val;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>                min = moreCentral(min, val);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>                //min2 = moreCentral2(min2, val, min);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>        return BandStructure.realloc(lfValues, fillp);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>    private static int moreCentral(int x, int y) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>        int kx = (x &gt;&gt; 31) ^ (x &lt;&lt; 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>        int ky = (y &gt;&gt; 31) ^ (y &lt;&lt; 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>        // bias kx/ky to get an unsigned comparison:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>        kx -= Integer.MIN_VALUE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>        ky -= Integer.MIN_VALUE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>        int xy = (kx &lt; ky? x: y);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>        // assert that this ALU-ish version is the same:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>        assert(xy == moreCentralSlow(x, y));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>        return xy;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>//  private static int moreCentral2(int x, int y, int min) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>//      // Strict implementation of buggy 150.7 specification.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>//      // The bug is that the spec. says absolute-value ties are broken</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>//      // in favor of positive numbers, but the suggested implementation</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>//      // (also mentioned in the spec.) breaks ties in favor of negatives.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>//      if (x + y == 0)  return (x &gt; y? x : y);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>//      return min;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>//  }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>    private static int moreCentralSlow(int x, int y) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>        int ax = x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>        if (ax &lt; 0)  ax = -ax;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>        if (ax &lt; 0)  return y;  //x is MIN_VALUE</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>        int ay = y;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>        if (ay &lt; 0)  ay = -ay;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>        if (ay &lt; 0)  return x;  //y is MIN_VALUE</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>        if (ax &lt; ay)  return x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>        if (ax &gt; ay)  return y;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>        // At this point the absolute values agree, and the negative wins.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>        return x &lt; y ? x : y;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>    static final int[] LValuesCoded</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>        = { -1, 4, 8, 16, 32, 64, 128, 192, 224, 240, 248, 252 };</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>    public byte[] getMetaCoding(Coding dflt) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>        int K = fVlen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>        int LCoded = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>        if (tokenCoding instanceof Coding) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>            Coding tc = (Coding) tokenCoding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>            if (tc.B() == 1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>                LCoded = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>            } else if (L &gt;= 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>                assert(L == tc.L());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>                for (int i = 1; i &lt; LValuesCoded.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>                    if (LValuesCoded[i] == L) { LCoded = i; break; }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>        CodingMethod tokenDflt = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>        if (LCoded != 0 &amp;&amp; tokenCoding == fitTokenCoding(fVlen, L)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>            // A simple L value is enough to recover the tokenCoding.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>            tokenDflt = tokenCoding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>        int FDef = (favoredCoding == dflt)?1:0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>        int UDef = (unfavoredCoding == dflt || unfavoredCoding == null)?1:0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>        int TDef = (tokenCoding == tokenDflt)?1:0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>        int TDefL = (TDef == 1) ? LCoded : 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>        assert(TDef == ((TDefL&gt;0)?1:0));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>        ByteArrayOutputStream bytes = new ByteArrayOutputStream(10);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>        bytes.write(_meta_pop + FDef + 2*UDef + 4*TDefL);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>            if (FDef == 0)  bytes.write(favoredCoding.getMetaCoding(dflt));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>            if (TDef == 0)  bytes.write(tokenCoding.getMetaCoding(dflt));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>            if (UDef == 0)  bytes.write(unfavoredCoding.getMetaCoding(dflt));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>        } catch (IOException ee) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>            throw new RuntimeException(ee);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>        return bytes.toByteArray();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>    public static int parseMetaCoding(byte[] bytes, int pos, Coding dflt, CodingMethod res[]) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>        int op = bytes[pos++] &amp; 0xFF;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>        if (op &lt; _meta_pop || op &gt;= _meta_limit)  return pos-1; // backup</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>        op -= _meta_pop;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>        int FDef = op % 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>        int UDef = (op / 2) % 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>        int TDefL = (op / 4);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>        int TDef = (TDefL &gt; 0)?1:0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>        int L = LValuesCoded[TDefL];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>        CodingMethod[] FCode = {dflt}, TCode = {null}, UCode = {dflt};</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>        if (FDef == 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>            pos = BandStructure.parseMetaCoding(bytes, pos, dflt, FCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>        if (TDef == 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>            pos = BandStructure.parseMetaCoding(bytes, pos, dflt, TCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>        if (UDef == 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>            pos = BandStructure.parseMetaCoding(bytes, pos, dflt, UCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>        PopulationCoding pop = new PopulationCoding();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>        pop.L = L;  // might be -1</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>        pop.favoredCoding   = FCode[0];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>        pop.tokenCoding     = TCode[0];  // might be null!</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>        pop.unfavoredCoding = UCode[0];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>        res[0] = pop;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>        return pos;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>    private String keyString(CodingMethod m) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>        if (m instanceof Coding)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>            return ((Coding)m).keyString();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>        if (m == null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>            return &quot;none&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>        return m.toString();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>    public String toString() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>        PropMap p200 = Utils.currentPropMap();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>        boolean verbose</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>            = (p200 != null &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>               p200.getBoolean(Utils.COM_PREFIX+&quot;verbose.pop&quot;));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>        StringBuilder res = new StringBuilder(100);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>        res.append(&quot;pop(&quot;).append(&quot;fVlen=&quot;).append(fVlen);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>        if (verbose &amp;&amp; fValues != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>            res.append(&quot; fV=[&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>            for (int i = 1; i &lt;= fVlen; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>                res.append(i==1?&quot;&quot;:&quot;,&quot;).append(fValues[i]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>            res.append(&quot;;&quot;).append(computeSentinelValue());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>            res.append(&quot;]&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>        res.append(&quot; fc=&quot;).append(keyString(favoredCoding));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>        res.append(&quot; tc=&quot;).append(keyString(tokenCoding));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>        res.append(&quot; uc=&quot;).append(keyString(unfavoredCoding));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>        res.append(&quot;)&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>        return res.toString();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

@@ -3,1066 +3,4243 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2004, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package sun.tools.jconsole;
-
-import com.sun.management.HotSpotDiagnosticMXBean;
-import com.sun.tools.jconsole.JConsoleContext;
-import java.beans.PropertyChangeListener;
-import java.beans.PropertyChangeEvent;
-import java.io.IOException;
-import java.lang.management.*;
-import static java.lang.management.ManagementFactory.*;
-import java.lang.ref.WeakReference;
-import java.lang.reflect.*;
-import java.rmi.*;
-import java.rmi.registry.*;
-import java.rmi.server.*;
-import java.util.*;
-import javax.management.*;
-import javax.management.remote.*;
-import javax.management.remote.rmi.*;
-import javax.rmi.ssl.SslRMIClientSocketFactory;
-import javax.swing.event.SwingPropertyChangeSupport;
-import sun.rmi.server.UnicastRef2;
-import sun.rmi.transport.LiveRef;
-
-public class ProxyClient implements JConsoleContext {
-
-    private ConnectionState connectionState = ConnectionState.DISCONNECTED;
-
-    // The SwingPropertyChangeSupport will fire events on the EDT
-    private SwingPropertyChangeSupport propertyChangeSupport =
-                                new SwingPropertyChangeSupport(this, true);
-
-    private static Map&lt;String, ProxyClient&gt; cache =
-        Collections.synchronizedMap(new HashMap&lt;String, ProxyClient&gt;());
-
-    private volatile boolean isDead = true;
-    private String hostName = null;
-    private int port = 0;
-    private String userName = null;
-    private String password = null;
-    private boolean hasPlatformMXBeans = false;
-    private boolean hasHotSpotDiagnosticMXBean= false;
-    private boolean hasCompilationMXBean = false;
-    private boolean supportsLockUsage = false;
-
-    // REVISIT: VMPanel and other places relying using getUrl().
-
-    // set only if it's created for local monitoring
-    private LocalVirtualMachine lvm;
-
-    // set only if it's created from a given URL via the Advanced tab
-    private String advancedUrl = null;
-
-    private JMXServiceURL jmxUrl = null;
-    private MBeanServerConnection mbsc = null;
-    private SnapshotMBeanServerConnection server = null;
-    private JMXConnector jmxc = null;
-    private RMIServer stub = null;
-    private static final SslRMIClientSocketFactory sslRMIClientSocketFactory =
-            new SslRMIClientSocketFactory();
-    private String registryHostName = null;
-    private int registryPort = 0;
-    private boolean vmConnector = false;
-    private boolean sslRegistry = false;
-    private boolean sslStub = false;
-    final private String connectionName;
-    final private String displayName;
-
-    private ClassLoadingMXBean    classLoadingMBean = null;
-    private CompilationMXBean     compilationMBean = null;
-    private MemoryMXBean          memoryMBean = null;
-    private OperatingSystemMXBean operatingSystemMBean = null;
-    private RuntimeMXBean         runtimeMBean = null;
-    private ThreadMXBean          threadMBean = null;
-
-    private com.sun.management.OperatingSystemMXBean sunOperatingSystemMXBean = null;
-    private HotSpotDiagnosticMXBean                  hotspotDiagnosticMXBean = null;
-
-    private List&lt;MemoryPoolProxy&gt;           memoryPoolProxies = null;
-    private List&lt;GarbageCollectorMXBean&gt;    garbageCollectorMBeans = null;
-
-    final static private String HOTSPOT_DIAGNOSTIC_MXBEAN_NAME =
-        &quot;com.sun.management:type=HotSpotDiagnostic&quot;;
-
-    private ProxyClient(String hostName, int port,
-                        String userName, String password) throws IOException {
-        this.connectionName = getConnectionName(hostName, port, userName);
-        this.displayName = connectionName;
-        if (hostName.equals(&quot;localhost&quot;) &amp;&amp; port == 0) {
-            // Monitor self
-            this.hostName = hostName;
-            this.port = port;
-        } else {
-            // Create an RMI connector client and connect it to
-            // the RMI connector server
-            final String urlPath = &quot;/jndi/rmi://&quot; + hostName + &quot;:&quot; + port +
-                                   &quot;/jmxrmi&quot;;
-            JMXServiceURL url = new JMXServiceURL(&quot;rmi&quot;, &quot;&quot;, 0, urlPath);
-            setParameters(url, userName, password);
-            vmConnector = true;
-            registryHostName = hostName;
-            registryPort = port;
-            checkSslConfig();
-        }
-    }
-
-    private ProxyClient(String url,
-                        String userName, String password) throws IOException {
-        this.advancedUrl = url;
-        this.connectionName = getConnectionName(url, userName);
-        this.displayName = connectionName;
-        setParameters(new JMXServiceURL(url), userName, password);
-    }
-
-    private ProxyClient(LocalVirtualMachine lvm) throws IOException {
-        this.lvm = lvm;
-        this.connectionName = getConnectionName(lvm);
-        this.displayName = &quot;pid: &quot; + lvm.vmid() + &quot; &quot; + lvm.displayName();
-    }
-
-    private void setParameters(JMXServiceURL url, String userName, String password) {
-        this.jmxUrl = url;
-        this.hostName = jmxUrl.getHost();
-        this.port = jmxUrl.getPort();
-        this.userName = userName;
-        this.password = password;
-    }
-
-    private static void checkStub(Remote stub,
-                                  Class&lt;? extends Remote&gt; stubClass) {
-        // Check remote stub is from the expected class.
-        //
-        if (stub.getClass() != stubClass) {
-            if (!Proxy.isProxyClass(stub.getClass())) {
-                throw new SecurityException(
-                    &quot;Expecting a &quot; + stubClass.getName() + &quot; stub!&quot;);
-            } else {
-                InvocationHandler handler = Proxy.getInvocationHandler(stub);
-                if (handler.getClass() != RemoteObjectInvocationHandler.class) {
-                    throw new SecurityException(
-                        &quot;Expecting a dynamic proxy instance with a &quot; +
-                        RemoteObjectInvocationHandler.class.getName() +
-                        &quot; invocation handler!&quot;);
-                } else {
-                    stub = (Remote) handler;
-                }
-            }
-        }
-        // Check RemoteRef in stub is from the expected class
-        // &quot;sun.rmi.server.UnicastRef2&quot;.
-        //
-        RemoteRef ref = ((RemoteObject)stub).getRef();
-        if (ref.getClass() != UnicastRef2.class) {
-            throw new SecurityException(
-                &quot;Expecting a &quot; + UnicastRef2.class.getName() +
-                &quot; remote reference in stub!&quot;);
-        }
-        // Check RMIClientSocketFactory in stub is from the expected class
-        // &quot;javax.rmi.ssl.SslRMIClientSocketFactory&quot;.
-        //
-        LiveRef liveRef = ((UnicastRef2)ref).getLiveRef();
-        RMIClientSocketFactory csf = liveRef.getClientSocketFactory();
-        if (csf == null || csf.getClass() != SslRMIClientSocketFactory.class) {
-            throw new SecurityException(
-                &quot;Expecting a &quot; + SslRMIClientSocketFactory.class.getName() +
-                &quot; RMI client socket factory in stub!&quot;);
-        }
-    }
-
-    private static final String rmiServerImplStubClassName =
-        &quot;javax.management.remote.rmi.RMIServerImpl_Stub&quot;;
-    private static final Class&lt;? extends Remote&gt; rmiServerImplStubClass;
-
-    static {
-        // FIXME: RMIServerImpl_Stub is generated at build time
-        // after jconsole is built.  We need to investigate if
-        // the Makefile can be fixed to build jconsole in the
-        // right order.  As a workaround for now, we dynamically
-        // load RMIServerImpl_Stub class instead of statically
-        // referencing it.
-        Class&lt;? extends Remote&gt; serverStubClass = null;
-        try {
-            serverStubClass = Class.forName(rmiServerImplStubClassName).asSubclass(Remote.class);
-        } catch (ClassNotFoundException e) {
-            // should never reach here
-            throw new InternalError(e.getMessage(), e);
-        }
-        rmiServerImplStubClass = serverStubClass;
-    }
-
-    private void checkSslConfig() throws IOException {
-        // Get the reference to the RMI Registry and lookup RMIServer stub
-        //
-        Registry registry;
-        try {
-            registry =
-                LocateRegistry.getRegistry(registryHostName, registryPort,
-                                           sslRMIClientSocketFactory);
-            try {
-                stub = (RMIServer) registry.lookup(&quot;jmxrmi&quot;);
-            } catch (NotBoundException nbe) {
-                throw (IOException)
-                    new IOException(nbe.getMessage()).initCause(nbe);
-            }
-            sslRegistry = true;
-        } catch (IOException e) {
-            registry =
-                LocateRegistry.getRegistry(registryHostName, registryPort);
-            try {
-                stub = (RMIServer) registry.lookup(&quot;jmxrmi&quot;);
-            } catch (NotBoundException nbe) {
-                throw (IOException)
-                    new IOException(nbe.getMessage()).initCause(nbe);
-            }
-            sslRegistry = false;
-        }
-        // Perform the checks for secure stub
-        //
-        try {
-            checkStub(stub, rmiServerImplStubClass);
-            sslStub = true;
-        } catch (SecurityException e) {
-            sslStub = false;
-        }
-    }
-
-    /**
-     * Returns true if the underlying RMI registry is SSL-protected.
-     *
-     * @exception UnsupportedOperationException If this {@code ProxyClient}
-     * does not denote a JMX connector for a JMX VM agent.
-     */
-    public boolean isSslRmiRegistry() {
-        // Check for VM connector
-        //
-        if (!isVmConnector()) {
-            throw new UnsupportedOperationException(
-                &quot;ProxyClient.isSslRmiRegistry() is only supported if this &quot; +
-                &quot;ProxyClient is a JMX connector for a JMX VM agent&quot;);
-        }
-        return sslRegistry;
-    }
-
-    /**
-     * Returns true if the retrieved RMI stub is SSL-protected.
-     *
-     * @exception UnsupportedOperationException If this {@code ProxyClient}
-     * does not denote a JMX connector for a JMX VM agent.
-     */
-    public boolean isSslRmiStub() {
-        // Check for VM connector
-        //
-        if (!isVmConnector()) {
-            throw new UnsupportedOperationException(
-                &quot;ProxyClient.isSslRmiStub() is only supported if this &quot; +
-                &quot;ProxyClient is a JMX connector for a JMX VM agent&quot;);
-        }
-        return sslStub;
-    }
-
-    /**
-     * Returns true if this {@code ProxyClient} denotes
-     * a JMX connector for a JMX VM agent.
-     */
-    public boolean isVmConnector() {
-        return vmConnector;
-    }
-
-    private void setConnectionState(ConnectionState state) {
-        ConnectionState oldState = this.connectionState;
-        this.connectionState = state;
-        propertyChangeSupport.firePropertyChange(CONNECTION_STATE_PROPERTY,
-                                                 oldState, state);
-    }
-
-    public ConnectionState getConnectionState() {
-        return this.connectionState;
-    }
-
-    void flush() {
-        if (server != null) {
-            server.flush();
-        }
-    }
-
-    void connect(boolean requireSSL) {
-        setConnectionState(ConnectionState.CONNECTING);
-        try {
-            tryConnect(requireSSL);
-            setConnectionState(ConnectionState.CONNECTED);
-        } catch (Exception e) {
-            if (JConsole.isDebug()) {
-                e.printStackTrace();
-            }
-            setConnectionState(ConnectionState.DISCONNECTED);
-        }
-    }
-
-    private void tryConnect(boolean requireRemoteSSL) throws IOException {
-        if (jmxUrl == null &amp;&amp; &quot;localhost&quot;.equals(hostName) &amp;&amp; port == 0) {
-            // Monitor self
-            this.jmxc = null;
-            this.mbsc = ManagementFactory.getPlatformMBeanServer();
-            this.server = Snapshot.newSnapshot(mbsc);
-        } else {
-            // Monitor another process
-            if (lvm != null) {
-                if (!lvm.isManageable()) {
-                    lvm.startManagementAgent();
-                    if (!lvm.isManageable()) {
-                        // FIXME: what to throw
-                        throw new IOException(lvm + &quot;not manageable&quot;);
-                    }
-                }
-                if (this.jmxUrl == null) {
-                    this.jmxUrl = new JMXServiceURL(lvm.connectorAddress());
-                }
-            }
-            Map&lt;String, Object&gt; env = new HashMap&lt;String, Object&gt;();
-            if (requireRemoteSSL) {
-                env.put(&quot;jmx.remote.x.check.stub&quot;, &quot;true&quot;);
-            }
-            // Need to pass in credentials ?
-            if (userName == null &amp;&amp; password == null) {
-                if (isVmConnector()) {
-                    // Check for SSL config on reconnection only
-                    if (stub == null) {
-                        checkSslConfig();
-                    }
-                    this.jmxc = new RMIConnector(stub, null);
-                    jmxc.connect(env);
-                } else {
-                    this.jmxc = JMXConnectorFactory.connect(jmxUrl, env);
-                }
-            } else {
-                env.put(JMXConnector.CREDENTIALS,
-                        new String[] {userName, password});
-                if (isVmConnector()) {
-                    // Check for SSL config on reconnection only
-                    if (stub == null) {
-                        checkSslConfig();
-                    }
-                    this.jmxc = new RMIConnector(stub, null);
-                    jmxc.connect(env);
-                } else {
-                    this.jmxc = JMXConnectorFactory.connect(jmxUrl, env);
-                }
-            }
-            this.mbsc = jmxc.getMBeanServerConnection();
-            this.server = Snapshot.newSnapshot(mbsc);
-        }
-        this.isDead = false;
-
-        try {
-            ObjectName on = new ObjectName(THREAD_MXBEAN_NAME);
-            this.hasPlatformMXBeans = server.isRegistered(on);
-            this.hasHotSpotDiagnosticMXBean =
-                server.isRegistered(new ObjectName(HOTSPOT_DIAGNOSTIC_MXBEAN_NAME));
-            // check if it has 6.0 new APIs
-            if (this.hasPlatformMXBeans) {
-                MBeanOperationInfo[] mopis = server.getMBeanInfo(on).getOperations();
-                // look for findDeadlockedThreads operations;
-                for (MBeanOperationInfo op : mopis) {
-                    if (op.getName().equals(&quot;findDeadlockedThreads&quot;)) {
-                        this.supportsLockUsage = true;
-                        break;
-                    }
-                }
-
-                on = new ObjectName(COMPILATION_MXBEAN_NAME);
-                this.hasCompilationMXBean = server.isRegistered(on);
-            }
-        } catch (MalformedObjectNameException e) {
-            // should not reach here
-            throw new InternalError(e.getMessage());
-        } catch (IntrospectionException |
-                 InstanceNotFoundException |
-                 ReflectionException e) {
-            throw new InternalError(e.getMessage(), e);
-        }
-
-        if (hasPlatformMXBeans) {
-            // WORKAROUND for bug 5056632
-            // Check if the access role is correct by getting a RuntimeMXBean
-            getRuntimeMXBean();
-        }
-    }
-
-    /**
-     * Gets a proxy client for a given local virtual machine.
-     */
-    public static ProxyClient getProxyClient(LocalVirtualMachine lvm)
-        throws IOException {
-        final String key = getCacheKey(lvm);
-        ProxyClient proxyClient = cache.get(key);
-        if (proxyClient == null) {
-            proxyClient = new ProxyClient(lvm);
-            cache.put(key, proxyClient);
-        }
-        return proxyClient;
-    }
-
-    public static String getConnectionName(LocalVirtualMachine lvm) {
-        return Integer.toString(lvm.vmid());
-    }
-
-    private static String getCacheKey(LocalVirtualMachine lvm) {
-        return Integer.toString(lvm.vmid());
-    }
-
-    /**
-     * Gets a proxy client for a given JMXServiceURL.
-     */
-    public static ProxyClient getProxyClient(String url,
-                                             String userName, String password)
-        throws IOException {
-        final String key = getCacheKey(url, userName, password);
-        ProxyClient proxyClient = cache.get(key);
-        if (proxyClient == null) {
-            proxyClient = new ProxyClient(url, userName, password);
-            cache.put(key, proxyClient);
-        }
-        return proxyClient;
-    }
-
-    public static String getConnectionName(String url,
-                                           String userName) {
-        if (userName != null &amp;&amp; userName.length() &gt; 0) {
-            return userName + &quot;@&quot; + url;
-        } else {
-            return url;
-        }
-    }
-
-    private static String getCacheKey(String url,
-                                      String userName, String password) {
-        return (url == null ? &quot;&quot; : url) + &quot;:&quot; +
-               (userName == null ? &quot;&quot; : userName) + &quot;:&quot; +
-               (password == null ? &quot;&quot; : password);
-    }
-
-    /**
-     * Gets a proxy client for a given &quot;hostname:port&quot;.
-     */
-    public static ProxyClient getProxyClient(String hostName, int port,
-                                             String userName, String password)
-        throws IOException {
-        final String key = getCacheKey(hostName, port, userName, password);
-        ProxyClient proxyClient = cache.get(key);
-        if (proxyClient == null) {
-            proxyClient = new ProxyClient(hostName, port, userName, password);
-            cache.put(key, proxyClient);
-        }
-        return proxyClient;
-    }
-
-    public static String getConnectionName(String hostName, int port,
-                                           String userName) {
-        String name = hostName + &quot;:&quot; + port;
-        if (userName != null &amp;&amp; userName.length() &gt; 0) {
-            return userName + &quot;@&quot; + name;
-        } else {
-            return name;
-        }
-    }
-
-    private static String getCacheKey(String hostName, int port,
-                                      String userName, String password) {
-        return (hostName == null ? &quot;&quot; : hostName) + &quot;:&quot; +
-               port + &quot;:&quot; +
-               (userName == null ? &quot;&quot; : userName) + &quot;:&quot; +
-               (password == null ? &quot;&quot; : password);
-    }
-
-    public String connectionName() {
-        return connectionName;
-    }
-
-    public String getDisplayName() {
-        return displayName;
-    }
-
-    public String toString() {
-        if (!isConnected()) {
-            return Resources.format(Messages.CONNECTION_NAME__DISCONNECTED_, displayName);
-        } else {
-            return displayName;
-        }
-    }
-
-   public MBeanServerConnection getMBeanServerConnection() {
-       return mbsc;
-   }
-
-    public SnapshotMBeanServerConnection getSnapshotMBeanServerConnection() {
-        return server;
-    }
-
-    public String getUrl() {
-        return advancedUrl;
-    }
-
-    public String getHostName() {
-        return hostName;
-    }
-
-    public int getPort() {
-        return port;
-    }
-
-    public int getVmid() {
-        return (lvm != null) ? lvm.vmid() : 0;
-    }
-
-    public String getUserName() {
-        return userName;
-    }
-
-    public String getPassword() {
-        return password;
-    }
-
-    public void disconnect() {
-        // Reset remote stub
-        stub = null;
-        // Close MBeanServer connection
-        if (jmxc != null) {
-            try {
-                jmxc.close();
-            } catch (IOException e) {
-                // Ignore ???
-            }
-        }
-        // Reset platform MBean references
-        classLoadingMBean = null;
-        compilationMBean = null;
-        memoryMBean = null;
-        operatingSystemMBean = null;
-        runtimeMBean = null;
-        threadMBean = null;
-        sunOperatingSystemMXBean = null;
-        garbageCollectorMBeans = null;
-        // Set connection state to DISCONNECTED
-        if (!isDead) {
-            isDead = true;
-            setConnectionState(ConnectionState.DISCONNECTED);
-        }
-    }
-
-    /**
-     * Returns the list of domains in which any MBean is
-     * currently registered.
-     */
-    public String[] getDomains() throws IOException {
-        return server.getDomains();
-    }
-
-    /**
-     * Returns a map of MBeans with ObjectName as the key and MBeanInfo value
-     * of a given domain.  If domain is &lt;tt&gt;null&lt;/tt&gt;, all MBeans
-     * are returned.  If no MBean found, an empty map is returned.
-     *
-     */
-    public Map&lt;ObjectName, MBeanInfo&gt; getMBeans(String domain)
-        throws IOException {
-
-        ObjectName name = null;
-        if (domain != null) {
-            try {
-                name = new ObjectName(domain + &quot;:*&quot;);
-            } catch (MalformedObjectNameException e) {
-                // should not reach here
-                assert(false);
-            }
-        }
-        Set&lt;ObjectName&gt; mbeans = server.queryNames(name, null);
-        Map&lt;ObjectName,MBeanInfo&gt; result =
-            new HashMap&lt;ObjectName,MBeanInfo&gt;(mbeans.size());
-        Iterator&lt;ObjectName&gt; iterator = mbeans.iterator();
-        while (iterator.hasNext()) {
-            Object object = iterator.next();
-            if (object instanceof ObjectName) {
-                ObjectName o = (ObjectName)object;
-                try {
-                    MBeanInfo info = server.getMBeanInfo(o);
-                    result.put(o, info);
-                } catch (IntrospectionException e) {
-                    // TODO: should log the error
-                } catch (InstanceNotFoundException e) {
-                    // TODO: should log the error
-                } catch (ReflectionException e) {
-                    // TODO: should log the error
-                }
-            }
-        }
-        return result;
-    }
-
-    /**
-     * Returns a list of attributes of a named MBean.
-     *
-     */
-    public AttributeList getAttributes(ObjectName name, String[] attributes)
-        throws IOException {
-        AttributeList list = null;
-        try {
-            list = server.getAttributes(name, attributes);
-        } catch (InstanceNotFoundException e) {
-            // TODO: A MBean may have been unregistered.
-            // need to set up listener to listen for MBeanServerNotification.
-        } catch (ReflectionException e) {
-            // TODO: should log the error
-        }
-        return list;
-    }
-
-    /**
-     * Set the value of a specific attribute of a named MBean.
-     */
-    public void setAttribute(ObjectName name, Attribute attribute)
-        throws InvalidAttributeValueException,
-               MBeanException,
-               IOException {
-        try {
-            server.setAttribute(name, attribute);
-        } catch (InstanceNotFoundException e) {
-            // TODO: A MBean may have been unregistered.
-        } catch (AttributeNotFoundException e) {
-            assert(false);
-        } catch (ReflectionException e) {
-            // TODO: should log the error
-        }
-    }
-
-    /**
-     * Invokes an operation of a named MBean.
-     *
-     * @throws MBeanException Wraps an exception thrown by
-     *      the MBean's invoked method.
-     */
-    public Object invoke(ObjectName name, String operationName,
-                         Object[] params, String[] signature)
-        throws IOException, MBeanException {
-        Object result = null;
-        try {
-            result = server.invoke(name, operationName, params, signature);
-        } catch (InstanceNotFoundException e) {
-            // TODO: A MBean may have been unregistered.
-        } catch (ReflectionException e) {
-            // TODO: should log the error
-        }
-        return result;
-    }
-
-    public synchronized ClassLoadingMXBean getClassLoadingMXBean() throws IOException {
-        if (hasPlatformMXBeans &amp;&amp; classLoadingMBean == null) {
-            classLoadingMBean =
-                newPlatformMXBeanProxy(server, CLASS_LOADING_MXBEAN_NAME,
-                                       ClassLoadingMXBean.class);
-        }
-        return classLoadingMBean;
-    }
-
-    public synchronized CompilationMXBean getCompilationMXBean() throws IOException {
-        if (hasCompilationMXBean &amp;&amp; compilationMBean == null) {
-            compilationMBean =
-                newPlatformMXBeanProxy(server, COMPILATION_MXBEAN_NAME,
-                                       CompilationMXBean.class);
-        }
-        return compilationMBean;
-    }
-
-    public Collection&lt;MemoryPoolProxy&gt; getMemoryPoolProxies()
-        throws IOException {
-
-        // TODO: How to deal with changes to the list??
-        if (memoryPoolProxies == null) {
-            ObjectName poolName = null;
-            try {
-                poolName = new ObjectName(MEMORY_POOL_MXBEAN_DOMAIN_TYPE + &quot;,*&quot;);
-            } catch (MalformedObjectNameException e) {
-                // should not reach here
-                assert(false);
-            }
-            Set&lt;ObjectName&gt; mbeans = server.queryNames(poolName, null);
-            if (mbeans != null) {
-                memoryPoolProxies = new ArrayList&lt;MemoryPoolProxy&gt;();
-                Iterator&lt;ObjectName&gt; iterator = mbeans.iterator();
-                while (iterator.hasNext()) {
-                    ObjectName objName = (ObjectName) iterator.next();
-                    MemoryPoolProxy p = new MemoryPoolProxy(this, objName);
-                    memoryPoolProxies.add(p);
-                }
-            }
-        }
-        return memoryPoolProxies;
-    }
-
-    public synchronized Collection&lt;GarbageCollectorMXBean&gt; getGarbageCollectorMXBeans()
-        throws IOException {
-
-        // TODO: How to deal with changes to the list??
-        if (garbageCollectorMBeans == null) {
-            ObjectName gcName = null;
-            try {
-                gcName = new ObjectName(GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE + &quot;,*&quot;);
-            } catch (MalformedObjectNameException e) {
-                // should not reach here
-                assert(false);
-            }
-            Set&lt;ObjectName&gt; mbeans = server.queryNames(gcName, null);
-            if (mbeans != null) {
-                garbageCollectorMBeans = new ArrayList&lt;GarbageCollectorMXBean&gt;();
-                Iterator&lt;ObjectName&gt; iterator = mbeans.iterator();
-                while (iterator.hasNext()) {
-                    ObjectName on = (ObjectName) iterator.next();
-                    String name = GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE +
-                        &quot;,name=&quot; + on.getKeyProperty(&quot;name&quot;);
-
-                    GarbageCollectorMXBean mBean =
-                        newPlatformMXBeanProxy(server, name,
-                                               GarbageCollectorMXBean.class);
-                        garbageCollectorMBeans.add(mBean);
-                }
-            }
-        }
-        return garbageCollectorMBeans;
-    }
-
-    public synchronized MemoryMXBean getMemoryMXBean() throws IOException {
-        if (hasPlatformMXBeans &amp;&amp; memoryMBean == null) {
-            memoryMBean =
-                newPlatformMXBeanProxy(server, MEMORY_MXBEAN_NAME,
-                                       MemoryMXBean.class);
-        }
-        return memoryMBean;
-    }
-
-    public synchronized RuntimeMXBean getRuntimeMXBean() throws IOException {
-        if (hasPlatformMXBeans &amp;&amp; runtimeMBean == null) {
-            runtimeMBean =
-                newPlatformMXBeanProxy(server, RUNTIME_MXBEAN_NAME,
-                                       RuntimeMXBean.class);
-        }
-        return runtimeMBean;
-    }
-
-
-    public synchronized ThreadMXBean getThreadMXBean() throws IOException {
-        if (hasPlatformMXBeans &amp;&amp; threadMBean == null) {
-            threadMBean =
-                newPlatformMXBeanProxy(server, THREAD_MXBEAN_NAME,
-                                       ThreadMXBean.class);
-        }
-        return threadMBean;
-    }
-
-    public synchronized OperatingSystemMXBean getOperatingSystemMXBean() throws IOException {
-        if (hasPlatformMXBeans &amp;&amp; operatingSystemMBean == null) {
-            operatingSystemMBean =
-                newPlatformMXBeanProxy(server, OPERATING_SYSTEM_MXBEAN_NAME,
-                                       OperatingSystemMXBean.class);
-        }
-        return operatingSystemMBean;
-    }
-
-    public synchronized com.sun.management.OperatingSystemMXBean
-        getSunOperatingSystemMXBean() throws IOException {
-
-        try {
-            ObjectName on = new ObjectName(OPERATING_SYSTEM_MXBEAN_NAME);
-            if (sunOperatingSystemMXBean == null) {
-                if (server.isInstanceOf(on,
-                        &quot;com.sun.management.OperatingSystemMXBean&quot;)) {
-                    sunOperatingSystemMXBean =
-                        newPlatformMXBeanProxy(server,
-                            OPERATING_SYSTEM_MXBEAN_NAME,
-                            com.sun.management.OperatingSystemMXBean.class);
-                }
-            }
-        } catch (InstanceNotFoundException e) {
-             return null;
-        } catch (MalformedObjectNameException e) {
-             return null; // should never reach here
-        }
-        return sunOperatingSystemMXBean;
-    }
-
-    public synchronized HotSpotDiagnosticMXBean getHotSpotDiagnosticMXBean() throws IOException {
-        if (hasHotSpotDiagnosticMXBean &amp;&amp; hotspotDiagnosticMXBean == null) {
-            hotspotDiagnosticMXBean =
-                newPlatformMXBeanProxy(server, HOTSPOT_DIAGNOSTIC_MXBEAN_NAME,
-                                       HotSpotDiagnosticMXBean.class);
-        }
-        return hotspotDiagnosticMXBean;
-    }
-
-    public &lt;T&gt; T getMXBean(ObjectName objName, Class&lt;T&gt; interfaceClass)
-        throws IOException {
-        return newPlatformMXBeanProxy(server,
-                                      objName.toString(),
-                                      interfaceClass);
-
-    }
-
-    // Return thread IDs of deadlocked threads or null if any.
-    // It finds deadlocks involving only monitors if it's a Tiger VM.
-    // Otherwise, it finds deadlocks involving both monitors and
-    // the concurrent locks.
-    public long[] findDeadlockedThreads() throws IOException {
-        ThreadMXBean tm = getThreadMXBean();
-        if (supportsLockUsage &amp;&amp; tm.isSynchronizerUsageSupported()) {
-            return tm.findDeadlockedThreads();
-        } else {
-            return tm.findMonitorDeadlockedThreads();
-        }
-    }
-
-    public synchronized void markAsDead() {
-        disconnect();
-    }
-
-    public boolean isDead() {
-        return isDead;
-    }
-
-    boolean isConnected() {
-        return !isDead();
-    }
-
-    boolean hasPlatformMXBeans() {
-        return this.hasPlatformMXBeans;
-    }
-
-    boolean hasHotSpotDiagnosticMXBean() {
-        return this.hasHotSpotDiagnosticMXBean;
-    }
-
-    boolean isLockUsageSupported() {
-        return supportsLockUsage;
-    }
-
-    public boolean isRegistered(ObjectName name) throws IOException {
-        return server.isRegistered(name);
-    }
-
-    public void addPropertyChangeListener(PropertyChangeListener listener) {
-        propertyChangeSupport.addPropertyChangeListener(listener);
-    }
-
-    public void addWeakPropertyChangeListener(PropertyChangeListener listener) {
-        if (!(listener instanceof WeakPCL)) {
-            listener = new WeakPCL(listener);
-        }
-        propertyChangeSupport.addPropertyChangeListener(listener);
-    }
-
-    public void removePropertyChangeListener(PropertyChangeListener listener) {
-        if (!(listener instanceof WeakPCL)) {
-            // Search for the WeakPCL holding this listener (if any)
-            for (PropertyChangeListener pcl : propertyChangeSupport.getPropertyChangeListeners()) {
-                if (pcl instanceof WeakPCL &amp;&amp; ((WeakPCL)pcl).get() == listener) {
-                    listener = pcl;
-                    break;
-                }
-            }
-        }
-        propertyChangeSupport.removePropertyChangeListener(listener);
-    }
-
-    /**
-     * The PropertyChangeListener is handled via a WeakReference
-     * so as not to pin down the listener.
-     */
-    private class WeakPCL extends WeakReference&lt;PropertyChangeListener&gt;
-                          implements PropertyChangeListener {
-        WeakPCL(PropertyChangeListener referent) {
-            super(referent);
-        }
-
-        public void propertyChange(PropertyChangeEvent pce) {
-            PropertyChangeListener pcl = get();
-
-            if (pcl == null) {
-                // The referent listener was GC'ed, we're no longer
-                // interested in PropertyChanges, remove the listener.
-                dispose();
-            } else {
-                pcl.propertyChange(pce);
-            }
-        }
-
-        private void dispose() {
-            removePropertyChangeListener(this);
-        }
-    }
-
-    //
-    // Snapshot MBeanServerConnection:
-    //
-    // This is an object that wraps an existing MBeanServerConnection and adds
-    // caching to it, as follows:
-    //
-    // - The first time an attribute is called in a given MBean, the result is
-    //   cached. Every subsequent time getAttribute is called for that attribute
-    //   the cached result is returned.
-    //
-    // - Before every call to VMPanel.update() or when the Refresh button in the
-    //   Attributes table is pressed down the attributes cache is flushed. Then
-    //   any subsequent call to getAttribute will retrieve all the values for
-    //   the attributes that are known to the cache.
-    //
-    // - The attributes cache uses a learning approach and only the attributes
-    //   that are in the cache will be retrieved between two subsequent updates.
-    //
-
-    public interface SnapshotMBeanServerConnection
-            extends MBeanServerConnection {
-        /**
-         * Flush all cached values of attributes.
-         */
-        public void flush();
-    }
-
-    public static class Snapshot {
-        private Snapshot() {
-        }
-        public static SnapshotMBeanServerConnection
-                newSnapshot(MBeanServerConnection mbsc) {
-            final InvocationHandler ih = new SnapshotInvocationHandler(mbsc);
-            return (SnapshotMBeanServerConnection) Proxy.newProxyInstance(
-                    Snapshot.class.getClassLoader(),
-                    new Class[] {SnapshotMBeanServerConnection.class},
-                    ih);
-        }
-    }
-
-    static class SnapshotInvocationHandler implements InvocationHandler {
-
-        private final MBeanServerConnection conn;
-        private Map&lt;ObjectName, NameValueMap&gt; cachedValues = newMap();
-        private Map&lt;ObjectName, Set&lt;String&gt;&gt; cachedNames = newMap();
-
-        @SuppressWarnings(&quot;serial&quot;)
-        private static final class NameValueMap
-                extends HashMap&lt;String, Object&gt; {}
-
-        SnapshotInvocationHandler(MBeanServerConnection conn) {
-            this.conn = conn;
-        }
-
-        synchronized void flush() {
-            cachedValues = newMap();
-        }
-
-        public Object invoke(Object proxy, Method method, Object[] args)
-                throws Throwable {
-            final String methodName = method.getName();
-            if (methodName.equals(&quot;getAttribute&quot;)) {
-                return getAttribute((ObjectName) args[0], (String) args[1]);
-            } else if (methodName.equals(&quot;getAttributes&quot;)) {
-                return getAttributes((ObjectName) args[0], (String[]) args[1]);
-            } else if (methodName.equals(&quot;flush&quot;)) {
-                flush();
-                return null;
-            } else {
-                try {
-                    return method.invoke(conn, args);
-                } catch (InvocationTargetException e) {
-                    throw e.getCause();
-                }
-            }
-        }
-
-        private Object getAttribute(ObjectName objName, String attrName)
-                throws MBeanException, InstanceNotFoundException,
-                AttributeNotFoundException, ReflectionException, IOException {
-            final NameValueMap values = getCachedAttributes(
-                    objName, Collections.singleton(attrName));
-            Object value = values.get(attrName);
-            if (value != null || values.containsKey(attrName)) {
-                return value;
-            }
-            // Not in cache, presumably because it was omitted from the
-            // getAttributes result because of an exception.  Following
-            // call will probably provoke the same exception.
-            return conn.getAttribute(objName, attrName);
-        }
-
-        private AttributeList getAttributes(
-                ObjectName objName, String[] attrNames) throws
-                InstanceNotFoundException, ReflectionException, IOException {
-            final NameValueMap values = getCachedAttributes(
-                    objName,
-                    new TreeSet&lt;String&gt;(Arrays.asList(attrNames)));
-            final AttributeList list = new AttributeList();
-            for (String attrName : attrNames) {
-                final Object value = values.get(attrName);
-                if (value != null || values.containsKey(attrName)) {
-                    list.add(new Attribute(attrName, value));
-                }
-            }
-            return list;
-        }
-
-        private synchronized NameValueMap getCachedAttributes(
-                ObjectName objName, Set&lt;String&gt; attrNames) throws
-                InstanceNotFoundException, ReflectionException, IOException {
-            NameValueMap values = cachedValues.get(objName);
-            if (values != null &amp;&amp; values.keySet().containsAll(attrNames)) {
-                return values;
-            }
-            attrNames = new TreeSet&lt;String&gt;(attrNames);
-            Set&lt;String&gt; oldNames = cachedNames.get(objName);
-            if (oldNames != null) {
-                attrNames.addAll(oldNames);
-            }
-            values = new NameValueMap();
-            final AttributeList attrs = conn.getAttributes(
-                    objName,
-                    attrNames.toArray(new String[attrNames.size()]));
-            for (Attribute attr : attrs.asList()) {
-                values.put(attr.getName(), attr.getValue());
-            }
-            cachedValues.put(objName, values);
-            cachedNames.put(objName, attrNames);
-            return values;
-        }
-
-        // See http://www.artima.com/weblogs/viewpost.jsp?thread=79394
-        private static &lt;K, V&gt; Map&lt;K, V&gt; newMap() {
-            return new HashMap&lt;K, V&gt;();
-        }
-    }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2004, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package sun.tools.jconsole;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import com.sun.management.HotSpotDiagnosticMXBean;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import com.sun.tools.jconsole.JConsoleContext;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.beans.PropertyChangeListener;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.beans.PropertyChangeEvent;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.io.IOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.lang.management.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import static java.lang.management.ManagementFactory.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import java.lang.ref.WeakReference;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.lang.reflect.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import java.rmi.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import java.rmi.registry.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import java.rmi.server.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre>import java.util.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre>import javax.management.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>import javax.management.remote.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>import javax.management.remote.rmi.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre>import javax.rmi.ssl.SslRMIClientSocketFactory;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre>import javax.swing.event.SwingPropertyChangeSupport;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>import sun.rmi.server.UnicastRef2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre>import sun.rmi.transport.LiveRef;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre>public class ProxyClient implements JConsoleContext {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>    private ConnectionState connectionState = ConnectionState.DISCONNECTED;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre>    // The SwingPropertyChangeSupport will fire events on the EDT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre>    private SwingPropertyChangeSupport propertyChangeSupport =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>                                new SwingPropertyChangeSupport(this, true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>    private static Map&lt;String, ProxyClient&gt; cache =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>        Collections.synchronizedMap(new HashMap&lt;String, ProxyClient&gt;());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>    private volatile boolean isDead = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>    private String hostName = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre>    private int port = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>    private String userName = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>    private String password = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>    private boolean hasPlatformMXBeans = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>    private boolean hasHotSpotDiagnosticMXBean= false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>    private boolean hasCompilationMXBean = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>    private boolean supportsLockUsage = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>    // REVISIT: VMPanel and other places relying using getUrl().</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>    // set only if it's created for local monitoring</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>    private LocalVirtualMachine lvm;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>    // set only if it's created from a given URL via the Advanced tab</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>    private String advancedUrl = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>    private JMXServiceURL jmxUrl = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>    private MBeanServerConnection mbsc = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>    private SnapshotMBeanServerConnection server = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>    private JMXConnector jmxc = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>    private RMIServer stub = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>    private static final SslRMIClientSocketFactory sslRMIClientSocketFactory =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>            new SslRMIClientSocketFactory();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>    private String registryHostName = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>    private int registryPort = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>    private boolean vmConnector = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>    private boolean sslRegistry = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>    private boolean sslStub = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>    final private String connectionName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>    final private String displayName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>    private ClassLoadingMXBean    classLoadingMBean = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>    private CompilationMXBean     compilationMBean = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>    private MemoryMXBean          memoryMBean = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>    private OperatingSystemMXBean operatingSystemMBean = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>    private RuntimeMXBean         runtimeMBean = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>    private ThreadMXBean          threadMBean = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>    private com.sun.management.OperatingSystemMXBean sunOperatingSystemMXBean = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>    private HotSpotDiagnosticMXBean                  hotspotDiagnosticMXBean = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>    private List&lt;MemoryPoolProxy&gt;           memoryPoolProxies = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>    private List&lt;GarbageCollectorMXBean&gt;    garbageCollectorMBeans = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>    final static private String HOTSPOT_DIAGNOSTIC_MXBEAN_NAME =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>        &quot;com.sun.management:type=HotSpotDiagnostic&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>    private ProxyClient(String hostName, int port,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>                        String userName, String password) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>        this.connectionName = getConnectionName(hostName, port, userName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>        this.displayName = connectionName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>        if (hostName.equals(&quot;localhost&quot;) &amp;&amp; port == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>            // Monitor self</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>            this.hostName = hostName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>            this.port = port;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>            // Create an RMI connector client and connect it to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>            // the RMI connector server</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>            final String urlPath = &quot;/jndi/rmi://&quot; + hostName + &quot;:&quot; + port +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>                                   &quot;/jmxrmi&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>            JMXServiceURL url = new JMXServiceURL(&quot;rmi&quot;, &quot;&quot;, 0, urlPath);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>            setParameters(url, userName, password);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>            vmConnector = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>            registryHostName = hostName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>            registryPort = port;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>            checkSslConfig();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>    private ProxyClient(String url,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>                        String userName, String password) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>        this.advancedUrl = url;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>        this.connectionName = getConnectionName(url, userName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>        this.displayName = connectionName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>        setParameters(new JMXServiceURL(url), userName, password);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>    private ProxyClient(LocalVirtualMachine lvm) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>        this.lvm = lvm;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>        this.connectionName = getConnectionName(lvm);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>        this.displayName = &quot;pid: &quot; + lvm.vmid() + &quot; &quot; + lvm.displayName();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>    private void setParameters(JMXServiceURL url, String userName, String password) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>        this.jmxUrl = url;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>        this.hostName = jmxUrl.getHost();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>        this.port = jmxUrl.getPort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>        this.userName = userName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>        this.password = password;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>    private static void checkStub(Remote stub,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>                                  Class&lt;? extends Remote&gt; stubClass) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>        // Check remote stub is from the expected class.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>        if (stub.getClass() != stubClass) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>            if (!Proxy.isProxyClass(stub.getClass())) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>                throw new SecurityException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>                    &quot;Expecting a &quot; + stubClass.getName() + &quot; stub!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>                InvocationHandler handler = Proxy.getInvocationHandler(stub);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>                if (handler.getClass() != RemoteObjectInvocationHandler.class) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>                    throw new SecurityException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>                        &quot;Expecting a dynamic proxy instance with a &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>                        RemoteObjectInvocationHandler.class.getName() +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>                        &quot; invocation handler!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>                    stub = (Remote) handler;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>        // Check RemoteRef in stub is from the expected class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>        // &quot;sun.rmi.server.UnicastRef2&quot;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>        RemoteRef ref = ((RemoteObject)stub).getRef();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>        if (ref.getClass() != UnicastRef2.class) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>            throw new SecurityException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>                &quot;Expecting a &quot; + UnicastRef2.class.getName() +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>                &quot; remote reference in stub!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>        // Check RMIClientSocketFactory in stub is from the expected class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>        // &quot;javax.rmi.ssl.SslRMIClientSocketFactory&quot;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>        LiveRef liveRef = ((UnicastRef2)ref).getLiveRef();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>        RMIClientSocketFactory csf = liveRef.getClientSocketFactory();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>        if (csf == null || csf.getClass() != SslRMIClientSocketFactory.class) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>            throw new SecurityException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>                &quot;Expecting a &quot; + SslRMIClientSocketFactory.class.getName() +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>                &quot; RMI client socket factory in stub!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>    private static final String rmiServerImplStubClassName =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>        &quot;javax.management.remote.rmi.RMIServerImpl_Stub&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>    private static final Class&lt;? extends Remote&gt; rmiServerImplStubClass;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>    static {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>        // FIXME: RMIServerImpl_Stub is generated at build time</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>        // after jconsole is built.  We need to investigate if</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>        // the Makefile can be fixed to build jconsole in the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>        // right order.  As a workaround for now, we dynamically</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>        // load RMIServerImpl_Stub class instead of statically</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>        // referencing it.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>        Class&lt;? extends Remote&gt; serverStubClass = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>            serverStubClass = Class.forName(rmiServerImplStubClassName).asSubclass(Remote.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>        } catch (ClassNotFoundException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>            // should never reach here</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>            throw new InternalError(e.getMessage(), e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>        rmiServerImplStubClass = serverStubClass;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>    private void checkSslConfig() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>        // Get the reference to the RMI Registry and lookup RMIServer stub</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>        Registry registry;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>            registry =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>                LocateRegistry.getRegistry(registryHostName, registryPort,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>                                           sslRMIClientSocketFactory);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>                stub = (RMIServer) registry.lookup(&quot;jmxrmi&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>            } catch (NotBoundException nbe) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>                throw (IOException)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>                    new IOException(nbe.getMessage()).initCause(nbe);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>            sslRegistry = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>        } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>            registry =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>                LocateRegistry.getRegistry(registryHostName, registryPort);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>                stub = (RMIServer) registry.lookup(&quot;jmxrmi&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>            } catch (NotBoundException nbe) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>                throw (IOException)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>                    new IOException(nbe.getMessage()).initCause(nbe);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>            sslRegistry = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>        // Perform the checks for secure stub</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>            checkStub(stub, rmiServerImplStubClass);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>            sslStub = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>        } catch (SecurityException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>            sslStub = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>     * Returns true if the underlying RMI registry is SSL-protected.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>     * @exception UnsupportedOperationException If this {@code ProxyClient}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>     * does not denote a JMX connector for a JMX VM agent.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>    public boolean isSslRmiRegistry() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>        // Check for VM connector</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>        if (!isVmConnector()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>            throw new UnsupportedOperationException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>                &quot;ProxyClient.isSslRmiRegistry() is only supported if this &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>                &quot;ProxyClient is a JMX connector for a JMX VM agent&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>        return sslRegistry;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>     * Returns true if the retrieved RMI stub is SSL-protected.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>     * @exception UnsupportedOperationException If this {@code ProxyClient}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>     * does not denote a JMX connector for a JMX VM agent.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>    public boolean isSslRmiStub() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>        // Check for VM connector</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>        if (!isVmConnector()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>            throw new UnsupportedOperationException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>                &quot;ProxyClient.isSslRmiStub() is only supported if this &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>                &quot;ProxyClient is a JMX connector for a JMX VM agent&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>        return sslStub;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>     * Returns true if this {@code ProxyClient} denotes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>     * a JMX connector for a JMX VM agent.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>    public boolean isVmConnector() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>        return vmConnector;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>    private void setConnectionState(ConnectionState state) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>        ConnectionState oldState = this.connectionState;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>        this.connectionState = state;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>        propertyChangeSupport.firePropertyChange(CONNECTION_STATE_PROPERTY,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>                                                 oldState, state);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>    public ConnectionState getConnectionState() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>        return this.connectionState;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>    void flush() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>        if (server != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>            server.flush();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>    void connect(boolean requireSSL) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>        setConnectionState(ConnectionState.CONNECTING);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>            tryConnect(requireSSL);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>            setConnectionState(ConnectionState.CONNECTED);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>            if (JConsole.isDebug()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>                e.printStackTrace();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>            setConnectionState(ConnectionState.DISCONNECTED);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>    private void tryConnect(boolean requireRemoteSSL) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>        if (jmxUrl == null &amp;&amp; &quot;localhost&quot;.equals(hostName) &amp;&amp; port == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>            // Monitor self</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>            this.jmxc = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>            this.mbsc = ManagementFactory.getPlatformMBeanServer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>            this.server = Snapshot.newSnapshot(mbsc);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>            // Monitor another process</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>            if (lvm != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>                if (!lvm.isManageable()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>                    lvm.startManagementAgent();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>                    if (!lvm.isManageable()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>                        // FIXME: what to throw</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>                        throw new IOException(lvm + &quot;not manageable&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>                if (this.jmxUrl == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>                    this.jmxUrl = new JMXServiceURL(lvm.connectorAddress());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>            Map&lt;String, Object&gt; env = new HashMap&lt;String, Object&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>            if (requireRemoteSSL) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>                env.put(&quot;jmx.remote.x.check.stub&quot;, &quot;true&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>            // Need to pass in credentials ?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>            if (userName == null &amp;&amp; password == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>                if (isVmConnector()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>                    // Check for SSL config on reconnection only</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>                    if (stub == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>                        checkSslConfig();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>                    this.jmxc = new RMIConnector(stub, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>                    jmxc.connect(env);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>                    this.jmxc = JMXConnectorFactory.connect(jmxUrl, env);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>                env.put(JMXConnector.CREDENTIALS,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>                        new String[] {userName, password});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>                if (isVmConnector()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>                    // Check for SSL config on reconnection only</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>                    if (stub == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>                        checkSslConfig();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>                    this.jmxc = new RMIConnector(stub, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>                    jmxc.connect(env);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>                    this.jmxc = JMXConnectorFactory.connect(jmxUrl, env);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>            this.mbsc = jmxc.getMBeanServerConnection();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>            this.server = Snapshot.newSnapshot(mbsc);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>        this.isDead = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>            ObjectName on = new ObjectName(THREAD_MXBEAN_NAME);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>            this.hasPlatformMXBeans = server.isRegistered(on);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>            this.hasHotSpotDiagnosticMXBean =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>                server.isRegistered(new ObjectName(HOTSPOT_DIAGNOSTIC_MXBEAN_NAME));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>            // check if it has 6.0 new APIs</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>            if (this.hasPlatformMXBeans) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>                MBeanOperationInfo[] mopis = server.getMBeanInfo(on).getOperations();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>                // look for findDeadlockedThreads operations;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>                for (MBeanOperationInfo op : mopis) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>                    if (op.getName().equals(&quot;findDeadlockedThreads&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>                        this.supportsLockUsage = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>                        break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>                on = new ObjectName(COMPILATION_MXBEAN_NAME);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>                this.hasCompilationMXBean = server.isRegistered(on);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>        } catch (MalformedObjectNameException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>            // should not reach here</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>            throw new InternalError(e.getMessage());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>        } catch (IntrospectionException |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>                 InstanceNotFoundException |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>                 ReflectionException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>            throw new InternalError(e.getMessage(), e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>        if (hasPlatformMXBeans) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>            // WORKAROUND for bug 5056632</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>            // Check if the access role is correct by getting a RuntimeMXBean</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>            getRuntimeMXBean();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>     * Gets a proxy client for a given local virtual machine.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>    public static ProxyClient getProxyClient(LocalVirtualMachine lvm)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>        throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>        final String key = getCacheKey(lvm);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>        ProxyClient proxyClient = cache.get(key);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>        if (proxyClient == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>            proxyClient = new ProxyClient(lvm);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>            cache.put(key, proxyClient);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>        return proxyClient;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>    public static String getConnectionName(LocalVirtualMachine lvm) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>        return Integer.toString(lvm.vmid());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>    private static String getCacheKey(LocalVirtualMachine lvm) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>        return Integer.toString(lvm.vmid());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>     * Gets a proxy client for a given JMXServiceURL.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>    public static ProxyClient getProxyClient(String url,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>                                             String userName, String password)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>        throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>        final String key = getCacheKey(url, userName, password);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>        ProxyClient proxyClient = cache.get(key);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>        if (proxyClient == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>            proxyClient = new ProxyClient(url, userName, password);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>            cache.put(key, proxyClient);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>        return proxyClient;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>    public static String getConnectionName(String url,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>                                           String userName) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>        if (userName != null &amp;&amp; userName.length() &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>            return userName + &quot;@&quot; + url;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>            return url;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>    private static String getCacheKey(String url,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>                                      String userName, String password) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>        return (url == null ? &quot;&quot; : url) + &quot;:&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>               (userName == null ? &quot;&quot; : userName) + &quot;:&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>               (password == null ? &quot;&quot; : password);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>     * Gets a proxy client for a given &quot;hostname:port&quot;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>    public static ProxyClient getProxyClient(String hostName, int port,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>                                             String userName, String password)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>        throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>        final String key = getCacheKey(hostName, port, userName, password);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>        ProxyClient proxyClient = cache.get(key);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>        if (proxyClient == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>            proxyClient = new ProxyClient(hostName, port, userName, password);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>            cache.put(key, proxyClient);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>        return proxyClient;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>    public static String getConnectionName(String hostName, int port,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>                                           String userName) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>        String name = hostName + &quot;:&quot; + port;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>        if (userName != null &amp;&amp; userName.length() &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>            return userName + &quot;@&quot; + name;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>            return name;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>    private static String getCacheKey(String hostName, int port,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>                                      String userName, String password) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>        return (hostName == null ? &quot;&quot; : hostName) + &quot;:&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>               port + &quot;:&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>               (userName == null ? &quot;&quot; : userName) + &quot;:&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>               (password == null ? &quot;&quot; : password);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>    public String connectionName() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>        return connectionName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>    public String getDisplayName() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre>        return displayName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>    public String toString() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>        if (!isConnected()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>            return Resources.format(Messages.CONNECTION_NAME__DISCONNECTED_, displayName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>            return displayName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>   public MBeanServerConnection getMBeanServerConnection() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre>       return mbsc;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>   }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>    public SnapshotMBeanServerConnection getSnapshotMBeanServerConnection() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>        return server;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>    public String getUrl() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>        return advancedUrl;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>    public String getHostName() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>        return hostName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>    public int getPort() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>        return port;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>    public int getVmid() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>        return (lvm != null) ? lvm.vmid() : 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>    public String getUserName() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>        return userName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>    public String getPassword() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>        return password;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>    public void disconnect() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>        // Reset remote stub</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>        stub = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>        // Close MBeanServer connection</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>        if (jmxc != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>                jmxc.close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>            } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>                // Ignore ???</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>        // Reset platform MBean references</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>        classLoadingMBean = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>        compilationMBean = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>        memoryMBean = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>        operatingSystemMBean = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>        runtimeMBean = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre>        threadMBean = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>        sunOperatingSystemMXBean = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre>        garbageCollectorMBeans = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>        // Set connection state to DISCONNECTED</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>        if (!isDead) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>            isDead = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>            setConnectionState(ConnectionState.DISCONNECTED);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>     * Returns the list of domains in which any MBean is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>     * currently registered.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>    public String[] getDomains() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>        return server.getDomains();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>     * Returns a map of MBeans with ObjectName as the key and MBeanInfo value</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>     * of a given domain.  If domain is &lt;tt&gt;null&lt;/tt&gt;, all MBeans</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>     * are returned.  If no MBean found, an empty map is returned.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>    public Map&lt;ObjectName, MBeanInfo&gt; getMBeans(String domain)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>        throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre>        ObjectName name = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>        if (domain != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>                name = new ObjectName(domain + &quot;:*&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>            } catch (MalformedObjectNameException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>                // should not reach here</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>                assert(false);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>        Set&lt;ObjectName&gt; mbeans = server.queryNames(name, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>        Map&lt;ObjectName,MBeanInfo&gt; result =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>            new HashMap&lt;ObjectName,MBeanInfo&gt;(mbeans.size());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>        Iterator&lt;ObjectName&gt; iterator = mbeans.iterator();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>        while (iterator.hasNext()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>            Object object = iterator.next();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre>            if (object instanceof ObjectName) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>                ObjectName o = (ObjectName)object;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>                    MBeanInfo info = server.getMBeanInfo(o);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre>                    result.put(o, info);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>                } catch (IntrospectionException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>                    // TODO: should log the error</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>                } catch (InstanceNotFoundException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>                    // TODO: should log the error</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>                } catch (ReflectionException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>                    // TODO: should log the error</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>        return result;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre>     * Returns a list of attributes of a named MBean.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>    public AttributeList getAttributes(ObjectName name, String[] attributes)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>        throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre>        AttributeList list = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>            list = server.getAttributes(name, attributes);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre>        } catch (InstanceNotFoundException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>            // TODO: A MBean may have been unregistered.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre>            // need to set up listener to listen for MBeanServerNotification.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>        } catch (ReflectionException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>            // TODO: should log the error</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>        return list;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>     * Set the value of a specific attribute of a named MBean.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>    public void setAttribute(ObjectName name, Attribute attribute)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>        throws InvalidAttributeValueException,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre>               MBeanException,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>               IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>            server.setAttribute(name, attribute);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>        } catch (InstanceNotFoundException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>            // TODO: A MBean may have been unregistered.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>        } catch (AttributeNotFoundException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>            assert(false);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>        } catch (ReflectionException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre>            // TODO: should log the error</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>     * Invokes an operation of a named MBean.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>     * @throws MBeanException Wraps an exception thrown by</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre>     *      the MBean's invoked method.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre>    public Object invoke(ObjectName name, String operationName,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>                         Object[] params, String[] signature)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre>        throws IOException, MBeanException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>        Object result = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>            result = server.invoke(name, operationName, params, signature);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>        } catch (InstanceNotFoundException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre>            // TODO: A MBean may have been unregistered.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>        } catch (ReflectionException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>            // TODO: should log the error</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>        return result;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre>    public synchronized ClassLoadingMXBean getClassLoadingMXBean() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>        if (hasPlatformMXBeans &amp;&amp; classLoadingMBean == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>            classLoadingMBean =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre>                newPlatformMXBeanProxy(server, CLASS_LOADING_MXBEAN_NAME,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre>                                       ClassLoadingMXBean.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>        return classLoadingMBean;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre>    public synchronized CompilationMXBean getCompilationMXBean() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>        if (hasCompilationMXBean &amp;&amp; compilationMBean == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre>            compilationMBean =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre>                newPlatformMXBeanProxy(server, COMPILATION_MXBEAN_NAME,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre>                                       CompilationMXBean.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre>        return compilationMBean;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre>    public Collection&lt;MemoryPoolProxy&gt; getMemoryPoolProxies()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre>        throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>        // TODO: How to deal with changes to the list??</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre>        if (memoryPoolProxies == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre>            ObjectName poolName = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre>                poolName = new ObjectName(MEMORY_POOL_MXBEAN_DOMAIN_TYPE + &quot;,*&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre>            } catch (MalformedObjectNameException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>                // should not reach here</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>                assert(false);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre>            Set&lt;ObjectName&gt; mbeans = server.queryNames(poolName, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>            if (mbeans != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre>                memoryPoolProxies = new ArrayList&lt;MemoryPoolProxy&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre>                Iterator&lt;ObjectName&gt; iterator = mbeans.iterator();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>                while (iterator.hasNext()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre>                    ObjectName objName = (ObjectName) iterator.next();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre>                    MemoryPoolProxy p = new MemoryPoolProxy(this, objName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre>                    memoryPoolProxies.add(p);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="719" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="720" href="#"></a></td>
+<td><pre>        return memoryPoolProxies;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="721" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="722" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="723" href="#"></a></td>
+<td><pre>    public synchronized Collection&lt;GarbageCollectorMXBean&gt; getGarbageCollectorMXBeans()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="724" href="#"></a></td>
+<td><pre>        throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="725" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="726" href="#"></a></td>
+<td><pre>        // TODO: How to deal with changes to the list??</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="727" href="#"></a></td>
+<td><pre>        if (garbageCollectorMBeans == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="728" href="#"></a></td>
+<td><pre>            ObjectName gcName = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="729" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="730" href="#"></a></td>
+<td><pre>                gcName = new ObjectName(GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE + &quot;,*&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="731" href="#"></a></td>
+<td><pre>            } catch (MalformedObjectNameException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="732" href="#"></a></td>
+<td><pre>                // should not reach here</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="733" href="#"></a></td>
+<td><pre>                assert(false);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="734" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="735" href="#"></a></td>
+<td><pre>            Set&lt;ObjectName&gt; mbeans = server.queryNames(gcName, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="736" href="#"></a></td>
+<td><pre>            if (mbeans != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="737" href="#"></a></td>
+<td><pre>                garbageCollectorMBeans = new ArrayList&lt;GarbageCollectorMXBean&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="738" href="#"></a></td>
+<td><pre>                Iterator&lt;ObjectName&gt; iterator = mbeans.iterator();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="739" href="#"></a></td>
+<td><pre>                while (iterator.hasNext()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="740" href="#"></a></td>
+<td><pre>                    ObjectName on = (ObjectName) iterator.next();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="741" href="#"></a></td>
+<td><pre>                    String name = GARBAGE_COLLECTOR_MXBEAN_DOMAIN_TYPE +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="742" href="#"></a></td>
+<td><pre>                        &quot;,name=&quot; + on.getKeyProperty(&quot;name&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="743" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="744" href="#"></a></td>
+<td><pre>                    GarbageCollectorMXBean mBean =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="745" href="#"></a></td>
+<td><pre>                        newPlatformMXBeanProxy(server, name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="746" href="#"></a></td>
+<td><pre>                                               GarbageCollectorMXBean.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="747" href="#"></a></td>
+<td><pre>                        garbageCollectorMBeans.add(mBean);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="748" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="749" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="750" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="751" href="#"></a></td>
+<td><pre>        return garbageCollectorMBeans;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="752" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="753" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="754" href="#"></a></td>
+<td><pre>    public synchronized MemoryMXBean getMemoryMXBean() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="755" href="#"></a></td>
+<td><pre>        if (hasPlatformMXBeans &amp;&amp; memoryMBean == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="756" href="#"></a></td>
+<td><pre>            memoryMBean =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="757" href="#"></a></td>
+<td><pre>                newPlatformMXBeanProxy(server, MEMORY_MXBEAN_NAME,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="758" href="#"></a></td>
+<td><pre>                                       MemoryMXBean.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="759" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="760" href="#"></a></td>
+<td><pre>        return memoryMBean;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="761" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="762" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="763" href="#"></a></td>
+<td><pre>    public synchronized RuntimeMXBean getRuntimeMXBean() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="764" href="#"></a></td>
+<td><pre>        if (hasPlatformMXBeans &amp;&amp; runtimeMBean == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="765" href="#"></a></td>
+<td><pre>            runtimeMBean =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="766" href="#"></a></td>
+<td><pre>                newPlatformMXBeanProxy(server, RUNTIME_MXBEAN_NAME,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="767" href="#"></a></td>
+<td><pre>                                       RuntimeMXBean.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="768" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="769" href="#"></a></td>
+<td><pre>        return runtimeMBean;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="770" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="771" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="772" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="773" href="#"></a></td>
+<td><pre>    public synchronized ThreadMXBean getThreadMXBean() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="774" href="#"></a></td>
+<td><pre>        if (hasPlatformMXBeans &amp;&amp; threadMBean == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="775" href="#"></a></td>
+<td><pre>            threadMBean =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="776" href="#"></a></td>
+<td><pre>                newPlatformMXBeanProxy(server, THREAD_MXBEAN_NAME,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="777" href="#"></a></td>
+<td><pre>                                       ThreadMXBean.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="778" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="779" href="#"></a></td>
+<td><pre>        return threadMBean;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="780" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="781" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="782" href="#"></a></td>
+<td><pre>    public synchronized OperatingSystemMXBean getOperatingSystemMXBean() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="783" href="#"></a></td>
+<td><pre>        if (hasPlatformMXBeans &amp;&amp; operatingSystemMBean == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="784" href="#"></a></td>
+<td><pre>            operatingSystemMBean =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="785" href="#"></a></td>
+<td><pre>                newPlatformMXBeanProxy(server, OPERATING_SYSTEM_MXBEAN_NAME,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="786" href="#"></a></td>
+<td><pre>                                       OperatingSystemMXBean.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="787" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="788" href="#"></a></td>
+<td><pre>        return operatingSystemMBean;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="789" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="790" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="791" href="#"></a></td>
+<td><pre>    public synchronized com.sun.management.OperatingSystemMXBean</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="792" href="#"></a></td>
+<td><pre>        getSunOperatingSystemMXBean() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="793" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="794" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="795" href="#"></a></td>
+<td><pre>            ObjectName on = new ObjectName(OPERATING_SYSTEM_MXBEAN_NAME);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="796" href="#"></a></td>
+<td><pre>            if (sunOperatingSystemMXBean == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="797" href="#"></a></td>
+<td><pre>                if (server.isInstanceOf(on,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="798" href="#"></a></td>
+<td><pre>                        &quot;com.sun.management.OperatingSystemMXBean&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="799" href="#"></a></td>
+<td><pre>                    sunOperatingSystemMXBean =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="800" href="#"></a></td>
+<td><pre>                        newPlatformMXBeanProxy(server,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="801" href="#"></a></td>
+<td><pre>                            OPERATING_SYSTEM_MXBEAN_NAME,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="802" href="#"></a></td>
+<td><pre>                            com.sun.management.OperatingSystemMXBean.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="803" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="804" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="805" href="#"></a></td>
+<td><pre>        } catch (InstanceNotFoundException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="806" href="#"></a></td>
+<td><pre>             return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="807" href="#"></a></td>
+<td><pre>        } catch (MalformedObjectNameException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="808" href="#"></a></td>
+<td><pre>             return null; // should never reach here</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="809" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="810" href="#"></a></td>
+<td><pre>        return sunOperatingSystemMXBean;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="811" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="812" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="813" href="#"></a></td>
+<td><pre>    public synchronized HotSpotDiagnosticMXBean getHotSpotDiagnosticMXBean() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="814" href="#"></a></td>
+<td><pre>        if (hasHotSpotDiagnosticMXBean &amp;&amp; hotspotDiagnosticMXBean == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="815" href="#"></a></td>
+<td><pre>            hotspotDiagnosticMXBean =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="816" href="#"></a></td>
+<td><pre>                newPlatformMXBeanProxy(server, HOTSPOT_DIAGNOSTIC_MXBEAN_NAME,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="817" href="#"></a></td>
+<td><pre>                                       HotSpotDiagnosticMXBean.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="818" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="819" href="#"></a></td>
+<td><pre>        return hotspotDiagnosticMXBean;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="820" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="821" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="822" href="#"></a></td>
+<td><pre>    public &lt;T&gt; T getMXBean(ObjectName objName, Class&lt;T&gt; interfaceClass)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="823" href="#"></a></td>
+<td><pre>        throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="824" href="#"></a></td>
+<td><pre>        return newPlatformMXBeanProxy(server,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="825" href="#"></a></td>
+<td><pre>                                      objName.toString(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="826" href="#"></a></td>
+<td><pre>                                      interfaceClass);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="827" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="828" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="829" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="830" href="#"></a></td>
+<td><pre>    // Return thread IDs of deadlocked threads or null if any.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="831" href="#"></a></td>
+<td><pre>    // It finds deadlocks involving only monitors if it's a Tiger VM.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="832" href="#"></a></td>
+<td><pre>    // Otherwise, it finds deadlocks involving both monitors and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="833" href="#"></a></td>
+<td><pre>    // the concurrent locks.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="834" href="#"></a></td>
+<td><pre>    public long[] findDeadlockedThreads() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="835" href="#"></a></td>
+<td><pre>        ThreadMXBean tm = getThreadMXBean();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="836" href="#"></a></td>
+<td><pre>        if (supportsLockUsage &amp;&amp; tm.isSynchronizerUsageSupported()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="837" href="#"></a></td>
+<td><pre>            return tm.findDeadlockedThreads();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="838" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="839" href="#"></a></td>
+<td><pre>            return tm.findMonitorDeadlockedThreads();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="840" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="841" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="842" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="843" href="#"></a></td>
+<td><pre>    public synchronized void markAsDead() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="844" href="#"></a></td>
+<td><pre>        disconnect();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="845" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="846" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="847" href="#"></a></td>
+<td><pre>    public boolean isDead() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="848" href="#"></a></td>
+<td><pre>        return isDead;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="849" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="850" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="851" href="#"></a></td>
+<td><pre>    boolean isConnected() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="852" href="#"></a></td>
+<td><pre>        return !isDead();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="853" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="854" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="855" href="#"></a></td>
+<td><pre>    boolean hasPlatformMXBeans() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="856" href="#"></a></td>
+<td><pre>        return this.hasPlatformMXBeans;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="857" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="858" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="859" href="#"></a></td>
+<td><pre>    boolean hasHotSpotDiagnosticMXBean() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="860" href="#"></a></td>
+<td><pre>        return this.hasHotSpotDiagnosticMXBean;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="861" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="862" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="863" href="#"></a></td>
+<td><pre>    boolean isLockUsageSupported() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="864" href="#"></a></td>
+<td><pre>        return supportsLockUsage;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="865" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="866" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="867" href="#"></a></td>
+<td><pre>    public boolean isRegistered(ObjectName name) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="868" href="#"></a></td>
+<td><pre>        return server.isRegistered(name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="869" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="870" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="871" href="#"></a></td>
+<td><pre>    public void addPropertyChangeListener(PropertyChangeListener listener) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="872" href="#"></a></td>
+<td><pre>        propertyChangeSupport.addPropertyChangeListener(listener);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="873" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="874" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="875" href="#"></a></td>
+<td><pre>    public void addWeakPropertyChangeListener(PropertyChangeListener listener) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="876" href="#"></a></td>
+<td><pre>        if (!(listener instanceof WeakPCL)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="877" href="#"></a></td>
+<td><pre>            listener = new WeakPCL(listener);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="878" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="879" href="#"></a></td>
+<td><pre>        propertyChangeSupport.addPropertyChangeListener(listener);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="880" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="881" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="882" href="#"></a></td>
+<td><pre>    public void removePropertyChangeListener(PropertyChangeListener listener) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="883" href="#"></a></td>
+<td><pre>        if (!(listener instanceof WeakPCL)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="884" href="#"></a></td>
+<td><pre>            // Search for the WeakPCL holding this listener (if any)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="885" href="#"></a></td>
+<td><pre>            for (PropertyChangeListener pcl : propertyChangeSupport.getPropertyChangeListeners()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="886" href="#"></a></td>
+<td><pre>                if (pcl instanceof WeakPCL &amp;&amp; ((WeakPCL)pcl).get() == listener) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="887" href="#"></a></td>
+<td><pre>                    listener = pcl;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="888" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="889" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="890" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="891" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="892" href="#"></a></td>
+<td><pre>        propertyChangeSupport.removePropertyChangeListener(listener);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="893" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="894" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="895" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="896" href="#"></a></td>
+<td><pre>     * The PropertyChangeListener is handled via a WeakReference</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="897" href="#"></a></td>
+<td><pre>     * so as not to pin down the listener.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="898" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="899" href="#"></a></td>
+<td><pre>    private class WeakPCL extends WeakReference&lt;PropertyChangeListener&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="900" href="#"></a></td>
+<td><pre>                          implements PropertyChangeListener {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="901" href="#"></a></td>
+<td><pre>        WeakPCL(PropertyChangeListener referent) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="902" href="#"></a></td>
+<td><pre>            super(referent);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="903" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="904" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="905" href="#"></a></td>
+<td><pre>        public void propertyChange(PropertyChangeEvent pce) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="906" href="#"></a></td>
+<td><pre>            PropertyChangeListener pcl = get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="907" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="908" href="#"></a></td>
+<td><pre>            if (pcl == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="909" href="#"></a></td>
+<td><pre>                // The referent listener was GC'ed, we're no longer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="910" href="#"></a></td>
+<td><pre>                // interested in PropertyChanges, remove the listener.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="911" href="#"></a></td>
+<td><pre>                dispose();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="912" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="913" href="#"></a></td>
+<td><pre>                pcl.propertyChange(pce);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="914" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="915" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="916" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="917" href="#"></a></td>
+<td><pre>        private void dispose() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="918" href="#"></a></td>
+<td><pre>            removePropertyChangeListener(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="919" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="920" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="921" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="922" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="923" href="#"></a></td>
+<td><pre>    // Snapshot MBeanServerConnection:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="924" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="925" href="#"></a></td>
+<td><pre>    // This is an object that wraps an existing MBeanServerConnection and adds</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="926" href="#"></a></td>
+<td><pre>    // caching to it, as follows:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="927" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="928" href="#"></a></td>
+<td><pre>    // - The first time an attribute is called in a given MBean, the result is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="929" href="#"></a></td>
+<td><pre>    //   cached. Every subsequent time getAttribute is called for that attribute</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="930" href="#"></a></td>
+<td><pre>    //   the cached result is returned.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="931" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="932" href="#"></a></td>
+<td><pre>    // - Before every call to VMPanel.update() or when the Refresh button in the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="933" href="#"></a></td>
+<td><pre>    //   Attributes table is pressed down the attributes cache is flushed. Then</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="934" href="#"></a></td>
+<td><pre>    //   any subsequent call to getAttribute will retrieve all the values for</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="935" href="#"></a></td>
+<td><pre>    //   the attributes that are known to the cache.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="936" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="937" href="#"></a></td>
+<td><pre>    // - The attributes cache uses a learning approach and only the attributes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="938" href="#"></a></td>
+<td><pre>    //   that are in the cache will be retrieved between two subsequent updates.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="939" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="940" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="941" href="#"></a></td>
+<td><pre>    public interface SnapshotMBeanServerConnection</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="942" href="#"></a></td>
+<td><pre>            extends MBeanServerConnection {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="943" href="#"></a></td>
+<td><pre>        /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="944" href="#"></a></td>
+<td><pre>         * Flush all cached values of attributes.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="945" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="946" href="#"></a></td>
+<td><pre>        public void flush();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="947" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="948" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="949" href="#"></a></td>
+<td><pre>    public static class Snapshot {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="950" href="#"></a></td>
+<td><pre>        private Snapshot() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="951" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="952" href="#"></a></td>
+<td><pre>        public static SnapshotMBeanServerConnection</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="953" href="#"></a></td>
+<td><pre>                newSnapshot(MBeanServerConnection mbsc) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="954" href="#"></a></td>
+<td><pre>            final InvocationHandler ih = new SnapshotInvocationHandler(mbsc);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="955" href="#"></a></td>
+<td><pre>            return (SnapshotMBeanServerConnection) Proxy.newProxyInstance(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="956" href="#"></a></td>
+<td><pre>                    Snapshot.class.getClassLoader(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="957" href="#"></a></td>
+<td><pre>                    new Class[] {SnapshotMBeanServerConnection.class},</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="958" href="#"></a></td>
+<td><pre>                    ih);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="959" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="960" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="961" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="962" href="#"></a></td>
+<td><pre>    static class SnapshotInvocationHandler implements InvocationHandler {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="963" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="964" href="#"></a></td>
+<td><pre>        private final MBeanServerConnection conn;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="965" href="#"></a></td>
+<td><pre>        private Map&lt;ObjectName, NameValueMap&gt; cachedValues = newMap();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="966" href="#"></a></td>
+<td><pre>        private Map&lt;ObjectName, Set&lt;String&gt;&gt; cachedNames = newMap();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="967" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="968" href="#"></a></td>
+<td><pre>        @SuppressWarnings(&quot;serial&quot;)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="969" href="#"></a></td>
+<td><pre>        private static final class NameValueMap</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="970" href="#"></a></td>
+<td><pre>                extends HashMap&lt;String, Object&gt; {}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="971" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="972" href="#"></a></td>
+<td><pre>        SnapshotInvocationHandler(MBeanServerConnection conn) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="973" href="#"></a></td>
+<td><pre>            this.conn = conn;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="974" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="975" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="976" href="#"></a></td>
+<td><pre>        synchronized void flush() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="977" href="#"></a></td>
+<td><pre>            cachedValues = newMap();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="978" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="979" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="980" href="#"></a></td>
+<td><pre>        public Object invoke(Object proxy, Method method, Object[] args)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="981" href="#"></a></td>
+<td><pre>                throws Throwable {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="982" href="#"></a></td>
+<td><pre>            final String methodName = method.getName();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="983" href="#"></a></td>
+<td><pre>            if (methodName.equals(&quot;getAttribute&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="984" href="#"></a></td>
+<td><pre>                return getAttribute((ObjectName) args[0], (String) args[1]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="985" href="#"></a></td>
+<td><pre>            } else if (methodName.equals(&quot;getAttributes&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="986" href="#"></a></td>
+<td><pre>                return getAttributes((ObjectName) args[0], (String[]) args[1]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="987" href="#"></a></td>
+<td><pre>            } else if (methodName.equals(&quot;flush&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="988" href="#"></a></td>
+<td><pre>                flush();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="989" href="#"></a></td>
+<td><pre>                return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="990" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="991" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="992" href="#"></a></td>
+<td><pre>                    return method.invoke(conn, args);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="993" href="#"></a></td>
+<td><pre>                } catch (InvocationTargetException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="994" href="#"></a></td>
+<td><pre>                    throw e.getCause();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="995" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="996" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="997" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="998" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="999" href="#"></a></td>
+<td><pre>        private Object getAttribute(ObjectName objName, String attrName)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1000" href="#"></a></td>
+<td><pre>                throws MBeanException, InstanceNotFoundException,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1001" href="#"></a></td>
+<td><pre>                AttributeNotFoundException, ReflectionException, IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1002" href="#"></a></td>
+<td><pre>            final NameValueMap values = getCachedAttributes(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1003" href="#"></a></td>
+<td><pre>                    objName, Collections.singleton(attrName));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1004" href="#"></a></td>
+<td><pre>            Object value = values.get(attrName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1005" href="#"></a></td>
+<td><pre>            if (value != null || values.containsKey(attrName)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1006" href="#"></a></td>
+<td><pre>                return value;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1007" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1008" href="#"></a></td>
+<td><pre>            // Not in cache, presumably because it was omitted from the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1009" href="#"></a></td>
+<td><pre>            // getAttributes result because of an exception.  Following</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1010" href="#"></a></td>
+<td><pre>            // call will probably provoke the same exception.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1011" href="#"></a></td>
+<td><pre>            return conn.getAttribute(objName, attrName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1012" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1013" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1014" href="#"></a></td>
+<td><pre>        private AttributeList getAttributes(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1015" href="#"></a></td>
+<td><pre>                ObjectName objName, String[] attrNames) throws</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1016" href="#"></a></td>
+<td><pre>                InstanceNotFoundException, ReflectionException, IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1017" href="#"></a></td>
+<td><pre>            final NameValueMap values = getCachedAttributes(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1018" href="#"></a></td>
+<td><pre>                    objName,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1019" href="#"></a></td>
+<td><pre>                    new TreeSet&lt;String&gt;(Arrays.asList(attrNames)));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1020" href="#"></a></td>
+<td><pre>            final AttributeList list = new AttributeList();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1021" href="#"></a></td>
+<td><pre>            for (String attrName : attrNames) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1022" href="#"></a></td>
+<td><pre>                final Object value = values.get(attrName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1023" href="#"></a></td>
+<td><pre>                if (value != null || values.containsKey(attrName)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1024" href="#"></a></td>
+<td><pre>                    list.add(new Attribute(attrName, value));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1025" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1026" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1027" href="#"></a></td>
+<td><pre>            return list;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1028" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1029" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1030" href="#"></a></td>
+<td><pre>        private synchronized NameValueMap getCachedAttributes(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1031" href="#"></a></td>
+<td><pre>                ObjectName objName, Set&lt;String&gt; attrNames) throws</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1032" href="#"></a></td>
+<td><pre>                InstanceNotFoundException, ReflectionException, IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1033" href="#"></a></td>
+<td><pre>            NameValueMap values = cachedValues.get(objName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1034" href="#"></a></td>
+<td><pre>            if (values != null &amp;&amp; values.keySet().containsAll(attrNames)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1035" href="#"></a></td>
+<td><pre>                return values;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1036" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1037" href="#"></a></td>
+<td><pre>            attrNames = new TreeSet&lt;String&gt;(attrNames);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1038" href="#"></a></td>
+<td><pre>            Set&lt;String&gt; oldNames = cachedNames.get(objName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1039" href="#"></a></td>
+<td><pre>            if (oldNames != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1040" href="#"></a></td>
+<td><pre>                attrNames.addAll(oldNames);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1041" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1042" href="#"></a></td>
+<td><pre>            values = new NameValueMap();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1043" href="#"></a></td>
+<td><pre>            final AttributeList attrs = conn.getAttributes(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1044" href="#"></a></td>
+<td><pre>                    objName,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1045" href="#"></a></td>
+<td><pre>                    attrNames.toArray(new String[attrNames.size()]));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1046" href="#"></a></td>
+<td><pre>            for (Attribute attr : attrs.asList()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1047" href="#"></a></td>
+<td><pre>                values.put(attr.getName(), attr.getValue());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1048" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1049" href="#"></a></td>
+<td><pre>            cachedValues.put(objName, values);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1050" href="#"></a></td>
+<td><pre>            cachedNames.put(objName, attrNames);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1051" href="#"></a></td>
+<td><pre>            return values;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1052" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1053" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1054" href="#"></a></td>
+<td><pre>        // See http://www.artima.com/weblogs/viewpost.jsp?thread=79394</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1055" href="#"></a></td>
+<td><pre>        private static &lt;K, V&gt; Map&lt;K, V&gt; newMap() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1056" href="#"></a></td>
+<td><pre>            return new HashMap&lt;K, V&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1057" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1058" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1059" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

@@ -3,671 +3,2663 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-/*
- * This file is available under and governed by the GNU General Public
- * License version 2 only, as published by the Free Software Foundation.
- * However, the following notice accompanied the original version of this
- * file:
- *
- * Written by Doug Lea, Bill Scherer, and Michael Scott with
- * assistance from members of JCP JSR-166 Expert Group and released to
- * the public domain, as explained at
- * http://creativecommons.org/publicdomain/zero/1.0/
- */
-
-package java.util.concurrent;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.LockSupport;
-
-/**
- * A synchronization point at which threads can pair and swap elements
- * within pairs.  Each thread presents some object on entry to the
- * {@link #exchange exchange} method, matches with a partner thread,
- * and receives its partner's object on return.  An Exchanger may be
- * viewed as a bidirectional form of a {@link SynchronousQueue}.
- * Exchangers may be useful in applications such as genetic algorithms
- * and pipeline designs.
- *
- * &lt;p&gt;&lt;b&gt;Sample Usage:&lt;/b&gt;
- * Here are the highlights of a class that uses an {@code Exchanger}
- * to swap buffers between threads so that the thread filling the
- * buffer gets a freshly emptied one when it needs it, handing off the
- * filled one to the thread emptying the buffer.
- *  &lt;pre&gt; {@code
- * class FillAndEmpty {
- *   Exchanger&lt;DataBuffer&gt; exchanger = new Exchanger&lt;DataBuffer&gt;();
- *   DataBuffer initialEmptyBuffer = ... a made-up type
- *   DataBuffer initialFullBuffer = ...
- *
- *   class FillingLoop implements Runnable {
- *     public void run() {
- *       DataBuffer currentBuffer = initialEmptyBuffer;
- *       try {
- *         while (currentBuffer != null) {
- *           addToBuffer(currentBuffer);
- *           if (currentBuffer.isFull())
- *             currentBuffer = exchanger.exchange(currentBuffer);
- *         }
- *       } catch (InterruptedException ex) { ... handle ... }
- *     }
- *   }
- *
- *   class EmptyingLoop implements Runnable {
- *     public void run() {
- *       DataBuffer currentBuffer = initialFullBuffer;
- *       try {
- *         while (currentBuffer != null) {
- *           takeFromBuffer(currentBuffer);
- *           if (currentBuffer.isEmpty())
- *             currentBuffer = exchanger.exchange(currentBuffer);
- *         }
- *       } catch (InterruptedException ex) { ... handle ...}
- *     }
- *   }
- *
- *   void start() {
- *     new Thread(new FillingLoop()).start();
- *     new Thread(new EmptyingLoop()).start();
- *   }
- * }}&lt;/pre&gt;
- *
- * &lt;p&gt;Memory consistency effects: For each pair of threads that
- * successfully exchange objects via an {@code Exchanger}, actions
- * prior to the {@code exchange()} in each thread
- * &lt;a href=&quot;package-summary.html#MemoryVisibility&quot;&gt;&lt;i&gt;happen-before&lt;/i&gt;&lt;/a&gt;
- * those subsequent to a return from the corresponding {@code exchange()}
- * in the other thread.
- *
- * @since 1.5
- * @author Doug Lea and Bill Scherer and Michael Scott
- * @param &lt;V&gt; The type of objects that may be exchanged
- */
-public class Exchanger&lt;V&gt; {
-
-    /*
-     * Overview: The core algorithm is, for an exchange &quot;slot&quot;,
-     * and a participant (caller) with an item:
-     *
-     * for (;;) {
-     *   if (slot is empty) {                       // offer
-     *     place item in a Node;
-     *     if (can CAS slot from empty to node) {
-     *       wait for release;
-     *       return matching item in node;
-     *     }
-     *   }
-     *   else if (can CAS slot from node to empty) { // release
-     *     get the item in node;
-     *     set matching item in node;
-     *     release waiting thread;
-     *   }
-     *   // else retry on CAS failure
-     * }
-     *
-     * This is among the simplest forms of a &quot;dual data structure&quot; --
-     * see Scott and Scherer's DISC 04 paper and
-     * http://www.cs.rochester.edu/research/synchronization/pseudocode/duals.html
-     *
-     * This works great in principle. But in practice, like many
-     * algorithms centered on atomic updates to a single location, it
-     * scales horribly when there are more than a few participants
-     * using the same Exchanger. So the implementation instead uses a
-     * form of elimination arena, that spreads out this contention by
-     * arranging that some threads typically use different slots,
-     * while still ensuring that eventually, any two parties will be
-     * able to exchange items. That is, we cannot completely partition
-     * across threads, but instead give threads arena indices that
-     * will on average grow under contention and shrink under lack of
-     * contention. We approach this by defining the Nodes that we need
-     * anyway as ThreadLocals, and include in them per-thread index
-     * and related bookkeeping state. (We can safely reuse per-thread
-     * nodes rather than creating them fresh each time because slots
-     * alternate between pointing to a node vs null, so cannot
-     * encounter ABA problems. However, we do need some care in
-     * resetting them between uses.)
-     *
-     * Implementing an effective arena requires allocating a bunch of
-     * space, so we only do so upon detecting contention (except on
-     * uniprocessors, where they wouldn't help, so aren't used).
-     * Otherwise, exchanges use the single-slot slotExchange method.
-     * On contention, not only must the slots be in different
-     * locations, but the locations must not encounter memory
-     * contention due to being on the same cache line (or more
-     * generally, the same coherence unit).  Because, as of this
-     * writing, there is no way to determine cacheline size, we define
-     * a value that is enough for common platforms.  Additionally,
-     * extra care elsewhere is taken to avoid other false/unintended
-     * sharing and to enhance locality, including adding padding (via
-     * sun.misc.Contended) to Nodes, embedding &quot;bound&quot; as an Exchanger
-     * field, and reworking some park/unpark mechanics compared to
-     * LockSupport versions.
-     *
-     * The arena starts out with only one used slot. We expand the
-     * effective arena size by tracking collisions; i.e., failed CASes
-     * while trying to exchange. By nature of the above algorithm, the
-     * only kinds of collision that reliably indicate contention are
-     * when two attempted releases collide -- one of two attempted
-     * offers can legitimately fail to CAS without indicating
-     * contention by more than one other thread. (Note: it is possible
-     * but not worthwhile to more precisely detect contention by
-     * reading slot values after CAS failures.)  When a thread has
-     * collided at each slot within the current arena bound, it tries
-     * to expand the arena size by one. We track collisions within
-     * bounds by using a version (sequence) number on the &quot;bound&quot;
-     * field, and conservatively reset collision counts when a
-     * participant notices that bound has been updated (in either
-     * direction).
-     *
-     * The effective arena size is reduced (when there is more than
-     * one slot) by giving up on waiting after a while and trying to
-     * decrement the arena size on expiration. The value of &quot;a while&quot;
-     * is an empirical matter.  We implement by piggybacking on the
-     * use of spin-&gt;yield-&gt;block that is essential for reasonable
-     * waiting performance anyway -- in a busy exchanger, offers are
-     * usually almost immediately released, in which case context
-     * switching on multiprocessors is extremely slow/wasteful.  Arena
-     * waits just omit the blocking part, and instead cancel. The spin
-     * count is empirically chosen to be a value that avoids blocking
-     * 99% of the time under maximum sustained exchange rates on a
-     * range of test machines. Spins and yields entail some limited
-     * randomness (using a cheap xorshift) to avoid regular patterns
-     * that can induce unproductive grow/shrink cycles. (Using a
-     * pseudorandom also helps regularize spin cycle duration by
-     * making branches unpredictable.)  Also, during an offer, a
-     * waiter can &quot;know&quot; that it will be released when its slot has
-     * changed, but cannot yet proceed until match is set.  In the
-     * mean time it cannot cancel the offer, so instead spins/yields.
-     * Note: It is possible to avoid this secondary check by changing
-     * the linearization point to be a CAS of the match field (as done
-     * in one case in the Scott &amp; Scherer DISC paper), which also
-     * increases asynchrony a bit, at the expense of poorer collision
-     * detection and inability to always reuse per-thread nodes. So
-     * the current scheme is typically a better tradeoff.
-     *
-     * On collisions, indices traverse the arena cyclically in reverse
-     * order, restarting at the maximum index (which will tend to be
-     * sparsest) when bounds change. (On expirations, indices instead
-     * are halved until reaching 0.) It is possible (and has been
-     * tried) to use randomized, prime-value-stepped, or double-hash
-     * style traversal instead of simple cyclic traversal to reduce
-     * bunching.  But empirically, whatever benefits these may have
-     * don't overcome their added overhead: We are managing operations
-     * that occur very quickly unless there is sustained contention,
-     * so simpler/faster control policies work better than more
-     * accurate but slower ones.
-     *
-     * Because we use expiration for arena size control, we cannot
-     * throw TimeoutExceptions in the timed version of the public
-     * exchange method until the arena size has shrunken to zero (or
-     * the arena isn't enabled). This may delay response to timeout
-     * but is still within spec.
-     *
-     * Essentially all of the implementation is in methods
-     * slotExchange and arenaExchange. These have similar overall
-     * structure, but differ in too many details to combine. The
-     * slotExchange method uses the single Exchanger field &quot;slot&quot;
-     * rather than arena array elements. However, it still needs
-     * minimal collision detection to trigger arena construction.
-     * (The messiest part is making sure interrupt status and
-     * InterruptedExceptions come out right during transitions when
-     * both methods may be called. This is done by using null return
-     * as a sentinel to recheck interrupt status.)
-     *
-     * As is too common in this sort of code, methods are monolithic
-     * because most of the logic relies on reads of fields that are
-     * maintained as local variables so can't be nicely factored --
-     * mainly, here, bulky spin-&gt;yield-&gt;block/cancel code), and
-     * heavily dependent on intrinsics (Unsafe) to use inlined
-     * embedded CAS and related memory access operations (that tend
-     * not to be as readily inlined by dynamic compilers when they are
-     * hidden behind other methods that would more nicely name and
-     * encapsulate the intended effects). This includes the use of
-     * putOrderedX to clear fields of the per-thread Nodes between
-     * uses. Note that field Node.item is not declared as volatile
-     * even though it is read by releasing threads, because they only
-     * do so after CAS operations that must precede access, and all
-     * uses by the owning thread are otherwise acceptably ordered by
-     * other operations. (Because the actual points of atomicity are
-     * slot CASes, it would also be legal for the write to Node.match
-     * in a release to be weaker than a full volatile write. However,
-     * this is not done because it could allow further postponement of
-     * the write, delaying progress.)
-     */
-
-    /**
-     * The byte distance (as a shift value) between any two used slots
-     * in the arena.  1 &lt;&lt; ASHIFT should be at least cacheline size.
-     */
-    private static final int ASHIFT = 7;
-
-    /**
-     * The maximum supported arena index. The maximum allocatable
-     * arena size is MMASK + 1. Must be a power of two minus one, less
-     * than (1&lt;&lt;(31-ASHIFT)). The cap of 255 (0xff) more than suffices
-     * for the expected scaling limits of the main algorithms.
-     */
-    private static final int MMASK = 0xff;
-
-    /**
-     * Unit for sequence/version bits of bound field. Each successful
-     * change to the bound also adds SEQ.
-     */
-    private static final int SEQ = MMASK + 1;
-
-    /** The number of CPUs, for sizing and spin control */
-    private static final int NCPU = Runtime.getRuntime().availableProcessors();
-
-    /**
-     * The maximum slot index of the arena: The number of slots that
-     * can in principle hold all threads without contention, or at
-     * most the maximum indexable value.
-     */
-    static final int FULL = (NCPU &gt;= (MMASK &lt;&lt; 1)) ? MMASK : NCPU &gt;&gt;&gt; 1;
-
-    /**
-     * The bound for spins while waiting for a match. The actual
-     * number of iterations will on average be about twice this value
-     * due to randomization. Note: Spinning is disabled when NCPU==1.
-     */
-    private static final int SPINS = 1 &lt;&lt; 10;
-
-    /**
-     * Value representing null arguments/returns from public
-     * methods. Needed because the API originally didn't disallow null
-     * arguments, which it should have.
-     */
-    private static final Object NULL_ITEM = new Object();
-
-    /**
-     * Sentinel value returned by internal exchange methods upon
-     * timeout, to avoid need for separate timed versions of these
-     * methods.
-     */
-    private static final Object TIMED_OUT = new Object();
-
-    /**
-     * Nodes hold partially exchanged data, plus other per-thread
-     * bookkeeping. Padded via @sun.misc.Contended to reduce memory
-     * contention.
-     */
-    @sun.misc.Contended static final class Node {
-        int index;              // Arena index
-        int bound;              // Last recorded value of Exchanger.bound
-        int collides;           // Number of CAS failures at current bound
-        int hash;               // Pseudo-random for spins
-        Object item;            // This thread's current item
-        volatile Object match;  // Item provided by releasing thread
-        volatile Thread parked; // Set to this thread when parked, else null
-    }
-
-    /** The corresponding thread local class */
-    static final class Participant extends ThreadLocal&lt;Node&gt; {
-        public Node initialValue() { return new Node(); }
-    }
-
-    /**
-     * Per-thread state
-     */
-    private final Participant participant;
-
-    /**
-     * Elimination array; null until enabled (within slotExchange).
-     * Element accesses use emulation of volatile gets and CAS.
-     */
-    private volatile Node[] arena;
-
-    /**
-     * Slot used until contention detected.
-     */
-    private volatile Node slot;
-
-    /**
-     * The index of the largest valid arena position, OR'ed with SEQ
-     * number in high bits, incremented on each update.  The initial
-     * update from 0 to SEQ is used to ensure that the arena array is
-     * constructed only once.
-     */
-    private volatile int bound;
-
-    /**
-     * Exchange function when arenas enabled. See above for explanation.
-     *
-     * @param item the (non-null) item to exchange
-     * @param timed true if the wait is timed
-     * @param ns if timed, the maximum wait time, else 0L
-     * @return the other thread's item; or null if interrupted; or
-     * TIMED_OUT if timed and timed out
-     */
-    private final Object arenaExchange(Object item, boolean timed, long ns) {
-        Node[] a = arena;
-        Node p = participant.get();
-        for (int i = p.index;;) {                      // access slot at i
-            int b, m, c; long j;                       // j is raw array offset
-            Node q = (Node)U.getObjectVolatile(a, j = (i &lt;&lt; ASHIFT) + ABASE);
-            if (q != null &amp;&amp; U.compareAndSwapObject(a, j, q, null)) {
-                Object v = q.item;                     // release
-                q.match = item;
-                Thread w = q.parked;
-                if (w != null)
-                    U.unpark(w);
-                return v;
-            }
-            else if (i &lt;= (m = (b = bound) &amp; MMASK) &amp;&amp; q == null) {
-                p.item = item;                         // offer
-                if (U.compareAndSwapObject(a, j, null, p)) {
-                    long end = (timed &amp;&amp; m == 0) ? System.nanoTime() + ns : 0L;
-                    Thread t = Thread.currentThread(); // wait
-                    for (int h = p.hash, spins = SPINS;;) {
-                        Object v = p.match;
-                        if (v != null) {
-                            U.putOrderedObject(p, MATCH, null);
-                            p.item = null;             // clear for next use
-                            p.hash = h;
-                            return v;
-                        }
-                        else if (spins &gt; 0) {
-                            h ^= h &lt;&lt; 1; h ^= h &gt;&gt;&gt; 3; h ^= h &lt;&lt; 10; // xorshift
-                            if (h == 0)                // initialize hash
-                                h = SPINS | (int)t.getId();
-                            else if (h &lt; 0 &amp;&amp;          // approx 50% true
-                                     (--spins &amp; ((SPINS &gt;&gt;&gt; 1) - 1)) == 0)
-                                Thread.yield();        // two yields per wait
-                        }
-                        else if (U.getObjectVolatile(a, j) != p)
-                            spins = SPINS;       // releaser hasn't set match yet
-                        else if (!t.isInterrupted() &amp;&amp; m == 0 &amp;&amp;
-                                 (!timed ||
-                                  (ns = end - System.nanoTime()) &gt; 0L)) {
-                            U.putObject(t, BLOCKER, this); // emulate LockSupport
-                            p.parked = t;              // minimize window
-                            if (U.getObjectVolatile(a, j) == p)
-                                U.park(false, ns);
-                            p.parked = null;
-                            U.putObject(t, BLOCKER, null);
-                        }
-                        else if (U.getObjectVolatile(a, j) == p &amp;&amp;
-                                 U.compareAndSwapObject(a, j, p, null)) {
-                            if (m != 0)                // try to shrink
-                                U.compareAndSwapInt(this, BOUND, b, b + SEQ - 1);
-                            p.item = null;
-                            p.hash = h;
-                            i = p.index &gt;&gt;&gt;= 1;        // descend
-                            if (Thread.interrupted())
-                                return null;
-                            if (timed &amp;&amp; m == 0 &amp;&amp; ns &lt;= 0L)
-                                return TIMED_OUT;
-                            break;                     // expired; restart
-                        }
-                    }
-                }
-                else
-                    p.item = null;                     // clear offer
-            }
-            else {
-                if (p.bound != b) {                    // stale; reset
-                    p.bound = b;
-                    p.collides = 0;
-                    i = (i != m || m == 0) ? m : m - 1;
-                }
-                else if ((c = p.collides) &lt; m || m == FULL ||
-                         !U.compareAndSwapInt(this, BOUND, b, b + SEQ + 1)) {
-                    p.collides = c + 1;
-                    i = (i == 0) ? m : i - 1;          // cyclically traverse
-                }
-                else
-                    i = m + 1;                         // grow
-                p.index = i;
-            }
-        }
-    }
-
-    /**
-     * Exchange function used until arenas enabled. See above for explanation.
-     *
-     * @param item the item to exchange
-     * @param timed true if the wait is timed
-     * @param ns if timed, the maximum wait time, else 0L
-     * @return the other thread's item; or null if either the arena
-     * was enabled or the thread was interrupted before completion; or
-     * TIMED_OUT if timed and timed out
-     */
-    private final Object slotExchange(Object item, boolean timed, long ns) {
-        Node p = participant.get();
-        Thread t = Thread.currentThread();
-        if (t.isInterrupted()) // preserve interrupt status so caller can recheck
-            return null;
-
-        for (Node q;;) {
-            if ((q = slot) != null) {
-                if (U.compareAndSwapObject(this, SLOT, q, null)) {
-                    Object v = q.item;
-                    q.match = item;
-                    Thread w = q.parked;
-                    if (w != null)
-                        U.unpark(w);
-                    return v;
-                }
-                // create arena on contention, but continue until slot null
-                if (NCPU &gt; 1 &amp;&amp; bound == 0 &amp;&amp;
-                    U.compareAndSwapInt(this, BOUND, 0, SEQ))
-                    arena = new Node[(FULL + 2) &lt;&lt; ASHIFT];
-            }
-            else if (arena != null)
-                return null; // caller must reroute to arenaExchange
-            else {
-                p.item = item;
-                if (U.compareAndSwapObject(this, SLOT, null, p))
-                    break;
-                p.item = null;
-            }
-        }
-
-        // await release
-        int h = p.hash;
-        long end = timed ? System.nanoTime() + ns : 0L;
-        int spins = (NCPU &gt; 1) ? SPINS : 1;
-        Object v;
-        while ((v = p.match) == null) {
-            if (spins &gt; 0) {
-                h ^= h &lt;&lt; 1; h ^= h &gt;&gt;&gt; 3; h ^= h &lt;&lt; 10;
-                if (h == 0)
-                    h = SPINS | (int)t.getId();
-                else if (h &lt; 0 &amp;&amp; (--spins &amp; ((SPINS &gt;&gt;&gt; 1) - 1)) == 0)
-                    Thread.yield();
-            }
-            else if (slot != p)
-                spins = SPINS;
-            else if (!t.isInterrupted() &amp;&amp; arena == null &amp;&amp;
-                     (!timed || (ns = end - System.nanoTime()) &gt; 0L)) {
-                U.putObject(t, BLOCKER, this);
-                p.parked = t;
-                if (slot == p)
-                    U.park(false, ns);
-                p.parked = null;
-                U.putObject(t, BLOCKER, null);
-            }
-            else if (U.compareAndSwapObject(this, SLOT, p, null)) {
-                v = timed &amp;&amp; ns &lt;= 0L &amp;&amp; !t.isInterrupted() ? TIMED_OUT : null;
-                break;
-            }
-        }
-        U.putOrderedObject(p, MATCH, null);
-        p.item = null;
-        p.hash = h;
-        return v;
-    }
-
-    /**
-     * Creates a new Exchanger.
-     */
-    public Exchanger() {
-        participant = new Participant();
-    }
-
-    /**
-     * Waits for another thread to arrive at this exchange point (unless
-     * the current thread is {@linkplain Thread#interrupt interrupted}),
-     * and then transfers the given object to it, receiving its object
-     * in return.
-     *
-     * &lt;p&gt;If another thread is already waiting at the exchange point then
-     * it is resumed for thread scheduling purposes and receives the object
-     * passed in by the current thread.  The current thread returns immediately,
-     * receiving the object passed to the exchange by that other thread.
-     *
-     * &lt;p&gt;If no other thread is already waiting at the exchange then the
-     * current thread is disabled for thread scheduling purposes and lies
-     * dormant until one of two things happens:
-     * &lt;ul&gt;
-     * &lt;li&gt;Some other thread enters the exchange; or
-     * &lt;li&gt;Some other thread {@linkplain Thread#interrupt interrupts}
-     * the current thread.
-     * &lt;/ul&gt;
-     * &lt;p&gt;If the current thread:
-     * &lt;ul&gt;
-     * &lt;li&gt;has its interrupted status set on entry to this method; or
-     * &lt;li&gt;is {@linkplain Thread#interrupt interrupted} while waiting
-     * for the exchange,
-     * &lt;/ul&gt;
-     * then {@link InterruptedException} is thrown and the current thread's
-     * interrupted status is cleared.
-     *
-     * @param x the object to exchange
-     * @return the object provided by the other thread
-     * @throws InterruptedException if the current thread was
-     *         interrupted while waiting
-     */
-    @SuppressWarnings(&quot;unchecked&quot;)
-    public V exchange(V x) throws InterruptedException {
-        Object v;
-        Object item = (x == null) ? NULL_ITEM : x; // translate null args
-        if ((arena != null ||
-             (v = slotExchange(item, false, 0L)) == null) &amp;&amp;
-            ((Thread.interrupted() || // disambiguates null return
-              (v = arenaExchange(item, false, 0L)) == null)))
-            throw new InterruptedException();
-        return (v == NULL_ITEM) ? null : (V)v;
-    }
-
-    /**
-     * Waits for another thread to arrive at this exchange point (unless
-     * the current thread is {@linkplain Thread#interrupt interrupted} or
-     * the specified waiting time elapses), and then transfers the given
-     * object to it, receiving its object in return.
-     *
-     * &lt;p&gt;If another thread is already waiting at the exchange point then
-     * it is resumed for thread scheduling purposes and receives the object
-     * passed in by the current thread.  The current thread returns immediately,
-     * receiving the object passed to the exchange by that other thread.
-     *
-     * &lt;p&gt;If no other thread is already waiting at the exchange then the
-     * current thread is disabled for thread scheduling purposes and lies
-     * dormant until one of three things happens:
-     * &lt;ul&gt;
-     * &lt;li&gt;Some other thread enters the exchange; or
-     * &lt;li&gt;Some other thread {@linkplain Thread#interrupt interrupts}
-     * the current thread; or
-     * &lt;li&gt;The specified waiting time elapses.
-     * &lt;/ul&gt;
-     * &lt;p&gt;If the current thread:
-     * &lt;ul&gt;
-     * &lt;li&gt;has its interrupted status set on entry to this method; or
-     * &lt;li&gt;is {@linkplain Thread#interrupt interrupted} while waiting
-     * for the exchange,
-     * &lt;/ul&gt;
-     * then {@link InterruptedException} is thrown and the current thread's
-     * interrupted status is cleared.
-     *
-     * &lt;p&gt;If the specified waiting time elapses then {@link
-     * TimeoutException} is thrown.  If the time is less than or equal
-     * to zero, the method will not wait at all.
-     *
-     * @param x the object to exchange
-     * @param timeout the maximum time to wait
-     * @param unit the time unit of the {@code timeout} argument
-     * @return the object provided by the other thread
-     * @throws InterruptedException if the current thread was
-     *         interrupted while waiting
-     * @throws TimeoutException if the specified waiting time elapses
-     *         before another thread enters the exchange
-     */
-    @SuppressWarnings(&quot;unchecked&quot;)
-    public V exchange(V x, long timeout, TimeUnit unit)
-        throws InterruptedException, TimeoutException {
-        Object v;
-        Object item = (x == null) ? NULL_ITEM : x;
-        long ns = unit.toNanos(timeout);
-        if ((arena != null ||
-             (v = slotExchange(item, true, ns)) == null) &amp;&amp;
-            ((Thread.interrupted() ||
-              (v = arenaExchange(item, true, ns)) == null)))
-            throw new InterruptedException();
-        if (v == TIMED_OUT)
-            throw new TimeoutException();
-        return (v == NULL_ITEM) ? null : (V)v;
-    }
-
-    // Unsafe mechanics
-    private static final sun.misc.Unsafe U;
-    private static final long BOUND;
-    private static final long SLOT;
-    private static final long MATCH;
-    private static final long BLOCKER;
-    private static final int ABASE;
-    static {
-        int s;
-        try {
-            U = sun.misc.Unsafe.getUnsafe();
-            Class&lt;?&gt; ek = Exchanger.class;
-            Class&lt;?&gt; nk = Node.class;
-            Class&lt;?&gt; ak = Node[].class;
-            Class&lt;?&gt; tk = Thread.class;
-            BOUND = U.objectFieldOffset
-                (ek.getDeclaredField(&quot;bound&quot;));
-            SLOT = U.objectFieldOffset
-                (ek.getDeclaredField(&quot;slot&quot;));
-            MATCH = U.objectFieldOffset
-                (nk.getDeclaredField(&quot;match&quot;));
-            BLOCKER = U.objectFieldOffset
-                (tk.getDeclaredField(&quot;parkBlocker&quot;));
-            s = U.arrayIndexScale(ak);
-            // ABASE absorbs padding in front of element 0
-            ABASE = U.arrayBaseOffset(ak) + (1 &lt;&lt; ASHIFT);
-
-        } catch (Exception e) {
-            throw new Error(e);
-        }
-        if ((s &amp; (s-1)) != 0 || s &gt; (1 &lt;&lt; ASHIFT))
-            throw new Error(&quot;Unsupported array scale&quot;);
-    }
-
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre> * This file is available under and governed by the GNU General Public</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre> * License version 2 only, as published by the Free Software Foundation.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre> * However, the following notice accompanied the original version of this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre> * file:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre> * Written by Doug Lea, Bill Scherer, and Michael Scott with</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre> * assistance from members of JCP JSR-166 Expert Group and released to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre> * the public domain, as explained at</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre> * http://creativecommons.org/publicdomain/zero/1.0/</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>package java.util.concurrent;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import java.util.concurrent.atomic.AtomicInteger;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import java.util.concurrent.atomic.AtomicReference;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre>import java.util.concurrent.locks.LockSupport;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre> * A synchronization point at which threads can pair and swap elements</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre> * within pairs.  Each thread presents some object on entry to the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre> * {@link #exchange exchange} method, matches with a partner thread,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre> * and receives its partner's object on return.  An Exchanger may be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre> * viewed as a bidirectional form of a {@link SynchronousQueue}.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre> * Exchangers may be useful in applications such as genetic algorithms</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre> * and pipeline designs.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre> * &lt;p&gt;&lt;b&gt;Sample Usage:&lt;/b&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre> * Here are the highlights of a class that uses an {@code Exchanger}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre> * to swap buffers between threads so that the thread filling the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre> * buffer gets a freshly emptied one when it needs it, handing off the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre> * filled one to the thread emptying the buffer.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre> *  &lt;pre&gt; {@code</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre> * class FillAndEmpty {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre> *   Exchanger&lt;DataBuffer&gt; exchanger = new Exchanger&lt;DataBuffer&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre> *   DataBuffer initialEmptyBuffer = ... a made-up type</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre> *   DataBuffer initialFullBuffer = ...</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre> *   class FillingLoop implements Runnable {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre> *     public void run() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre> *       DataBuffer currentBuffer = initialEmptyBuffer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre> *       try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre> *         while (currentBuffer != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre> *           addToBuffer(currentBuffer);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre> *           if (currentBuffer.isFull())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre> *             currentBuffer = exchanger.exchange(currentBuffer);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre> *         }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre> *       } catch (InterruptedException ex) { ... handle ... }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre> *     }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre> *   }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre> *   class EmptyingLoop implements Runnable {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre> *     public void run() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre> *       DataBuffer currentBuffer = initialFullBuffer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre> *       try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre> *         while (currentBuffer != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre> *           takeFromBuffer(currentBuffer);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre> *           if (currentBuffer.isEmpty())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre> *             currentBuffer = exchanger.exchange(currentBuffer);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre> *         }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre> *       } catch (InterruptedException ex) { ... handle ...}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre> *     }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre> *   }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre> *   void start() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre> *     new Thread(new FillingLoop()).start();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre> *     new Thread(new EmptyingLoop()).start();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre> *   }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre> * }}&lt;/pre&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre> * &lt;p&gt;Memory consistency effects: For each pair of threads that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre> * successfully exchange objects via an {@code Exchanger}, actions</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre> * prior to the {@code exchange()} in each thread</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre> * &lt;a href=&quot;package-summary.html#MemoryVisibility&quot;&gt;&lt;i&gt;happen-before&lt;/i&gt;&lt;/a&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre> * those subsequent to a return from the corresponding {@code exchange()}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre> * in the other thread.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre> * @since 1.5</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre> * @author Doug Lea and Bill Scherer and Michael Scott</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre> * @param &lt;V&gt; The type of objects that may be exchanged</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>public class Exchanger&lt;V&gt; {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>     * Overview: The core algorithm is, for an exchange &quot;slot&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>     * and a participant (caller) with an item:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>     * for (;;) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>     *   if (slot is empty) {                       // offer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>     *     place item in a Node;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>     *     if (can CAS slot from empty to node) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>     *       wait for release;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>     *       return matching item in node;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>     *     }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>     *   }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>     *   else if (can CAS slot from node to empty) { // release</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>     *     get the item in node;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>     *     set matching item in node;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>     *     release waiting thread;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>     *   }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>     *   // else retry on CAS failure</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>     * }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>     * This is among the simplest forms of a &quot;dual data structure&quot; --</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>     * see Scott and Scherer's DISC 04 paper and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>     * http://www.cs.rochester.edu/research/synchronization/pseudocode/duals.html</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>     * This works great in principle. But in practice, like many</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>     * algorithms centered on atomic updates to a single location, it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>     * scales horribly when there are more than a few participants</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>     * using the same Exchanger. So the implementation instead uses a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>     * form of elimination arena, that spreads out this contention by</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>     * arranging that some threads typically use different slots,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>     * while still ensuring that eventually, any two parties will be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>     * able to exchange items. That is, we cannot completely partition</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>     * across threads, but instead give threads arena indices that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>     * will on average grow under contention and shrink under lack of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>     * contention. We approach this by defining the Nodes that we need</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>     * anyway as ThreadLocals, and include in them per-thread index</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>     * and related bookkeeping state. (We can safely reuse per-thread</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>     * nodes rather than creating them fresh each time because slots</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>     * alternate between pointing to a node vs null, so cannot</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>     * encounter ABA problems. However, we do need some care in</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>     * resetting them between uses.)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>     * Implementing an effective arena requires allocating a bunch of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>     * space, so we only do so upon detecting contention (except on</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>     * uniprocessors, where they wouldn't help, so aren't used).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>     * Otherwise, exchanges use the single-slot slotExchange method.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>     * On contention, not only must the slots be in different</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>     * locations, but the locations must not encounter memory</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>     * contention due to being on the same cache line (or more</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>     * generally, the same coherence unit).  Because, as of this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>     * writing, there is no way to determine cacheline size, we define</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>     * a value that is enough for common platforms.  Additionally,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>     * extra care elsewhere is taken to avoid other false/unintended</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>     * sharing and to enhance locality, including adding padding (via</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>     * sun.misc.Contended) to Nodes, embedding &quot;bound&quot; as an Exchanger</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>     * field, and reworking some park/unpark mechanics compared to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>     * LockSupport versions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>     * The arena starts out with only one used slot. We expand the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>     * effective arena size by tracking collisions; i.e., failed CASes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>     * while trying to exchange. By nature of the above algorithm, the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>     * only kinds of collision that reliably indicate contention are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>     * when two attempted releases collide -- one of two attempted</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>     * offers can legitimately fail to CAS without indicating</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>     * contention by more than one other thread. (Note: it is possible</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>     * but not worthwhile to more precisely detect contention by</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>     * reading slot values after CAS failures.)  When a thread has</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>     * collided at each slot within the current arena bound, it tries</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>     * to expand the arena size by one. We track collisions within</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>     * bounds by using a version (sequence) number on the &quot;bound&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>     * field, and conservatively reset collision counts when a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>     * participant notices that bound has been updated (in either</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>     * direction).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>     * The effective arena size is reduced (when there is more than</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>     * one slot) by giving up on waiting after a while and trying to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>     * decrement the arena size on expiration. The value of &quot;a while&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>     * is an empirical matter.  We implement by piggybacking on the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>     * use of spin-&gt;yield-&gt;block that is essential for reasonable</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>     * waiting performance anyway -- in a busy exchanger, offers are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>     * usually almost immediately released, in which case context</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>     * switching on multiprocessors is extremely slow/wasteful.  Arena</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>     * waits just omit the blocking part, and instead cancel. The spin</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>     * count is empirically chosen to be a value that avoids blocking</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>     * 99% of the time under maximum sustained exchange rates on a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>     * range of test machines. Spins and yields entail some limited</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>     * randomness (using a cheap xorshift) to avoid regular patterns</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>     * that can induce unproductive grow/shrink cycles. (Using a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>     * pseudorandom also helps regularize spin cycle duration by</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>     * making branches unpredictable.)  Also, during an offer, a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>     * waiter can &quot;know&quot; that it will be released when its slot has</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>     * changed, but cannot yet proceed until match is set.  In the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>     * mean time it cannot cancel the offer, so instead spins/yields.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>     * Note: It is possible to avoid this secondary check by changing</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>     * the linearization point to be a CAS of the match field (as done</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>     * in one case in the Scott &amp; Scherer DISC paper), which also</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>     * increases asynchrony a bit, at the expense of poorer collision</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>     * detection and inability to always reuse per-thread nodes. So</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>     * the current scheme is typically a better tradeoff.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>     * On collisions, indices traverse the arena cyclically in reverse</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>     * order, restarting at the maximum index (which will tend to be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>     * sparsest) when bounds change. (On expirations, indices instead</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>     * are halved until reaching 0.) It is possible (and has been</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>     * tried) to use randomized, prime-value-stepped, or double-hash</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>     * style traversal instead of simple cyclic traversal to reduce</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>     * bunching.  But empirically, whatever benefits these may have</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>     * don't overcome their added overhead: We are managing operations</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>     * that occur very quickly unless there is sustained contention,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>     * so simpler/faster control policies work better than more</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>     * accurate but slower ones.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>     * Because we use expiration for arena size control, we cannot</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>     * throw TimeoutExceptions in the timed version of the public</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>     * exchange method until the arena size has shrunken to zero (or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>     * the arena isn't enabled). This may delay response to timeout</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>     * but is still within spec.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>     * Essentially all of the implementation is in methods</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>     * slotExchange and arenaExchange. These have similar overall</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>     * structure, but differ in too many details to combine. The</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>     * slotExchange method uses the single Exchanger field &quot;slot&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>     * rather than arena array elements. However, it still needs</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>     * minimal collision detection to trigger arena construction.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>     * (The messiest part is making sure interrupt status and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>     * InterruptedExceptions come out right during transitions when</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>     * both methods may be called. This is done by using null return</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>     * as a sentinel to recheck interrupt status.)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>     * As is too common in this sort of code, methods are monolithic</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>     * because most of the logic relies on reads of fields that are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>     * maintained as local variables so can't be nicely factored --</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>     * mainly, here, bulky spin-&gt;yield-&gt;block/cancel code), and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>     * heavily dependent on intrinsics (Unsafe) to use inlined</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>     * embedded CAS and related memory access operations (that tend</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>     * not to be as readily inlined by dynamic compilers when they are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>     * hidden behind other methods that would more nicely name and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>     * encapsulate the intended effects). This includes the use of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>     * putOrderedX to clear fields of the per-thread Nodes between</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>     * uses. Note that field Node.item is not declared as volatile</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>     * even though it is read by releasing threads, because they only</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>     * do so after CAS operations that must precede access, and all</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>     * uses by the owning thread are otherwise acceptably ordered by</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>     * other operations. (Because the actual points of atomicity are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>     * slot CASes, it would also be legal for the write to Node.match</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>     * in a release to be weaker than a full volatile write. However,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>     * this is not done because it could allow further postponement of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>     * the write, delaying progress.)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>     * The byte distance (as a shift value) between any two used slots</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>     * in the arena.  1 &lt;&lt; ASHIFT should be at least cacheline size.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>    private static final int ASHIFT = 7;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>     * The maximum supported arena index. The maximum allocatable</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>     * arena size is MMASK + 1. Must be a power of two minus one, less</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>     * than (1&lt;&lt;(31-ASHIFT)). The cap of 255 (0xff) more than suffices</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>     * for the expected scaling limits of the main algorithms.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>    private static final int MMASK = 0xff;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>     * Unit for sequence/version bits of bound field. Each successful</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>     * change to the bound also adds SEQ.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>    private static final int SEQ = MMASK + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>    /** The number of CPUs, for sizing and spin control */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>    private static final int NCPU = Runtime.getRuntime().availableProcessors();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>     * The maximum slot index of the arena: The number of slots that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>     * can in principle hold all threads without contention, or at</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>     * most the maximum indexable value.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>    static final int FULL = (NCPU &gt;= (MMASK &lt;&lt; 1)) ? MMASK : NCPU &gt;&gt;&gt; 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>     * The bound for spins while waiting for a match. The actual</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>     * number of iterations will on average be about twice this value</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>     * due to randomization. Note: Spinning is disabled when NCPU==1.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>    private static final int SPINS = 1 &lt;&lt; 10;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>     * Value representing null arguments/returns from public</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>     * methods. Needed because the API originally didn't disallow null</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>     * arguments, which it should have.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>    private static final Object NULL_ITEM = new Object();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>     * Sentinel value returned by internal exchange methods upon</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>     * timeout, to avoid need for separate timed versions of these</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>     * methods.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>    private static final Object TIMED_OUT = new Object();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>     * Nodes hold partially exchanged data, plus other per-thread</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>     * bookkeeping. Padded via @sun.misc.Contended to reduce memory</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>     * contention.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>    @sun.misc.Contended static final class Node {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>        int index;              // Arena index</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>        int bound;              // Last recorded value of Exchanger.bound</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>        int collides;           // Number of CAS failures at current bound</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>        int hash;               // Pseudo-random for spins</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>        Object item;            // This thread's current item</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>        volatile Object match;  // Item provided by releasing thread</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>        volatile Thread parked; // Set to this thread when parked, else null</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>    /** The corresponding thread local class */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>    static final class Participant extends ThreadLocal&lt;Node&gt; {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>        public Node initialValue() { return new Node(); }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>     * Per-thread state</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>    private final Participant participant;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>     * Elimination array; null until enabled (within slotExchange).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>     * Element accesses use emulation of volatile gets and CAS.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>    private volatile Node[] arena;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>     * Slot used until contention detected.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>    private volatile Node slot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>     * The index of the largest valid arena position, OR'ed with SEQ</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>     * number in high bits, incremented on each update.  The initial</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>     * update from 0 to SEQ is used to ensure that the arena array is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>     * constructed only once.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>    private volatile int bound;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>     * Exchange function when arenas enabled. See above for explanation.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>     * @param item the (non-null) item to exchange</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>     * @param timed true if the wait is timed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>     * @param ns if timed, the maximum wait time, else 0L</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>     * @return the other thread's item; or null if interrupted; or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>     * TIMED_OUT if timed and timed out</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>    private final Object arenaExchange(Object item, boolean timed, long ns) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>        Node[] a = arena;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>        Node p = participant.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>        for (int i = p.index;;) {                      // access slot at i</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>            int b, m, c; long j;                       // j is raw array offset</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>            Node q = (Node)U.getObjectVolatile(a, j = (i &lt;&lt; ASHIFT) + ABASE);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>            if (q != null &amp;&amp; U.compareAndSwapObject(a, j, q, null)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>                Object v = q.item;                     // release</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>                q.match = item;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>                Thread w = q.parked;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>                if (w != null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>                    U.unpark(w);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>                return v;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>            else if (i &lt;= (m = (b = bound) &amp; MMASK) &amp;&amp; q == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>                p.item = item;                         // offer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>                if (U.compareAndSwapObject(a, j, null, p)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>                    long end = (timed &amp;&amp; m == 0) ? System.nanoTime() + ns : 0L;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>                    Thread t = Thread.currentThread(); // wait</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>                    for (int h = p.hash, spins = SPINS;;) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>                        Object v = p.match;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>                        if (v != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>                            U.putOrderedObject(p, MATCH, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>                            p.item = null;             // clear for next use</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>                            p.hash = h;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>                            return v;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>                        else if (spins &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>                            h ^= h &lt;&lt; 1; h ^= h &gt;&gt;&gt; 3; h ^= h &lt;&lt; 10; // xorshift</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>                            if (h == 0)                // initialize hash</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>                                h = SPINS | (int)t.getId();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>                            else if (h &lt; 0 &amp;&amp;          // approx 50% true</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>                                     (--spins &amp; ((SPINS &gt;&gt;&gt; 1) - 1)) == 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>                                Thread.yield();        // two yields per wait</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>                        else if (U.getObjectVolatile(a, j) != p)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>                            spins = SPINS;       // releaser hasn't set match yet</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>                        else if (!t.isInterrupted() &amp;&amp; m == 0 &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>                                 (!timed ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>                                  (ns = end - System.nanoTime()) &gt; 0L)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>                            U.putObject(t, BLOCKER, this); // emulate LockSupport</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>                            p.parked = t;              // minimize window</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>                            if (U.getObjectVolatile(a, j) == p)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>                                U.park(false, ns);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>                            p.parked = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>                            U.putObject(t, BLOCKER, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>                        else if (U.getObjectVolatile(a, j) == p &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>                                 U.compareAndSwapObject(a, j, p, null)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>                            if (m != 0)                // try to shrink</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>                                U.compareAndSwapInt(this, BOUND, b, b + SEQ - 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>                            p.item = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>                            p.hash = h;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>                            i = p.index &gt;&gt;&gt;= 1;        // descend</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>                            if (Thread.interrupted())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>                                return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>                            if (timed &amp;&amp; m == 0 &amp;&amp; ns &lt;= 0L)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>                                return TIMED_OUT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>                            break;                     // expired; restart</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>                else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>                    p.item = null;                     // clear offer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>            else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>                if (p.bound != b) {                    // stale; reset</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>                    p.bound = b;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>                    p.collides = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>                    i = (i != m || m == 0) ? m : m - 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>                else if ((c = p.collides) &lt; m || m == FULL ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>                         !U.compareAndSwapInt(this, BOUND, b, b + SEQ + 1)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>                    p.collides = c + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>                    i = (i == 0) ? m : i - 1;          // cyclically traverse</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>                else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>                    i = m + 1;                         // grow</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>                p.index = i;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>     * Exchange function used until arenas enabled. See above for explanation.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>     * @param item the item to exchange</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>     * @param timed true if the wait is timed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>     * @param ns if timed, the maximum wait time, else 0L</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>     * @return the other thread's item; or null if either the arena</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>     * was enabled or the thread was interrupted before completion; or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>     * TIMED_OUT if timed and timed out</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>    private final Object slotExchange(Object item, boolean timed, long ns) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>        Node p = participant.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>        Thread t = Thread.currentThread();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>        if (t.isInterrupted()) // preserve interrupt status so caller can recheck</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>        for (Node q;;) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>            if ((q = slot) != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>                if (U.compareAndSwapObject(this, SLOT, q, null)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>                    Object v = q.item;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>                    q.match = item;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>                    Thread w = q.parked;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>                    if (w != null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>                        U.unpark(w);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>                    return v;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>                // create arena on contention, but continue until slot null</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>                if (NCPU &gt; 1 &amp;&amp; bound == 0 &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>                    U.compareAndSwapInt(this, BOUND, 0, SEQ))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>                    arena = new Node[(FULL + 2) &lt;&lt; ASHIFT];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>            else if (arena != null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>                return null; // caller must reroute to arenaExchange</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>            else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>                p.item = item;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>                if (U.compareAndSwapObject(this, SLOT, null, p))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>                p.item = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>        // await release</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>        int h = p.hash;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>        long end = timed ? System.nanoTime() + ns : 0L;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>        int spins = (NCPU &gt; 1) ? SPINS : 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>        Object v;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>        while ((v = p.match) == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>            if (spins &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>                h ^= h &lt;&lt; 1; h ^= h &gt;&gt;&gt; 3; h ^= h &lt;&lt; 10;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>                if (h == 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>                    h = SPINS | (int)t.getId();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>                else if (h &lt; 0 &amp;&amp; (--spins &amp; ((SPINS &gt;&gt;&gt; 1) - 1)) == 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>                    Thread.yield();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>            else if (slot != p)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>                spins = SPINS;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>            else if (!t.isInterrupted() &amp;&amp; arena == null &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>                     (!timed || (ns = end - System.nanoTime()) &gt; 0L)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>                U.putObject(t, BLOCKER, this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>                p.parked = t;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre>                if (slot == p)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>                    U.park(false, ns);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>                p.parked = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>                U.putObject(t, BLOCKER, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>            else if (U.compareAndSwapObject(this, SLOT, p, null)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>                v = timed &amp;&amp; ns &lt;= 0L &amp;&amp; !t.isInterrupted() ? TIMED_OUT : null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>        U.putOrderedObject(p, MATCH, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>        p.item = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre>        p.hash = h;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>        return v;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>     * Creates a new Exchanger.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>    public Exchanger() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>        participant = new Participant();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>     * Waits for another thread to arrive at this exchange point (unless</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>     * the current thread is {@linkplain Thread#interrupt interrupted}),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>     * and then transfers the given object to it, receiving its object</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>     * in return.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>     * &lt;p&gt;If another thread is already waiting at the exchange point then</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>     * it is resumed for thread scheduling purposes and receives the object</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>     * passed in by the current thread.  The current thread returns immediately,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>     * receiving the object passed to the exchange by that other thread.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>     * &lt;p&gt;If no other thread is already waiting at the exchange then the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>     * current thread is disabled for thread scheduling purposes and lies</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>     * dormant until one of two things happens:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>     * &lt;ul&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>     * &lt;li&gt;Some other thread enters the exchange; or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>     * &lt;li&gt;Some other thread {@linkplain Thread#interrupt interrupts}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>     * the current thread.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre>     * &lt;/ul&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>     * &lt;p&gt;If the current thread:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>     * &lt;ul&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>     * &lt;li&gt;has its interrupted status set on entry to this method; or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>     * &lt;li&gt;is {@linkplain Thread#interrupt interrupted} while waiting</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>     * for the exchange,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>     * &lt;/ul&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>     * then {@link InterruptedException} is thrown and the current thread's</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>     * interrupted status is cleared.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>     * @param x the object to exchange</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>     * @return the object provided by the other thread</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>     * @throws InterruptedException if the current thread was</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>     *         interrupted while waiting</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>    @SuppressWarnings(&quot;unchecked&quot;)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>    public V exchange(V x) throws InterruptedException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>        Object v;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>        Object item = (x == null) ? NULL_ITEM : x; // translate null args</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre>        if ((arena != null ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>             (v = slotExchange(item, false, 0L)) == null) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre>            ((Thread.interrupted() || // disambiguates null return</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>              (v = arenaExchange(item, false, 0L)) == null)))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>            throw new InterruptedException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>        return (v == NULL_ITEM) ? null : (V)v;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre>     * Waits for another thread to arrive at this exchange point (unless</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>     * the current thread is {@linkplain Thread#interrupt interrupted} or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>     * the specified waiting time elapses), and then transfers the given</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>     * object to it, receiving its object in return.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>     * &lt;p&gt;If another thread is already waiting at the exchange point then</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>     * it is resumed for thread scheduling purposes and receives the object</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>     * passed in by the current thread.  The current thread returns immediately,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>     * receiving the object passed to the exchange by that other thread.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>     * &lt;p&gt;If no other thread is already waiting at the exchange then the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>     * current thread is disabled for thread scheduling purposes and lies</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>     * dormant until one of three things happens:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>     * &lt;ul&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>     * &lt;li&gt;Some other thread enters the exchange; or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>     * &lt;li&gt;Some other thread {@linkplain Thread#interrupt interrupts}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>     * the current thread; or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre>     * &lt;li&gt;The specified waiting time elapses.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre>     * &lt;/ul&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>     * &lt;p&gt;If the current thread:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>     * &lt;ul&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>     * &lt;li&gt;has its interrupted status set on entry to this method; or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>     * &lt;li&gt;is {@linkplain Thread#interrupt interrupted} while waiting</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>     * for the exchange,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>     * &lt;/ul&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>     * then {@link InterruptedException} is thrown and the current thread's</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>     * interrupted status is cleared.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>     * &lt;p&gt;If the specified waiting time elapses then {@link</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>     * TimeoutException} is thrown.  If the time is less than or equal</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>     * to zero, the method will not wait at all.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>     * @param x the object to exchange</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre>     * @param timeout the maximum time to wait</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>     * @param unit the time unit of the {@code timeout} argument</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>     * @return the object provided by the other thread</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>     * @throws InterruptedException if the current thread was</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre>     *         interrupted while waiting</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>     * @throws TimeoutException if the specified waiting time elapses</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>     *         before another thread enters the exchange</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>    @SuppressWarnings(&quot;unchecked&quot;)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>    public V exchange(V x, long timeout, TimeUnit unit)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>        throws InterruptedException, TimeoutException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>        Object v;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>        Object item = (x == null) ? NULL_ITEM : x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>        long ns = unit.toNanos(timeout);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>        if ((arena != null ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>             (v = slotExchange(item, true, ns)) == null) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre>            ((Thread.interrupted() ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>              (v = arenaExchange(item, true, ns)) == null)))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre>            throw new InterruptedException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre>        if (v == TIMED_OUT)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>            throw new TimeoutException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>        return (v == NULL_ITEM) ? null : (V)v;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>    // Unsafe mechanics</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>    private static final sun.misc.Unsafe U;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre>    private static final long BOUND;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>    private static final long SLOT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre>    private static final long MATCH;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>    private static final long BLOCKER;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>    private static final int ABASE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre>    static {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>        int s;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre>            U = sun.misc.Unsafe.getUnsafe();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>            Class&lt;?&gt; ek = Exchanger.class;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>            Class&lt;?&gt; nk = Node.class;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>            Class&lt;?&gt; ak = Node[].class;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>            Class&lt;?&gt; tk = Thread.class;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>            BOUND = U.objectFieldOffset</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre>                (ek.getDeclaredField(&quot;bound&quot;));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>            SLOT = U.objectFieldOffset</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>                (ek.getDeclaredField(&quot;slot&quot;));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>            MATCH = U.objectFieldOffset</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>                (nk.getDeclaredField(&quot;match&quot;));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>            BLOCKER = U.objectFieldOffset</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>                (tk.getDeclaredField(&quot;parkBlocker&quot;));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>            s = U.arrayIndexScale(ak);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>            // ABASE absorbs padding in front of element 0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre>            ABASE = U.arrayBaseOffset(ak) + (1 &lt;&lt; ASHIFT);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>            throw new Error(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>        if ((s &amp; (s-1)) != 0 || s &gt; (1 &lt;&lt; ASHIFT))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>            throw new Error(&quot;Unsupported array scale&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

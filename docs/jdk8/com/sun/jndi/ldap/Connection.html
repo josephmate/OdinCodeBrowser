@@ -3,1033 +3,4111 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 1999, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package com.sun.jndi.ldap;
-
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.InterruptedIOException;
-import java.io.IOException;
-import java.io.OutputStream;
-import java.io.InputStream;
-import java.net.Socket;
-import javax.net.ssl.SSLSocket;
-
-import javax.naming.CommunicationException;
-import javax.naming.ServiceUnavailableException;
-import javax.naming.NamingException;
-import javax.naming.InterruptedNamingException;
-
-import javax.naming.ldap.Control;
-
-import java.lang.reflect.Method;
-import java.lang.reflect.Constructor;
-import java.lang.reflect.InvocationTargetException;
-import java.util.Arrays;
-import sun.misc.IOUtils;
-//import javax.net.SocketFactory;
-
-/**
-  * A thread that creates a connection to an LDAP server.
-  * After the connection, the thread reads from the connection.
-  * A caller can invoke methods on the instance to read LDAP responses
-  * and to send LDAP requests.
-  * &lt;p&gt;
-  * There is a one-to-one correspondence between an LdapClient and
-  * a Connection. Access to Connection and its methods is only via
-  * LdapClient with two exceptions: SASL authentication and StartTLS.
-  * SASL needs to access Connection's socket IO streams (in order to do encryption
-  * of the security layer). StartTLS needs to do replace IO streams
-  * and close the IO  streams on nonfatal close. The code for SASL
-  * authentication can be treated as being the same as from LdapClient
-  * because the SASL code is only ever called from LdapClient, from
-  * inside LdapClient's synchronized authenticate() method. StartTLS is called
-  * directly by the application but should only occur when the underlying
-  * connection is quiet.
-  * &lt;p&gt;
-  * In terms of synchronization, worry about data structures
-  * used by the Connection thread because that usage might contend
-  * with calls by the main threads (i.e., those that call LdapClient).
-  * Main threads need to worry about contention with each other.
-  * Fields that Connection thread uses:
-  *     inStream - synced access and update; initialized in constructor;
-  *           referenced outside class unsync'ed (by LdapSasl) only
-  *           when connection is quiet
-  *     traceFile, traceTagIn, traceTagOut - no sync; debugging only
-  *     parent - no sync; initialized in constructor; no updates
-  *     pendingRequests - sync
-  *     pauseLock - per-instance lock;
-  *     paused - sync via pauseLock (pauseReader())
-  * Members used by main threads (LdapClient):
-  *     host, port - unsync; read-only access for StartTLS and debug messages
-  *     setBound(), setV3() - no sync; called only by LdapClient.authenticate(),
-  *             which is a sync method called only when connection is &quot;quiet&quot;
-  *     getMsgId() - sync
-  *     writeRequest(), removeRequest(),findRequest(), abandonOutstandingReqs() -
-  *             access to shared pendingRequests is sync
-  *     writeRequest(),  abandonRequest(), ldapUnbind() - access to outStream sync
-  *     cleanup() - sync
-  *     readReply() - access to sock sync
-  *     unpauseReader() - (indirectly via writeRequest) sync on pauseLock
-  * Members used by SASL auth (main thread):
-  *     inStream, outStream - no sync; used to construct new stream; accessed
-  *             only when conn is &quot;quiet&quot; and not shared
-  *     replaceStreams() - sync method
-  * Members used by StartTLS:
-  *     inStream, outStream - no sync; used to record the existing streams;
-  *             accessed only when conn is &quot;quiet&quot; and not shared
-  *     replaceStreams() - sync method
-  * &lt;p&gt;
-  * Handles anonymous, simple, and SASL bind for v3; anonymous and simple
-  * for v2.
-  * %%% made public for access by LdapSasl %%%
-  *
-  * @author Vincent Ryan
-  * @author Rosanna Lee
-  * @author Jagane Sundar
-  */
-public final class Connection implements Runnable {
-
-    private static final boolean debug = false;
-    private static final int dump = 0; // &gt; 0 r, &gt; 1 rw
-
-
-    final private Thread worker;    // Initialized in constructor
-
-    private boolean v3 = true;       // Set in setV3()
-
-    final public String host;  // used by LdapClient for generating exception messages
-                         // used by StartTlsResponse when creating an SSL socket
-    final public int port;     // used by LdapClient for generating exception messages
-                         // used by StartTlsResponse when creating an SSL socket
-
-    private boolean bound = false;   // Set in setBound()
-
-    // All three are initialized in constructor and read-only afterwards
-    private OutputStream traceFile = null;
-    private String traceTagIn = null;
-    private String traceTagOut = null;
-
-    // Initialized in constructor; read and used externally (LdapSasl);
-    // Updated in replaceStreams() during &quot;quiet&quot;, unshared, period
-    public InputStream inStream;   // must be public; used by LdapSasl
-
-    // Initialized in constructor; read and used externally (LdapSasl);
-    // Updated in replaceOutputStream() during &quot;quiet&quot;, unshared, period
-    public OutputStream outStream; // must be public; used by LdapSasl
-
-    // Initialized in constructor; read and used externally (TLS) to
-    // get new IO streams; closed during cleanup
-    public Socket sock;            // for TLS
-
-    // For processing &quot;disconnect&quot; unsolicited notification
-    // Initialized in constructor
-    final private LdapClient parent;
-
-    // Incremented and returned in sync getMsgId()
-    private int outMsgId = 0;
-
-    //
-    // The list of ldapRequests pending on this binding
-    //
-    // Accessed only within sync methods
-    private LdapRequest pendingRequests = null;
-
-    volatile IOException closureReason = null;
-    volatile boolean useable = true;  // is Connection still useable
-
-    int readTimeout;
-    int connectTimeout;
-
-    // true means v3; false means v2
-    // Called in LdapClient.authenticate() (which is synchronized)
-    // when connection is &quot;quiet&quot; and not shared; no need to synchronize
-    void setV3(boolean v) {
-        v3 = v;
-    }
-
-    // A BIND request has been successfully made on this connection
-    // When cleaning up, remember to do an UNBIND
-    // Called in LdapClient.authenticate() (which is synchronized)
-    // when connection is &quot;quiet&quot; and not shared; no need to synchronize
-    void setBound() {
-        bound = true;
-    }
-
-    ////////////////////////////////////////////////////////////////////////////
-    //
-    // Create an LDAP Binding object and bind to a particular server
-    //
-    ////////////////////////////////////////////////////////////////////////////
-
-    Connection(LdapClient parent, String host, int port, String socketFactory,
-        int connectTimeout, int readTimeout, OutputStream trace) throws NamingException {
-
-        this.host = host;
-        this.port = port;
-        this.parent = parent;
-        this.readTimeout = readTimeout;
-        this.connectTimeout = connectTimeout;
-
-        if (trace != null) {
-            traceFile = trace;
-            traceTagIn = &quot;&lt;- &quot; + host + &quot;:&quot; + port + &quot;\n\n&quot;;
-            traceTagOut = &quot;-&gt; &quot; + host + &quot;:&quot; + port + &quot;\n\n&quot;;
-        }
-
-        //
-        // Connect to server
-        //
-        try {
-            sock = createSocket(host, port, socketFactory, connectTimeout);
-
-            if (debug) {
-                System.err.println(&quot;Connection: opening socket: &quot; + host + &quot;,&quot; + port);
-            }
-
-            inStream = new BufferedInputStream(sock.getInputStream());
-            outStream = new BufferedOutputStream(sock.getOutputStream());
-
-        } catch (InvocationTargetException e) {
-            Throwable realException = e.getTargetException();
-            // realException.printStackTrace();
-
-            CommunicationException ce =
-                new CommunicationException(host + &quot;:&quot; + port);
-            ce.setRootCause(realException);
-            throw ce;
-        } catch (Exception e) {
-            // Class.forName() seems to do more error checking
-            // and will throw IllegalArgumentException and such.
-            // That's why we need to have a catch all here and
-            // ignore generic exceptions.
-            // Also catches all IO errors generated by socket creation.
-            CommunicationException ce =
-                new CommunicationException(host + &quot;:&quot; + port);
-            ce.setRootCause(e);
-            throw ce;
-        }
-
-        worker = Obj.helper.createThread(this);
-        worker.setDaemon(true);
-        worker.start();
-    }
-
-    /*
-     * Create an InetSocketAddress using the specified hostname and port number.
-     */
-    private Object createInetSocketAddress(String host, int port)
-            throws NoSuchMethodException {
-
-        try {
-            Class&lt;?&gt; inetSocketAddressClass =
-                Class.forName(&quot;java.net.InetSocketAddress&quot;);
-
-            Constructor&lt;?&gt; inetSocketAddressCons =
-                inetSocketAddressClass.getConstructor(new Class&lt;?&gt;[]{
-                String.class, int.class});
-
-            return inetSocketAddressCons.newInstance(new Object[]{
-                host, new Integer(port)});
-
-        } catch (ClassNotFoundException |
-                 InstantiationException |
-                 InvocationTargetException |
-                 IllegalAccessException e) {
-            throw new NoSuchMethodException();
-
-        }
-    }
-
-    /*
-     * Create a Socket object using the specified socket factory and time limit.
-     *
-     * If a timeout is supplied and unconnected sockets are supported then
-     * an unconnected socket is created and the timeout is applied when
-     * connecting the socket. If a timeout is supplied but unconnected sockets
-     * are not supported then the timeout is ignored and a connected socket
-     * is created.
-     */
-    private Socket createSocket(String host, int port, String socketFactory,
-            int connectTimeout) throws Exception {
-
-        Socket socket = null;
-
-        if (socketFactory != null) {
-
-            // create the factory
-
-            Class&lt;?&gt; socketFactoryClass = Obj.helper.loadClass(socketFactory);
-            Method getDefault =
-                socketFactoryClass.getMethod(&quot;getDefault&quot;, new Class&lt;?&gt;[]{});
-            Object factory = getDefault.invoke(null, new Object[]{});
-
-            // create the socket
-
-            Method createSocket = null;
-
-            if (connectTimeout &gt; 0) {
-
-                try {
-                    createSocket = socketFactoryClass.getMethod(&quot;createSocket&quot;,
-                        new Class&lt;?&gt;[]{});
-
-                    Method connect = Socket.class.getMethod(&quot;connect&quot;,
-                        new Class&lt;?&gt;[]{Class.forName(&quot;java.net.SocketAddress&quot;),
-                        int.class});
-                    Object endpoint = createInetSocketAddress(host, port);
-
-                    // unconnected socket
-                    socket =
-                        (Socket)createSocket.invoke(factory, new Object[]{});
-
-                    if (debug) {
-                        System.err.println(&quot;Connection: creating socket with &quot; +
-                            &quot;a timeout using supplied socket factory&quot;);
-                    }
-
-                    // connected socket
-                    connect.invoke(socket, new Object[]{
-                        endpoint, new Integer(connectTimeout)});
-
-                } catch (NoSuchMethodException e) {
-                    // continue (but ignore connectTimeout)
-                }
-            }
-
-            if (socket == null) {
-                createSocket = socketFactoryClass.getMethod(&quot;createSocket&quot;,
-                    new Class&lt;?&gt;[]{String.class, int.class});
-
-                if (debug) {
-                    System.err.println(&quot;Connection: creating socket using &quot; +
-                        &quot;supplied socket factory&quot;);
-                }
-                // connected socket
-                socket = (Socket) createSocket.invoke(factory,
-                    new Object[]{host, new Integer(port)});
-            }
-        } else {
-
-            if (connectTimeout &gt; 0) {
-
-                try {
-                    Constructor&lt;Socket&gt; socketCons =
-                        Socket.class.getConstructor(new Class&lt;?&gt;[]{});
-
-                    Method connect = Socket.class.getMethod(&quot;connect&quot;,
-                        new Class&lt;?&gt;[]{Class.forName(&quot;java.net.SocketAddress&quot;),
-                        int.class});
-                    Object endpoint = createInetSocketAddress(host, port);
-
-                    socket = socketCons.newInstance(new Object[]{});
-
-                    if (debug) {
-                        System.err.println(&quot;Connection: creating socket with &quot; +
-                            &quot;a timeout&quot;);
-                    }
-                    connect.invoke(socket, new Object[]{
-                        endpoint, new Integer(connectTimeout)});
-
-                } catch (NoSuchMethodException e) {
-                    // continue (but ignore connectTimeout)
-                }
-            }
-
-            if (socket == null) {
-                if (debug) {
-                    System.err.println(&quot;Connection: creating socket&quot;);
-                }
-                // connected socket
-                socket = new Socket(host, port);
-            }
-        }
-
-        // For LDAP connect timeouts on LDAP over SSL connections must treat
-        // the SSL handshake following socket connection as part of the timeout.
-        // So explicitly set a socket read timeout, trigger the SSL handshake,
-        // then reset the timeout.
-        if (connectTimeout &gt; 0 &amp;&amp; socket instanceof SSLSocket) {
-            SSLSocket sslSocket = (SSLSocket) socket;
-            int socketTimeout = sslSocket.getSoTimeout();
-
-            sslSocket.setSoTimeout(connectTimeout); // reuse full timeout value
-            sslSocket.startHandshake();
-            sslSocket.setSoTimeout(socketTimeout);
-        }
-
-        return socket;
-    }
-
-    ////////////////////////////////////////////////////////////////////////////
-    //
-    // Methods to IO to the LDAP server
-    //
-    ////////////////////////////////////////////////////////////////////////////
-
-    synchronized int getMsgId() {
-        return ++outMsgId;
-    }
-
-    LdapRequest writeRequest(BerEncoder ber, int msgId) throws IOException {
-        return writeRequest(ber, msgId, false /* pauseAfterReceipt */, -1);
-    }
-
-    LdapRequest writeRequest(BerEncoder ber, int msgId,
-        boolean pauseAfterReceipt) throws IOException {
-        return writeRequest(ber, msgId, pauseAfterReceipt, -1);
-    }
-
-    LdapRequest writeRequest(BerEncoder ber, int msgId,
-        boolean pauseAfterReceipt, int replyQueueCapacity) throws IOException {
-
-        LdapRequest req =
-            new LdapRequest(msgId, pauseAfterReceipt, replyQueueCapacity);
-        addRequest(req);
-
-        if (traceFile != null) {
-            Ber.dumpBER(traceFile, traceTagOut, ber.getBuf(), 0, ber.getDataLen());
-        }
-
-
-        // unpause reader so that it can get response
-        // NOTE: Must do this before writing request, otherwise might
-        // create a race condition where the writer unblocks its own response
-        unpauseReader();
-
-        if (debug) {
-            System.err.println(&quot;Writing request to: &quot; + outStream);
-        }
-
-        try {
-            synchronized (this) {
-                outStream.write(ber.getBuf(), 0, ber.getDataLen());
-                outStream.flush();
-            }
-        } catch (IOException e) {
-            cleanup(null, true);
-            throw (closureReason = e); // rethrow
-        }
-
-        return req;
-    }
-
-    /**
-     * Reads a reply; waits until one is ready.
-     */
-    BerDecoder readReply(LdapRequest ldr)
-            throws IOException, NamingException {
-        BerDecoder rber;
-        boolean waited = false;
-
-        while (((rber = ldr.getReplyBer()) == null) &amp;&amp; !waited) {
-            try {
-                // If socket closed, don't even try
-                synchronized (this) {
-                    if (sock == null) {
-                        throw new ServiceUnavailableException(host + &quot;:&quot; + port +
-                            &quot;; socket closed&quot;);
-                    }
-                }
-                synchronized (ldr) {
-                    // check if condition has changed since our last check
-                    rber = ldr.getReplyBer();
-                    if (rber == null) {
-                        if (readTimeout &gt; 0) {  // Socket read timeout is specified
-
-                            // will be woken up before readTimeout only if reply is
-                            // available
-                            ldr.wait(readTimeout);
-                            waited = true;
-                        } else {
-                            ldr.wait(15 * 1000); // 15 second timeout
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            } catch (InterruptedException ex) {
-                throw new InterruptedNamingException(
-                    &quot;Interrupted during LDAP operation&quot;);
-            }
-        }
-
-        if ((rber == null) &amp;&amp; waited) {
-            removeRequest(ldr);
-            throw new NamingException(&quot;LDAP response read timed out, timeout used:&quot;
-                            + readTimeout + &quot;ms.&quot; );
-
-        }
-        return rber;
-    }
-
-
-    ////////////////////////////////////////////////////////////////////////////
-    //
-    // Methods to add, find, delete, and abandon requests made to server
-    //
-    ////////////////////////////////////////////////////////////////////////////
-
-    private synchronized void addRequest(LdapRequest ldapRequest) {
-
-        LdapRequest ldr = pendingRequests;
-        if (ldr == null) {
-            pendingRequests = ldapRequest;
-            ldapRequest.next = null;
-        } else {
-            ldapRequest.next = pendingRequests;
-            pendingRequests = ldapRequest;
-        }
-    }
-
-    synchronized LdapRequest findRequest(int msgId) {
-
-        LdapRequest ldr = pendingRequests;
-        while (ldr != null) {
-            if (ldr.msgId == msgId) {
-                return ldr;
-            }
-            ldr = ldr.next;
-        }
-        return null;
-
-    }
-
-    synchronized void removeRequest(LdapRequest req) {
-        LdapRequest ldr = pendingRequests;
-        LdapRequest ldrprev = null;
-
-        while (ldr != null) {
-            if (ldr == req) {
-                ldr.cancel();
-
-                if (ldrprev != null) {
-                    ldrprev.next = ldr.next;
-                } else {
-                    pendingRequests = ldr.next;
-                }
-                ldr.next = null;
-            }
-            ldrprev = ldr;
-            ldr = ldr.next;
-        }
-    }
-
-    void abandonRequest(LdapRequest ldr, Control[] reqCtls) {
-        // Remove from queue
-        removeRequest(ldr);
-
-        BerEncoder ber = new BerEncoder(256);
-        int abandonMsgId = getMsgId();
-
-        //
-        // build the abandon request.
-        //
-        try {
-            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);
-                ber.encodeInt(abandonMsgId);
-                ber.encodeInt(ldr.msgId, LdapClient.LDAP_REQ_ABANDON);
-
-                if (v3) {
-                    LdapClient.encodeControls(ber, reqCtls);
-                }
-            ber.endSeq();
-
-            if (traceFile != null) {
-                Ber.dumpBER(traceFile, traceTagOut, ber.getBuf(), 0,
-                    ber.getDataLen());
-            }
-
-            synchronized (this) {
-                outStream.write(ber.getBuf(), 0, ber.getDataLen());
-                outStream.flush();
-            }
-
-        } catch (IOException ex) {
-            //System.err.println(&quot;ldap.abandon: &quot; + ex);
-        }
-
-        // Don't expect any response for the abandon request.
-    }
-
-    synchronized void abandonOutstandingReqs(Control[] reqCtls) {
-        LdapRequest ldr = pendingRequests;
-
-        while (ldr != null) {
-            abandonRequest(ldr, reqCtls);
-            pendingRequests = ldr = ldr.next;
-        }
-    }
-
-    ////////////////////////////////////////////////////////////////////////////
-    //
-    // Methods to unbind from server and clear up resources when object is
-    // destroyed.
-    //
-    ////////////////////////////////////////////////////////////////////////////
-
-    private void ldapUnbind(Control[] reqCtls) {
-
-        BerEncoder ber = new BerEncoder(256);
-        int unbindMsgId = getMsgId();
-
-        //
-        // build the unbind request.
-        //
-
-        try {
-
-            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);
-                ber.encodeInt(unbindMsgId);
-                // IMPLICIT TAGS
-                ber.encodeByte(LdapClient.LDAP_REQ_UNBIND);
-                ber.encodeByte(0);
-
-                if (v3) {
-                    LdapClient.encodeControls(ber, reqCtls);
-                }
-            ber.endSeq();
-
-            if (traceFile != null) {
-                Ber.dumpBER(traceFile, traceTagOut, ber.getBuf(),
-                    0, ber.getDataLen());
-            }
-
-            synchronized (this) {
-                outStream.write(ber.getBuf(), 0, ber.getDataLen());
-                outStream.flush();
-            }
-
-        } catch (IOException ex) {
-            //System.err.println(&quot;ldap.unbind: &quot; + ex);
-        }
-
-        // Don't expect any response for the unbind request.
-    }
-
-    /**
-     * @param reqCtls Possibly null request controls that accompanies the
-     *    abandon and unbind LDAP request.
-     * @param notifyParent true means to call parent LdapClient back, notifying
-     *    it that the connection has been closed; false means not to notify
-     *    parent. If LdapClient invokes cleanup(), notifyParent should be set to
-     *    false because LdapClient already knows that it is closing
-     *    the connection. If Connection invokes cleanup(), notifyParent should be
-     *    set to true because LdapClient needs to know about the closure.
-     */
-    void cleanup(Control[] reqCtls, boolean notifyParent) {
-        boolean nparent = false;
-
-        synchronized (this) {
-            useable = false;
-
-            if (sock != null) {
-                if (debug) {
-                    System.err.println(&quot;Connection: closing socket: &quot; + host + &quot;,&quot; + port);
-                }
-                try {
-                    if (!notifyParent) {
-                        abandonOutstandingReqs(reqCtls);
-                    }
-                    if (bound) {
-                        ldapUnbind(reqCtls);
-                    }
-                } finally {
-                    try {
-                        outStream.flush();
-                        sock.close();
-                        unpauseReader();
-                    } catch (IOException ie) {
-                        if (debug)
-                            System.err.println(&quot;Connection: problem closing socket: &quot; + ie);
-                    }
-                    if (!notifyParent) {
-                        LdapRequest ldr = pendingRequests;
-                        while (ldr != null) {
-                            ldr.cancel();
-                            ldr = ldr.next;
-                        }
-                    }
-                    sock = null;
-                }
-                nparent = notifyParent;
-            }
-            if (nparent) {
-                LdapRequest ldr = pendingRequests;
-                while (ldr != null) {
-
-                    synchronized (ldr) {
-                        ldr.notify();
-                        ldr = ldr.next;
-                    }
-                }
-            }
-        }
-        if (nparent) {
-            parent.processConnectionClosure();
-        }
-    }
-
-
-    // Assume everything is &quot;quiet&quot;
-    // &quot;synchronize&quot; might lead to deadlock so don't synchronize method
-    // Use streamLock instead for synchronizing update to stream
-
-    synchronized public void replaceStreams(InputStream newIn, OutputStream newOut) {
-        if (debug) {
-            System.err.println(&quot;Replacing &quot; + inStream + &quot; with: &quot; + newIn);
-            System.err.println(&quot;Replacing &quot; + outStream + &quot; with: &quot; + newOut);
-        }
-
-        inStream = newIn;
-
-        // Cleanup old stream
-        try {
-            outStream.flush();
-        } catch (IOException ie) {
-            if (debug)
-                System.err.println(&quot;Connection: cannot flush outstream: &quot; + ie);
-        }
-
-        // Replace stream
-        outStream = newOut;
-    }
-
-    /**
-     * Used by Connection thread to read inStream into a local variable.
-     * This ensures that there is no contention between the main thread
-     * and the Connection thread when the main thread updates inStream.
-     */
-    synchronized private InputStream getInputStream() {
-        return inStream;
-    }
-
-
-    ////////////////////////////////////////////////////////////////////////////
-    //
-    // Code for pausing/unpausing the reader thread ('worker')
-    //
-    ////////////////////////////////////////////////////////////////////////////
-
-    /*
-     * The main idea is to mark requests that need the reader thread to
-     * pause after getting the response. When the reader thread gets the response,
-     * it waits on a lock instead of returning to the read(). The next time a
-     * request is sent, the reader is automatically unblocked if necessary.
-     * Note that the reader must be unblocked BEFORE the request is sent.
-     * Otherwise, there is a race condition where the request is sent and
-     * the reader thread might read the response and be unblocked
-     * by writeRequest().
-     *
-     * This pause gives the main thread (StartTLS or SASL) an opportunity to
-     * update the reader's state (e.g., its streams) if necessary.
-     * The assumption is that the connection will remain quiet during this pause
-     * (i.e., no intervening requests being sent).
-     *&lt;p&gt;
-     * For dealing with StartTLS close,
-     * when the read() exits either due to EOF or an exception,
-     * the reader thread checks whether there is a new stream to read from.
-     * If so, then it reattempts the read. Otherwise, the EOF or exception
-     * is processed and the reader thread terminates.
-     * In a StartTLS close, the client first replaces the SSL IO streams with
-     * plain ones and then closes the SSL socket.
-     * If the reader thread attempts to read, or was reading, from
-     * the SSL socket (that is, it got to the read BEFORE replaceStreams()),
-     * the SSL socket close will cause the reader thread to
-     * get an EOF/exception and reexamine the input stream.
-     * If the reader thread sees a new stream, it reattempts the read.
-     * If the underlying socket is still alive, then the new read will succeed.
-     * If the underlying socket has been closed also, then the new read will
-     * fail and the reader thread exits.
-     * If the reader thread attempts to read, or was reading, from the plain
-     * socket (that is, it got to the read AFTER replaceStreams()), the
-     * SSL socket close will have no effect on the reader thread.
-     *
-     * The check for new stream is made only
-     * in the first attempt at reading a BER buffer; the reader should
-     * never be in midst of reading a buffer when a nonfatal close occurs.
-     * If this occurs, then the connection is in an inconsistent state and
-     * the safest thing to do is to shut it down.
-     */
-
-    private Object pauseLock = new Object();  // lock for reader to wait on while paused
-    private boolean paused = false;           // paused state of reader
-
-    /*
-     * Unpauses reader thread if it was paused
-     */
-    private void unpauseReader() throws IOException {
-        synchronized (pauseLock) {
-            if (paused) {
-                if (debug) {
-                    System.err.println(&quot;Unpausing reader; read from: &quot; +
-                                        inStream);
-                }
-                paused = false;
-                pauseLock.notify();
-            }
-        }
-    }
-
-     /*
-     * Pauses reader so that it stops reading from the input stream.
-     * Reader blocks on pauseLock instead of read().
-     * MUST be called from within synchronized (pauseLock) clause.
-     */
-    private void pauseReader() throws IOException {
-        if (debug) {
-            System.err.println(&quot;Pausing reader;  was reading from: &quot; +
-                                inStream);
-        }
-        paused = true;
-        try {
-            while (paused) {
-                pauseLock.wait(); // notified by unpauseReader
-            }
-        } catch (InterruptedException e) {
-            throw new InterruptedIOException(
-                    &quot;Pause/unpause reader has problems.&quot;);
-        }
-    }
-
-
-    ////////////////////////////////////////////////////////////////////////////
-    //
-    // The LDAP Binding thread. It does the mux/demux of multiple requests
-    // on the same TCP connection.
-    //
-    ////////////////////////////////////////////////////////////////////////////
-
-
-    public void run() {
-        byte inbuf[];   // Buffer for reading incoming bytes
-        int inMsgId;    // Message id of incoming response
-        int bytesread;  // Number of bytes in inbuf
-        int br;         // Temp; number of bytes read from stream
-        int offset;     // Offset of where to store bytes in inbuf
-        int seqlen;     // Length of ASN sequence
-        int seqlenlen;  // Number of sequence length bytes
-        boolean eos;    // End of stream
-        BerDecoder retBer;    // Decoder for ASN.1 BER data from inbuf
-        InputStream in = null;
-
-        try {
-            while (true) {
-                try {
-                    // type and length (at most 128 octets for long form)
-                    inbuf = new byte[129];
-
-                    offset = 0;
-                    seqlen = 0;
-                    seqlenlen = 0;
-
-                    in = getInputStream();
-
-                    // check that it is the beginning of a sequence
-                    bytesread = in.read(inbuf, offset, 1);
-                    if (bytesread &lt; 0) {
-                        if (in != getInputStream()) {
-                            continue;   // a new stream to try
-                        } else {
-                            break; // EOF
-                        }
-                    }
-
-                    if (inbuf[offset++] != (Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR))
-                        continue;
-
-                    // get length of sequence
-                    bytesread = in.read(inbuf, offset, 1);
-                    if (bytesread &lt; 0)
-                        break; // EOF
-                    seqlen = inbuf[offset++];
-
-                    // if high bit is on, length is encoded in the
-                    // subsequent length bytes and the number of length bytes
-                    // is equal to &amp; 0x80 (i.e. length byte with high bit off).
-                    if ((seqlen &amp; 0x80) == 0x80) {
-                        seqlenlen = seqlen &amp; 0x7f;  // number of length bytes
-
-                        bytesread = 0;
-                        eos = false;
-
-                        // Read all length bytes
-                        while (bytesread &lt; seqlenlen) {
-                            br = in.read(inbuf, offset+bytesread,
-                                seqlenlen-bytesread);
-                            if (br &lt; 0) {
-                                eos = true;
-                                break; // EOF
-                            }
-                            bytesread += br;
-                        }
-
-                        // end-of-stream reached before length bytes are read
-                        if (eos)
-                            break;  // EOF
-
-                        // Add contents of length bytes to determine length
-                        seqlen = 0;
-                        for( int i = 0; i &lt; seqlenlen; i++) {
-                            seqlen = (seqlen &lt;&lt; 8) + (inbuf[offset+i] &amp; 0xff);
-                        }
-                        offset += bytesread;
-                    }
-
-                    // read in seqlen bytes
-                    byte[] left = IOUtils.readFully(in, seqlen, false);
-                    inbuf = Arrays.copyOf(inbuf, offset + left.length);
-                    System.arraycopy(left, 0, inbuf, offset, left.length);
-                    offset += left.length;
-/*
-if (dump &gt; 0) {
-System.err.println(&quot;seqlen: &quot; + seqlen);
-System.err.println(&quot;bufsize: &quot; + offset);
-System.err.println(&quot;bytesleft: &quot; + bytesleft);
-System.err.println(&quot;bytesread: &quot; + bytesread);
-}
-*/
-
-
-                    try {
-                        retBer = new BerDecoder(inbuf, 0, offset);
-
-                        if (traceFile != null) {
-                            Ber.dumpBER(traceFile, traceTagIn, inbuf, 0, offset);
-                        }
-
-                        retBer.parseSeq(null);
-                        inMsgId = retBer.parseInt();
-                        retBer.reset(); // reset offset
-
-                        boolean needPause = false;
-
-                        if (inMsgId == 0) {
-                            // Unsolicited Notification
-                            parent.processUnsolicited(retBer);
-                        } else {
-                            LdapRequest ldr = findRequest(inMsgId);
-
-                            if (ldr != null) {
-
-                                /**
-                                 * Grab pauseLock before making reply available
-                                 * to ensure that reader goes into paused state
-                                 * before writer can attempt to unpause reader
-                                 */
-                                synchronized (pauseLock) {
-                                    needPause = ldr.addReplyBer(retBer);
-                                    if (needPause) {
-                                        /*
-                                         * Go into paused state; release
-                                         * pauseLock
-                                         */
-                                        pauseReader();
-                                    }
-
-                                    // else release pauseLock
-                                }
-                            } else {
-                                // System.err.println(&quot;Cannot find&quot; +
-                                //              &quot;LdapRequest for &quot; + inMsgId);
-                            }
-                        }
-                    } catch (Ber.DecodeException e) {
-                        //System.err.println(&quot;Cannot parse Ber&quot;);
-                    }
-                } catch (IOException ie) {
-                    if (debug) {
-                        System.err.println(&quot;Connection: Inside Caught &quot; + ie);
-                        ie.printStackTrace();
-                    }
-
-                    if (in != getInputStream()) {
-                        // A new stream to try
-                        // Go to top of loop and continue
-                    } else {
-                        if (debug) {
-                            System.err.println(&quot;Connection: rethrowing &quot; + ie);
-                        }
-                        throw ie;  // rethrow exception
-                    }
-                }
-            }
-
-            if (debug) {
-                System.err.println(&quot;Connection: end-of-stream detected: &quot;
-                    + in);
-            }
-        } catch (IOException ex) {
-            if (debug) {
-                System.err.println(&quot;Connection: Caught &quot; + ex);
-            }
-            closureReason = ex;
-        } finally {
-            cleanup(null, true); // cleanup
-        }
-        if (debug) {
-            System.err.println(&quot;Connection: Thread Exiting&quot;);
-        }
-    }
-
-
-    // This code must be uncommented to run the LdapAbandonTest.
-    /*public void sendSearchReqs(String dn, int numReqs) {
-        int i;
-        String attrs[] = null;
-        for(i = 1; i &lt;= numReqs; i++) {
-            BerEncoder ber = new BerEncoder(2048);
-
-            try {
-            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);
-                ber.encodeInt(i);
-                ber.beginSeq(LdapClient.LDAP_REQ_SEARCH);
-                    ber.encodeString(dn == null ? &quot;&quot; : dn);
-                    ber.encodeInt(0, LdapClient.LBER_ENUMERATED);
-                    ber.encodeInt(3, LdapClient.LBER_ENUMERATED);
-                    ber.encodeInt(0);
-                    ber.encodeInt(0);
-                    ber.encodeBoolean(true);
-                    LdapClient.encodeFilter(ber, &quot;&quot;);
-                    ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);
-                        ber.encodeStringArray(attrs);
-                    ber.endSeq();
-                ber.endSeq();
-            ber.endSeq();
-            writeRequest(ber, i);
-            //System.err.println(&quot;wrote request &quot; + i);
-            } catch (Exception ex) {
-            //System.err.println(&quot;ldap.search: Caught &quot; + ex + &quot; building req&quot;);
-            }
-
-        }
-    } */
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 1999, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package com.sun.jndi.ldap;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.io.BufferedInputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.io.BufferedOutputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.io.InterruptedIOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.io.IOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.io.OutputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.io.InputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.net.Socket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import javax.net.ssl.SSLSocket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import javax.naming.CommunicationException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import javax.naming.ServiceUnavailableException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import javax.naming.NamingException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre>import javax.naming.InterruptedNamingException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>import javax.naming.ldap.Control;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre>import java.lang.reflect.Method;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre>import java.lang.reflect.Constructor;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>import java.lang.reflect.InvocationTargetException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre>import java.util.Arrays;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre>import sun.misc.IOUtils;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre>//import javax.net.SocketFactory;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre>  * A thread that creates a connection to an LDAP server.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre>  * After the connection, the thread reads from the connection.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre>  * A caller can invoke methods on the instance to read LDAP responses</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>  * and to send LDAP requests.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre>  * &lt;p&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>  * There is a one-to-one correspondence between an LdapClient and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>  * a Connection. Access to Connection and its methods is only via</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre>  * LdapClient with two exceptions: SASL authentication and StartTLS.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>  * SASL needs to access Connection's socket IO streams (in order to do encryption</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>  * of the security layer). StartTLS needs to do replace IO streams</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre>  * and close the IO  streams on nonfatal close. The code for SASL</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>  * authentication can be treated as being the same as from LdapClient</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>  * because the SASL code is only ever called from LdapClient, from</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>  * inside LdapClient's synchronized authenticate() method. StartTLS is called</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>  * directly by the application but should only occur when the underlying</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>  * connection is quiet.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>  * &lt;p&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>  * In terms of synchronization, worry about data structures</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>  * used by the Connection thread because that usage might contend</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>  * with calls by the main threads (i.e., those that call LdapClient).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>  * Main threads need to worry about contention with each other.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>  * Fields that Connection thread uses:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>  *     inStream - synced access and update; initialized in constructor;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>  *           referenced outside class unsync'ed (by LdapSasl) only</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>  *           when connection is quiet</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>  *     traceFile, traceTagIn, traceTagOut - no sync; debugging only</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>  *     parent - no sync; initialized in constructor; no updates</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>  *     pendingRequests - sync</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>  *     pauseLock - per-instance lock;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>  *     paused - sync via pauseLock (pauseReader())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>  * Members used by main threads (LdapClient):</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>  *     host, port - unsync; read-only access for StartTLS and debug messages</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>  *     setBound(), setV3() - no sync; called only by LdapClient.authenticate(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>  *             which is a sync method called only when connection is &quot;quiet&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>  *     getMsgId() - sync</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>  *     writeRequest(), removeRequest(),findRequest(), abandonOutstandingReqs() -</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>  *             access to shared pendingRequests is sync</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>  *     writeRequest(),  abandonRequest(), ldapUnbind() - access to outStream sync</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>  *     cleanup() - sync</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>  *     readReply() - access to sock sync</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>  *     unpauseReader() - (indirectly via writeRequest) sync on pauseLock</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>  * Members used by SASL auth (main thread):</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>  *     inStream, outStream - no sync; used to construct new stream; accessed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>  *             only when conn is &quot;quiet&quot; and not shared</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>  *     replaceStreams() - sync method</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>  * Members used by StartTLS:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>  *     inStream, outStream - no sync; used to record the existing streams;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>  *             accessed only when conn is &quot;quiet&quot; and not shared</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>  *     replaceStreams() - sync method</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>  * &lt;p&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>  * Handles anonymous, simple, and SASL bind for v3; anonymous and simple</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>  * for v2.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>  * %%% made public for access by LdapSasl %%%</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>  *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>  * @author Vincent Ryan</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>  * @author Rosanna Lee</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>  * @author Jagane Sundar</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>  */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>public final class Connection implements Runnable {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>    private static final boolean debug = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>    private static final int dump = 0; // &gt; 0 r, &gt; 1 rw</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>    final private Thread worker;    // Initialized in constructor</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>    private boolean v3 = true;       // Set in setV3()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>    final public String host;  // used by LdapClient for generating exception messages</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>                         // used by StartTlsResponse when creating an SSL socket</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>    final public int port;     // used by LdapClient for generating exception messages</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>                         // used by StartTlsResponse when creating an SSL socket</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>    private boolean bound = false;   // Set in setBound()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>    // All three are initialized in constructor and read-only afterwards</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>    private OutputStream traceFile = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>    private String traceTagIn = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>    private String traceTagOut = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>    // Initialized in constructor; read and used externally (LdapSasl);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>    // Updated in replaceStreams() during &quot;quiet&quot;, unshared, period</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>    public InputStream inStream;   // must be public; used by LdapSasl</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>    // Initialized in constructor; read and used externally (LdapSasl);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>    // Updated in replaceOutputStream() during &quot;quiet&quot;, unshared, period</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>    public OutputStream outStream; // must be public; used by LdapSasl</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>    // Initialized in constructor; read and used externally (TLS) to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>    // get new IO streams; closed during cleanup</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>    public Socket sock;            // for TLS</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>    // For processing &quot;disconnect&quot; unsolicited notification</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>    // Initialized in constructor</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>    final private LdapClient parent;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>    // Incremented and returned in sync getMsgId()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>    private int outMsgId = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>    // The list of ldapRequests pending on this binding</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>    // Accessed only within sync methods</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>    private LdapRequest pendingRequests = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>    volatile IOException closureReason = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>    volatile boolean useable = true;  // is Connection still useable</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>    int readTimeout;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>    int connectTimeout;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>    // true means v3; false means v2</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>    // Called in LdapClient.authenticate() (which is synchronized)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>    // when connection is &quot;quiet&quot; and not shared; no need to synchronize</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>    void setV3(boolean v) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>        v3 = v;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>    // A BIND request has been successfully made on this connection</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>    // When cleaning up, remember to do an UNBIND</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>    // Called in LdapClient.authenticate() (which is synchronized)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>    // when connection is &quot;quiet&quot; and not shared; no need to synchronize</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>    void setBound() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>        bound = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>    ////////////////////////////////////////////////////////////////////////////</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>    // Create an LDAP Binding object and bind to a particular server</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>    ////////////////////////////////////////////////////////////////////////////</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>    Connection(LdapClient parent, String host, int port, String socketFactory,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>        int connectTimeout, int readTimeout, OutputStream trace) throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>        this.host = host;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>        this.port = port;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>        this.parent = parent;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>        this.readTimeout = readTimeout;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>        this.connectTimeout = connectTimeout;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>        if (trace != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>            traceFile = trace;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>            traceTagIn = &quot;&lt;- &quot; + host + &quot;:&quot; + port + &quot;\n\n&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>            traceTagOut = &quot;-&gt; &quot; + host + &quot;:&quot; + port + &quot;\n\n&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>        // Connect to server</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>            sock = createSocket(host, port, socketFactory, connectTimeout);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>            if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>                System.err.println(&quot;Connection: opening socket: &quot; + host + &quot;,&quot; + port);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>            inStream = new BufferedInputStream(sock.getInputStream());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>            outStream = new BufferedOutputStream(sock.getOutputStream());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>        } catch (InvocationTargetException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>            Throwable realException = e.getTargetException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>            // realException.printStackTrace();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>            CommunicationException ce =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>                new CommunicationException(host + &quot;:&quot; + port);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>            ce.setRootCause(realException);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>            throw ce;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>            // Class.forName() seems to do more error checking</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>            // and will throw IllegalArgumentException and such.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>            // That's why we need to have a catch all here and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>            // ignore generic exceptions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>            // Also catches all IO errors generated by socket creation.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>            CommunicationException ce =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>                new CommunicationException(host + &quot;:&quot; + port);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>            ce.setRootCause(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>            throw ce;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>        worker = Obj.helper.createThread(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>        worker.setDaemon(true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>        worker.start();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>     * Create an InetSocketAddress using the specified hostname and port number.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>    private Object createInetSocketAddress(String host, int port)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>            throws NoSuchMethodException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>            Class&lt;?&gt; inetSocketAddressClass =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>                Class.forName(&quot;java.net.InetSocketAddress&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>            Constructor&lt;?&gt; inetSocketAddressCons =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>                inetSocketAddressClass.getConstructor(new Class&lt;?&gt;[]{</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>                String.class, int.class});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>            return inetSocketAddressCons.newInstance(new Object[]{</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>                host, new Integer(port)});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>        } catch (ClassNotFoundException |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>                 InstantiationException |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>                 InvocationTargetException |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>                 IllegalAccessException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>            throw new NoSuchMethodException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>     * Create a Socket object using the specified socket factory and time limit.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>     * If a timeout is supplied and unconnected sockets are supported then</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>     * an unconnected socket is created and the timeout is applied when</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>     * connecting the socket. If a timeout is supplied but unconnected sockets</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>     * are not supported then the timeout is ignored and a connected socket</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>     * is created.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>    private Socket createSocket(String host, int port, String socketFactory,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>            int connectTimeout) throws Exception {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>        Socket socket = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>        if (socketFactory != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>            // create the factory</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>            Class&lt;?&gt; socketFactoryClass = Obj.helper.loadClass(socketFactory);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>            Method getDefault =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>                socketFactoryClass.getMethod(&quot;getDefault&quot;, new Class&lt;?&gt;[]{});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>            Object factory = getDefault.invoke(null, new Object[]{});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>            // create the socket</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>            Method createSocket = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>            if (connectTimeout &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>                    createSocket = socketFactoryClass.getMethod(&quot;createSocket&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>                        new Class&lt;?&gt;[]{});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>                    Method connect = Socket.class.getMethod(&quot;connect&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>                        new Class&lt;?&gt;[]{Class.forName(&quot;java.net.SocketAddress&quot;),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>                        int.class});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>                    Object endpoint = createInetSocketAddress(host, port);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>                    // unconnected socket</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>                    socket =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>                        (Socket)createSocket.invoke(factory, new Object[]{});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>                    if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>                        System.err.println(&quot;Connection: creating socket with &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>                            &quot;a timeout using supplied socket factory&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>                    // connected socket</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>                    connect.invoke(socket, new Object[]{</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>                        endpoint, new Integer(connectTimeout)});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>                } catch (NoSuchMethodException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>                    // continue (but ignore connectTimeout)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>            if (socket == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>                createSocket = socketFactoryClass.getMethod(&quot;createSocket&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>                    new Class&lt;?&gt;[]{String.class, int.class});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>                if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>                    System.err.println(&quot;Connection: creating socket using &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>                        &quot;supplied socket factory&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>                // connected socket</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>                socket = (Socket) createSocket.invoke(factory,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>                    new Object[]{host, new Integer(port)});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>            if (connectTimeout &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>                    Constructor&lt;Socket&gt; socketCons =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>                        Socket.class.getConstructor(new Class&lt;?&gt;[]{});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>                    Method connect = Socket.class.getMethod(&quot;connect&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>                        new Class&lt;?&gt;[]{Class.forName(&quot;java.net.SocketAddress&quot;),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>                        int.class});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>                    Object endpoint = createInetSocketAddress(host, port);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>                    socket = socketCons.newInstance(new Object[]{});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>                    if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>                        System.err.println(&quot;Connection: creating socket with &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>                            &quot;a timeout&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>                    connect.invoke(socket, new Object[]{</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>                        endpoint, new Integer(connectTimeout)});</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>                } catch (NoSuchMethodException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>                    // continue (but ignore connectTimeout)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>            if (socket == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>                if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>                    System.err.println(&quot;Connection: creating socket&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>                // connected socket</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>                socket = new Socket(host, port);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>        // For LDAP connect timeouts on LDAP over SSL connections must treat</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>        // the SSL handshake following socket connection as part of the timeout.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>        // So explicitly set a socket read timeout, trigger the SSL handshake,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>        // then reset the timeout.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>        if (connectTimeout &gt; 0 &amp;&amp; socket instanceof SSLSocket) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>            SSLSocket sslSocket = (SSLSocket) socket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>            int socketTimeout = sslSocket.getSoTimeout();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>            sslSocket.setSoTimeout(connectTimeout); // reuse full timeout value</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>            sslSocket.startHandshake();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>            sslSocket.setSoTimeout(socketTimeout);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>        return socket;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>    ////////////////////////////////////////////////////////////////////////////</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>    // Methods to IO to the LDAP server</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>    ////////////////////////////////////////////////////////////////////////////</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>    synchronized int getMsgId() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>        return ++outMsgId;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>    LdapRequest writeRequest(BerEncoder ber, int msgId) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>        return writeRequest(ber, msgId, false /* pauseAfterReceipt */, -1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>    LdapRequest writeRequest(BerEncoder ber, int msgId,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>        boolean pauseAfterReceipt) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>        return writeRequest(ber, msgId, pauseAfterReceipt, -1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>    LdapRequest writeRequest(BerEncoder ber, int msgId,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>        boolean pauseAfterReceipt, int replyQueueCapacity) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>        LdapRequest req =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>            new LdapRequest(msgId, pauseAfterReceipt, replyQueueCapacity);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>        addRequest(req);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>        if (traceFile != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>            Ber.dumpBER(traceFile, traceTagOut, ber.getBuf(), 0, ber.getDataLen());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>        // unpause reader so that it can get response</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>        // NOTE: Must do this before writing request, otherwise might</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>        // create a race condition where the writer unblocks its own response</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>        unpauseReader();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>        if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>            System.err.println(&quot;Writing request to: &quot; + outStream);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>            synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>                outStream.write(ber.getBuf(), 0, ber.getDataLen());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>                outStream.flush();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>        } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>            cleanup(null, true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>            throw (closureReason = e); // rethrow</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>        return req;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>     * Reads a reply; waits until one is ready.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>    BerDecoder readReply(LdapRequest ldr)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>            throws IOException, NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>        BerDecoder rber;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>        boolean waited = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>        while (((rber = ldr.getReplyBer()) == null) &amp;&amp; !waited) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>                // If socket closed, don't even try</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>                synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>                    if (sock == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>                        throw new ServiceUnavailableException(host + &quot;:&quot; + port +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>                            &quot;; socket closed&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>                synchronized (ldr) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>                    // check if condition has changed since our last check</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>                    rber = ldr.getReplyBer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>                    if (rber == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>                        if (readTimeout &gt; 0) {  // Socket read timeout is specified</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>                            // will be woken up before readTimeout only if reply is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>                            // available</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>                            ldr.wait(readTimeout);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>                            waited = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>                        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>                            ldr.wait(15 * 1000); // 15 second timeout</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>                    } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>                        break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>            } catch (InterruptedException ex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>                throw new InterruptedNamingException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>                    &quot;Interrupted during LDAP operation&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>        if ((rber == null) &amp;&amp; waited) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>            removeRequest(ldr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>            throw new NamingException(&quot;LDAP response read timed out, timeout used:&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>                            + readTimeout + &quot;ms.&quot; );</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>        return rber;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>    ////////////////////////////////////////////////////////////////////////////</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>    // Methods to add, find, delete, and abandon requests made to server</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>    ////////////////////////////////////////////////////////////////////////////</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>    private synchronized void addRequest(LdapRequest ldapRequest) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>        LdapRequest ldr = pendingRequests;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>        if (ldr == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>            pendingRequests = ldapRequest;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>            ldapRequest.next = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>            ldapRequest.next = pendingRequests;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>            pendingRequests = ldapRequest;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre>    synchronized LdapRequest findRequest(int msgId) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>        LdapRequest ldr = pendingRequests;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>        while (ldr != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>            if (ldr.msgId == msgId) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>                return ldr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>            ldr = ldr.next;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>        return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>    synchronized void removeRequest(LdapRequest req) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>        LdapRequest ldr = pendingRequests;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>        LdapRequest ldrprev = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>        while (ldr != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>            if (ldr == req) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>                ldr.cancel();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>                if (ldrprev != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>                    ldrprev.next = ldr.next;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>                    pendingRequests = ldr.next;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>                ldr.next = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>            ldrprev = ldr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>            ldr = ldr.next;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>    void abandonRequest(LdapRequest ldr, Control[] reqCtls) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>        // Remove from queue</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>        removeRequest(ldr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>        BerEncoder ber = new BerEncoder(256);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>        int abandonMsgId = getMsgId();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre>        // build the abandon request.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>                ber.encodeInt(abandonMsgId);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>                ber.encodeInt(ldr.msgId, LdapClient.LDAP_REQ_ABANDON);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>                if (v3) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>                    LdapClient.encodeControls(ber, reqCtls);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>            ber.endSeq();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>            if (traceFile != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>                Ber.dumpBER(traceFile, traceTagOut, ber.getBuf(), 0,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>                    ber.getDataLen());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>            synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>                outStream.write(ber.getBuf(), 0, ber.getDataLen());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre>                outStream.flush();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>        } catch (IOException ex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>            //System.err.println(&quot;ldap.abandon: &quot; + ex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre>        // Don't expect any response for the abandon request.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>    synchronized void abandonOutstandingReqs(Control[] reqCtls) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>        LdapRequest ldr = pendingRequests;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>        while (ldr != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>            abandonRequest(ldr, reqCtls);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>            pendingRequests = ldr = ldr.next;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>    ////////////////////////////////////////////////////////////////////////////</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>    // Methods to unbind from server and clear up resources when object is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>    // destroyed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>    ////////////////////////////////////////////////////////////////////////////</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre>    private void ldapUnbind(Control[] reqCtls) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>        BerEncoder ber = new BerEncoder(256);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>        int unbindMsgId = getMsgId();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>        // build the unbind request.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>                ber.encodeInt(unbindMsgId);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>                // IMPLICIT TAGS</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>                ber.encodeByte(LdapClient.LDAP_REQ_UNBIND);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>                ber.encodeByte(0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>                if (v3) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>                    LdapClient.encodeControls(ber, reqCtls);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre>            ber.endSeq();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>            if (traceFile != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>                Ber.dumpBER(traceFile, traceTagOut, ber.getBuf(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>                    0, ber.getDataLen());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>            synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>                outStream.write(ber.getBuf(), 0, ber.getDataLen());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>                outStream.flush();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre>        } catch (IOException ex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>            //System.err.println(&quot;ldap.unbind: &quot; + ex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>        // Don't expect any response for the unbind request.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>     * @param reqCtls Possibly null request controls that accompanies the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>     *    abandon and unbind LDAP request.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre>     * @param notifyParent true means to call parent LdapClient back, notifying</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>     *    it that the connection has been closed; false means not to notify</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre>     *    parent. If LdapClient invokes cleanup(), notifyParent should be set to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>     *    false because LdapClient already knows that it is closing</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>     *    the connection. If Connection invokes cleanup(), notifyParent should be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre>     *    set to true because LdapClient needs to know about the closure.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>    void cleanup(Control[] reqCtls, boolean notifyParent) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre>        boolean nparent = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>        synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>            useable = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>            if (sock != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre>                if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>                    System.err.println(&quot;Connection: closing socket: &quot; + host + &quot;,&quot; + port);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>                    if (!notifyParent) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>                        abandonOutstandingReqs(reqCtls);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>                    if (bound) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>                        ldapUnbind(reqCtls);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre>                } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre>                    try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>                        outStream.flush();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre>                        sock.close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>                        unpauseReader();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>                    } catch (IOException ie) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>                        if (debug)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre>                            System.err.println(&quot;Connection: problem closing socket: &quot; + ie);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre>                    if (!notifyParent) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>                        LdapRequest ldr = pendingRequests;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre>                        while (ldr != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>                            ldr.cancel();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre>                            ldr = ldr.next;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre>                    sock = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>                nparent = notifyParent;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>            if (nparent) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre>                LdapRequest ldr = pendingRequests;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre>                while (ldr != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>                    synchronized (ldr) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>                        ldr.notify();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre>                        ldr = ldr.next;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre>        if (nparent) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre>            parent.processConnectionClosure();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>    // Assume everything is &quot;quiet&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre>    // &quot;synchronize&quot; might lead to deadlock so don't synchronize method</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>    // Use streamLock instead for synchronizing update to stream</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre>    synchronized public void replaceStreams(InputStream newIn, OutputStream newOut) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre>        if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre>            System.err.println(&quot;Replacing &quot; + inStream + &quot; with: &quot; + newIn);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>            System.err.println(&quot;Replacing &quot; + outStream + &quot; with: &quot; + newOut);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>        inStream = newIn;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre>        // Cleanup old stream</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>            outStream.flush();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre>        } catch (IOException ie) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre>            if (debug)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>                System.err.println(&quot;Connection: cannot flush outstream: &quot; + ie);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>        // Replace stream</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre>        outStream = newOut;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre>     * Used by Connection thread to read inStream into a local variable.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="719" href="#"></a></td>
+<td><pre>     * This ensures that there is no contention between the main thread</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="720" href="#"></a></td>
+<td><pre>     * and the Connection thread when the main thread updates inStream.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="721" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="722" href="#"></a></td>
+<td><pre>    synchronized private InputStream getInputStream() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="723" href="#"></a></td>
+<td><pre>        return inStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="724" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="725" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="726" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="727" href="#"></a></td>
+<td><pre>    ////////////////////////////////////////////////////////////////////////////</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="728" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="729" href="#"></a></td>
+<td><pre>    // Code for pausing/unpausing the reader thread ('worker')</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="730" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="731" href="#"></a></td>
+<td><pre>    ////////////////////////////////////////////////////////////////////////////</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="732" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="733" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="734" href="#"></a></td>
+<td><pre>     * The main idea is to mark requests that need the reader thread to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="735" href="#"></a></td>
+<td><pre>     * pause after getting the response. When the reader thread gets the response,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="736" href="#"></a></td>
+<td><pre>     * it waits on a lock instead of returning to the read(). The next time a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="737" href="#"></a></td>
+<td><pre>     * request is sent, the reader is automatically unblocked if necessary.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="738" href="#"></a></td>
+<td><pre>     * Note that the reader must be unblocked BEFORE the request is sent.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="739" href="#"></a></td>
+<td><pre>     * Otherwise, there is a race condition where the request is sent and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="740" href="#"></a></td>
+<td><pre>     * the reader thread might read the response and be unblocked</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="741" href="#"></a></td>
+<td><pre>     * by writeRequest().</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="742" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="743" href="#"></a></td>
+<td><pre>     * This pause gives the main thread (StartTLS or SASL) an opportunity to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="744" href="#"></a></td>
+<td><pre>     * update the reader's state (e.g., its streams) if necessary.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="745" href="#"></a></td>
+<td><pre>     * The assumption is that the connection will remain quiet during this pause</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="746" href="#"></a></td>
+<td><pre>     * (i.e., no intervening requests being sent).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="747" href="#"></a></td>
+<td><pre>     *&lt;p&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="748" href="#"></a></td>
+<td><pre>     * For dealing with StartTLS close,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="749" href="#"></a></td>
+<td><pre>     * when the read() exits either due to EOF or an exception,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="750" href="#"></a></td>
+<td><pre>     * the reader thread checks whether there is a new stream to read from.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="751" href="#"></a></td>
+<td><pre>     * If so, then it reattempts the read. Otherwise, the EOF or exception</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="752" href="#"></a></td>
+<td><pre>     * is processed and the reader thread terminates.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="753" href="#"></a></td>
+<td><pre>     * In a StartTLS close, the client first replaces the SSL IO streams with</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="754" href="#"></a></td>
+<td><pre>     * plain ones and then closes the SSL socket.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="755" href="#"></a></td>
+<td><pre>     * If the reader thread attempts to read, or was reading, from</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="756" href="#"></a></td>
+<td><pre>     * the SSL socket (that is, it got to the read BEFORE replaceStreams()),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="757" href="#"></a></td>
+<td><pre>     * the SSL socket close will cause the reader thread to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="758" href="#"></a></td>
+<td><pre>     * get an EOF/exception and reexamine the input stream.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="759" href="#"></a></td>
+<td><pre>     * If the reader thread sees a new stream, it reattempts the read.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="760" href="#"></a></td>
+<td><pre>     * If the underlying socket is still alive, then the new read will succeed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="761" href="#"></a></td>
+<td><pre>     * If the underlying socket has been closed also, then the new read will</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="762" href="#"></a></td>
+<td><pre>     * fail and the reader thread exits.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="763" href="#"></a></td>
+<td><pre>     * If the reader thread attempts to read, or was reading, from the plain</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="764" href="#"></a></td>
+<td><pre>     * socket (that is, it got to the read AFTER replaceStreams()), the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="765" href="#"></a></td>
+<td><pre>     * SSL socket close will have no effect on the reader thread.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="766" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="767" href="#"></a></td>
+<td><pre>     * The check for new stream is made only</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="768" href="#"></a></td>
+<td><pre>     * in the first attempt at reading a BER buffer; the reader should</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="769" href="#"></a></td>
+<td><pre>     * never be in midst of reading a buffer when a nonfatal close occurs.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="770" href="#"></a></td>
+<td><pre>     * If this occurs, then the connection is in an inconsistent state and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="771" href="#"></a></td>
+<td><pre>     * the safest thing to do is to shut it down.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="772" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="773" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="774" href="#"></a></td>
+<td><pre>    private Object pauseLock = new Object();  // lock for reader to wait on while paused</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="775" href="#"></a></td>
+<td><pre>    private boolean paused = false;           // paused state of reader</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="776" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="777" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="778" href="#"></a></td>
+<td><pre>     * Unpauses reader thread if it was paused</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="779" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="780" href="#"></a></td>
+<td><pre>    private void unpauseReader() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="781" href="#"></a></td>
+<td><pre>        synchronized (pauseLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="782" href="#"></a></td>
+<td><pre>            if (paused) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="783" href="#"></a></td>
+<td><pre>                if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="784" href="#"></a></td>
+<td><pre>                    System.err.println(&quot;Unpausing reader; read from: &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="785" href="#"></a></td>
+<td><pre>                                        inStream);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="786" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="787" href="#"></a></td>
+<td><pre>                paused = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="788" href="#"></a></td>
+<td><pre>                pauseLock.notify();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="789" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="790" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="791" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="792" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="793" href="#"></a></td>
+<td><pre>     /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="794" href="#"></a></td>
+<td><pre>     * Pauses reader so that it stops reading from the input stream.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="795" href="#"></a></td>
+<td><pre>     * Reader blocks on pauseLock instead of read().</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="796" href="#"></a></td>
+<td><pre>     * MUST be called from within synchronized (pauseLock) clause.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="797" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="798" href="#"></a></td>
+<td><pre>    private void pauseReader() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="799" href="#"></a></td>
+<td><pre>        if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="800" href="#"></a></td>
+<td><pre>            System.err.println(&quot;Pausing reader;  was reading from: &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="801" href="#"></a></td>
+<td><pre>                                inStream);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="802" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="803" href="#"></a></td>
+<td><pre>        paused = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="804" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="805" href="#"></a></td>
+<td><pre>            while (paused) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="806" href="#"></a></td>
+<td><pre>                pauseLock.wait(); // notified by unpauseReader</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="807" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="808" href="#"></a></td>
+<td><pre>        } catch (InterruptedException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="809" href="#"></a></td>
+<td><pre>            throw new InterruptedIOException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="810" href="#"></a></td>
+<td><pre>                    &quot;Pause/unpause reader has problems.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="811" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="812" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="813" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="814" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="815" href="#"></a></td>
+<td><pre>    ////////////////////////////////////////////////////////////////////////////</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="816" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="817" href="#"></a></td>
+<td><pre>    // The LDAP Binding thread. It does the mux/demux of multiple requests</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="818" href="#"></a></td>
+<td><pre>    // on the same TCP connection.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="819" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="820" href="#"></a></td>
+<td><pre>    ////////////////////////////////////////////////////////////////////////////</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="821" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="822" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="823" href="#"></a></td>
+<td><pre>    public void run() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="824" href="#"></a></td>
+<td><pre>        byte inbuf[];   // Buffer for reading incoming bytes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="825" href="#"></a></td>
+<td><pre>        int inMsgId;    // Message id of incoming response</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="826" href="#"></a></td>
+<td><pre>        int bytesread;  // Number of bytes in inbuf</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="827" href="#"></a></td>
+<td><pre>        int br;         // Temp; number of bytes read from stream</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="828" href="#"></a></td>
+<td><pre>        int offset;     // Offset of where to store bytes in inbuf</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="829" href="#"></a></td>
+<td><pre>        int seqlen;     // Length of ASN sequence</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="830" href="#"></a></td>
+<td><pre>        int seqlenlen;  // Number of sequence length bytes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="831" href="#"></a></td>
+<td><pre>        boolean eos;    // End of stream</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="832" href="#"></a></td>
+<td><pre>        BerDecoder retBer;    // Decoder for ASN.1 BER data from inbuf</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="833" href="#"></a></td>
+<td><pre>        InputStream in = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="834" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="835" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="836" href="#"></a></td>
+<td><pre>            while (true) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="837" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="838" href="#"></a></td>
+<td><pre>                    // type and length (at most 128 octets for long form)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="839" href="#"></a></td>
+<td><pre>                    inbuf = new byte[129];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="840" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="841" href="#"></a></td>
+<td><pre>                    offset = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="842" href="#"></a></td>
+<td><pre>                    seqlen = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="843" href="#"></a></td>
+<td><pre>                    seqlenlen = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="844" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="845" href="#"></a></td>
+<td><pre>                    in = getInputStream();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="846" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="847" href="#"></a></td>
+<td><pre>                    // check that it is the beginning of a sequence</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="848" href="#"></a></td>
+<td><pre>                    bytesread = in.read(inbuf, offset, 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="849" href="#"></a></td>
+<td><pre>                    if (bytesread &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="850" href="#"></a></td>
+<td><pre>                        if (in != getInputStream()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="851" href="#"></a></td>
+<td><pre>                            continue;   // a new stream to try</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="852" href="#"></a></td>
+<td><pre>                        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="853" href="#"></a></td>
+<td><pre>                            break; // EOF</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="854" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="855" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="856" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="857" href="#"></a></td>
+<td><pre>                    if (inbuf[offset++] != (Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="858" href="#"></a></td>
+<td><pre>                        continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="859" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="860" href="#"></a></td>
+<td><pre>                    // get length of sequence</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="861" href="#"></a></td>
+<td><pre>                    bytesread = in.read(inbuf, offset, 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="862" href="#"></a></td>
+<td><pre>                    if (bytesread &lt; 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="863" href="#"></a></td>
+<td><pre>                        break; // EOF</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="864" href="#"></a></td>
+<td><pre>                    seqlen = inbuf[offset++];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="865" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="866" href="#"></a></td>
+<td><pre>                    // if high bit is on, length is encoded in the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="867" href="#"></a></td>
+<td><pre>                    // subsequent length bytes and the number of length bytes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="868" href="#"></a></td>
+<td><pre>                    // is equal to &amp; 0x80 (i.e. length byte with high bit off).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="869" href="#"></a></td>
+<td><pre>                    if ((seqlen &amp; 0x80) == 0x80) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="870" href="#"></a></td>
+<td><pre>                        seqlenlen = seqlen &amp; 0x7f;  // number of length bytes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="871" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="872" href="#"></a></td>
+<td><pre>                        bytesread = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="873" href="#"></a></td>
+<td><pre>                        eos = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="874" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="875" href="#"></a></td>
+<td><pre>                        // Read all length bytes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="876" href="#"></a></td>
+<td><pre>                        while (bytesread &lt; seqlenlen) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="877" href="#"></a></td>
+<td><pre>                            br = in.read(inbuf, offset+bytesread,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="878" href="#"></a></td>
+<td><pre>                                seqlenlen-bytesread);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="879" href="#"></a></td>
+<td><pre>                            if (br &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="880" href="#"></a></td>
+<td><pre>                                eos = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="881" href="#"></a></td>
+<td><pre>                                break; // EOF</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="882" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="883" href="#"></a></td>
+<td><pre>                            bytesread += br;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="884" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="885" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="886" href="#"></a></td>
+<td><pre>                        // end-of-stream reached before length bytes are read</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="887" href="#"></a></td>
+<td><pre>                        if (eos)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="888" href="#"></a></td>
+<td><pre>                            break;  // EOF</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="889" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="890" href="#"></a></td>
+<td><pre>                        // Add contents of length bytes to determine length</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="891" href="#"></a></td>
+<td><pre>                        seqlen = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="892" href="#"></a></td>
+<td><pre>                        for( int i = 0; i &lt; seqlenlen; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="893" href="#"></a></td>
+<td><pre>                            seqlen = (seqlen &lt;&lt; 8) + (inbuf[offset+i] &amp; 0xff);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="894" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="895" href="#"></a></td>
+<td><pre>                        offset += bytesread;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="896" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="897" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="898" href="#"></a></td>
+<td><pre>                    // read in seqlen bytes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="899" href="#"></a></td>
+<td><pre>                    byte[] left = IOUtils.readFully(in, seqlen, false);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="900" href="#"></a></td>
+<td><pre>                    inbuf = Arrays.copyOf(inbuf, offset + left.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="901" href="#"></a></td>
+<td><pre>                    System.arraycopy(left, 0, inbuf, offset, left.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="902" href="#"></a></td>
+<td><pre>                    offset += left.length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="903" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="904" href="#"></a></td>
+<td><pre>if (dump &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="905" href="#"></a></td>
+<td><pre>System.err.println(&quot;seqlen: &quot; + seqlen);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="906" href="#"></a></td>
+<td><pre>System.err.println(&quot;bufsize: &quot; + offset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="907" href="#"></a></td>
+<td><pre>System.err.println(&quot;bytesleft: &quot; + bytesleft);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="908" href="#"></a></td>
+<td><pre>System.err.println(&quot;bytesread: &quot; + bytesread);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="909" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="910" href="#"></a></td>
+<td><pre>*/</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="911" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="912" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="913" href="#"></a></td>
+<td><pre>                    try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="914" href="#"></a></td>
+<td><pre>                        retBer = new BerDecoder(inbuf, 0, offset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="915" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="916" href="#"></a></td>
+<td><pre>                        if (traceFile != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="917" href="#"></a></td>
+<td><pre>                            Ber.dumpBER(traceFile, traceTagIn, inbuf, 0, offset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="918" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="919" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="920" href="#"></a></td>
+<td><pre>                        retBer.parseSeq(null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="921" href="#"></a></td>
+<td><pre>                        inMsgId = retBer.parseInt();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="922" href="#"></a></td>
+<td><pre>                        retBer.reset(); // reset offset</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="923" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="924" href="#"></a></td>
+<td><pre>                        boolean needPause = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="925" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="926" href="#"></a></td>
+<td><pre>                        if (inMsgId == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="927" href="#"></a></td>
+<td><pre>                            // Unsolicited Notification</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="928" href="#"></a></td>
+<td><pre>                            parent.processUnsolicited(retBer);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="929" href="#"></a></td>
+<td><pre>                        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="930" href="#"></a></td>
+<td><pre>                            LdapRequest ldr = findRequest(inMsgId);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="931" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="932" href="#"></a></td>
+<td><pre>                            if (ldr != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="933" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="934" href="#"></a></td>
+<td><pre>                                /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="935" href="#"></a></td>
+<td><pre>                                 * Grab pauseLock before making reply available</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="936" href="#"></a></td>
+<td><pre>                                 * to ensure that reader goes into paused state</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="937" href="#"></a></td>
+<td><pre>                                 * before writer can attempt to unpause reader</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="938" href="#"></a></td>
+<td><pre>                                 */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="939" href="#"></a></td>
+<td><pre>                                synchronized (pauseLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="940" href="#"></a></td>
+<td><pre>                                    needPause = ldr.addReplyBer(retBer);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="941" href="#"></a></td>
+<td><pre>                                    if (needPause) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="942" href="#"></a></td>
+<td><pre>                                        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="943" href="#"></a></td>
+<td><pre>                                         * Go into paused state; release</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="944" href="#"></a></td>
+<td><pre>                                         * pauseLock</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="945" href="#"></a></td>
+<td><pre>                                         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="946" href="#"></a></td>
+<td><pre>                                        pauseReader();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="947" href="#"></a></td>
+<td><pre>                                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="948" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="949" href="#"></a></td>
+<td><pre>                                    // else release pauseLock</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="950" href="#"></a></td>
+<td><pre>                                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="951" href="#"></a></td>
+<td><pre>                            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="952" href="#"></a></td>
+<td><pre>                                // System.err.println(&quot;Cannot find&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="953" href="#"></a></td>
+<td><pre>                                //              &quot;LdapRequest for &quot; + inMsgId);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="954" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="955" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="956" href="#"></a></td>
+<td><pre>                    } catch (Ber.DecodeException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="957" href="#"></a></td>
+<td><pre>                        //System.err.println(&quot;Cannot parse Ber&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="958" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="959" href="#"></a></td>
+<td><pre>                } catch (IOException ie) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="960" href="#"></a></td>
+<td><pre>                    if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="961" href="#"></a></td>
+<td><pre>                        System.err.println(&quot;Connection: Inside Caught &quot; + ie);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="962" href="#"></a></td>
+<td><pre>                        ie.printStackTrace();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="963" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="964" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="965" href="#"></a></td>
+<td><pre>                    if (in != getInputStream()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="966" href="#"></a></td>
+<td><pre>                        // A new stream to try</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="967" href="#"></a></td>
+<td><pre>                        // Go to top of loop and continue</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="968" href="#"></a></td>
+<td><pre>                    } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="969" href="#"></a></td>
+<td><pre>                        if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="970" href="#"></a></td>
+<td><pre>                            System.err.println(&quot;Connection: rethrowing &quot; + ie);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="971" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="972" href="#"></a></td>
+<td><pre>                        throw ie;  // rethrow exception</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="973" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="974" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="975" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="976" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="977" href="#"></a></td>
+<td><pre>            if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="978" href="#"></a></td>
+<td><pre>                System.err.println(&quot;Connection: end-of-stream detected: &quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="979" href="#"></a></td>
+<td><pre>                    + in);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="980" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="981" href="#"></a></td>
+<td><pre>        } catch (IOException ex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="982" href="#"></a></td>
+<td><pre>            if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="983" href="#"></a></td>
+<td><pre>                System.err.println(&quot;Connection: Caught &quot; + ex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="984" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="985" href="#"></a></td>
+<td><pre>            closureReason = ex;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="986" href="#"></a></td>
+<td><pre>        } finally {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="987" href="#"></a></td>
+<td><pre>            cleanup(null, true); // cleanup</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="988" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="989" href="#"></a></td>
+<td><pre>        if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="990" href="#"></a></td>
+<td><pre>            System.err.println(&quot;Connection: Thread Exiting&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="991" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="992" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="993" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="994" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="995" href="#"></a></td>
+<td><pre>    // This code must be uncommented to run the LdapAbandonTest.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="996" href="#"></a></td>
+<td><pre>    /*public void sendSearchReqs(String dn, int numReqs) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="997" href="#"></a></td>
+<td><pre>        int i;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="998" href="#"></a></td>
+<td><pre>        String attrs[] = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="999" href="#"></a></td>
+<td><pre>        for(i = 1; i &lt;= numReqs; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1000" href="#"></a></td>
+<td><pre>            BerEncoder ber = new BerEncoder(2048);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1001" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1002" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1003" href="#"></a></td>
+<td><pre>            ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1004" href="#"></a></td>
+<td><pre>                ber.encodeInt(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1005" href="#"></a></td>
+<td><pre>                ber.beginSeq(LdapClient.LDAP_REQ_SEARCH);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1006" href="#"></a></td>
+<td><pre>                    ber.encodeString(dn == null ? &quot;&quot; : dn);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1007" href="#"></a></td>
+<td><pre>                    ber.encodeInt(0, LdapClient.LBER_ENUMERATED);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1008" href="#"></a></td>
+<td><pre>                    ber.encodeInt(3, LdapClient.LBER_ENUMERATED);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1009" href="#"></a></td>
+<td><pre>                    ber.encodeInt(0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1010" href="#"></a></td>
+<td><pre>                    ber.encodeInt(0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1011" href="#"></a></td>
+<td><pre>                    ber.encodeBoolean(true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1012" href="#"></a></td>
+<td><pre>                    LdapClient.encodeFilter(ber, &quot;&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1013" href="#"></a></td>
+<td><pre>                    ber.beginSeq(Ber.ASN_SEQUENCE | Ber.ASN_CONSTRUCTOR);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1014" href="#"></a></td>
+<td><pre>                        ber.encodeStringArray(attrs);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1015" href="#"></a></td>
+<td><pre>                    ber.endSeq();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1016" href="#"></a></td>
+<td><pre>                ber.endSeq();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1017" href="#"></a></td>
+<td><pre>            ber.endSeq();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1018" href="#"></a></td>
+<td><pre>            writeRequest(ber, i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1019" href="#"></a></td>
+<td><pre>            //System.err.println(&quot;wrote request &quot; + i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1020" href="#"></a></td>
+<td><pre>            } catch (Exception ex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1021" href="#"></a></td>
+<td><pre>            //System.err.println(&quot;ldap.search: Caught &quot; + ex + &quot; building req&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1022" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1023" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1024" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1025" href="#"></a></td>
+<td><pre>    } */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1026" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

@@ -3,1120 +3,4459 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-
-package sun.security.ssl;
-
-import java.io.ByteArrayInputStream;
-import java.io.IOException;
-import java.util.Hashtable;
-import java.util.Arrays;
-
-import java.security.*;
-import javax.crypto.*;
-import javax.crypto.spec.IvParameterSpec;
-import javax.crypto.spec.GCMParameterSpec;
-
-import java.nio.*;
-
-import sun.security.ssl.CipherSuite.*;
-import static sun.security.ssl.CipherSuite.*;
-import static sun.security.ssl.CipherSuite.CipherType.*;
-
-import sun.misc.HexDumpEncoder;
-
-
-/**
- * This class handles bulk data enciphering/deciphering for each SSLv3
- * message.  This provides data confidentiality.  Stream ciphers (such
- * as RC4) don't need to do padding; block ciphers (e.g. DES) need it.
- *
- * Individual instances are obtained by calling the static method
- * newCipherBox(), which should only be invoked by BulkCipher.newCipher().
- *
- * In RFC 2246, with bock ciphers in CBC mode, the Initialization
- * Vector (IV) for the first record is generated with the other keys
- * and secrets when the security parameters are set.  The IV for
- * subsequent records is the last ciphertext block from the previous
- * record.
- *
- * In RFC 4346, the implicit Initialization Vector (IV) is replaced
- * with an explicit IV to protect against CBC attacks.  RFC 4346
- * recommends two algorithms used to generated the per-record IV.
- * The implementation uses the algorithm (2)(b), as described at
- * section 6.2.3.2 of RFC 4346.
- *
- * The usage of IV in CBC block cipher can be illustrated in
- * the following diagrams.
- *
- *   (random)
- *        R         P1                    IV        C1
- *        |          |                     |         |
- *  SIV---+    |-----+    |-...            |-----    |------
- *        |    |     |    |                |    |    |     |
- *     +----+  |  +----+  |             +----+  |  +----+  |
- *     | Ek |  |  + Ek +  |             | Dk |  |  | Dk |  |
- *     +----+  |  +----+  |             +----+  |  +----+  |
- *        |    |     |    |                |    |    |     |
- *        |----|     |----|           SIV--+    |----|     |-...
- *        |          |                     |       |
- *       IV         C1                     R      P1
- *                                     (discard)
- *
- *       CBC Encryption                    CBC Decryption
- *
- * NOTE that any ciphering involved in key exchange (e.g. with RSA) is
- * handled separately.
- *
- * @author David Brownell
- * @author Andreas Sterbenz
- */
-final class CipherBox {
-
-    // A CipherBox that implements the identity operation
-    final static CipherBox NULL = new CipherBox();
-
-    /* Class and subclass dynamic debugging support */
-    private static final Debug debug = Debug.getInstance(&quot;ssl&quot;);
-
-    // the protocol version this cipher conforms to
-    private final ProtocolVersion protocolVersion;
-
-    // cipher object
-    private final Cipher cipher;
-
-    /**
-     * secure random
-     */
-    private SecureRandom random;
-
-    /**
-     * fixed IV, the implicit nonce of AEAD cipher suite, only apply to
-     * AEAD cipher suites
-     */
-    private final byte[] fixedIv;
-
-    /**
-     * the key, reserved only for AEAD cipher initialization
-     */
-    private final Key key;
-
-    /**
-     * the operation mode, reserved for AEAD cipher initialization
-     */
-    private final int mode;
-
-    /**
-     * the authentication tag size, only apply to AEAD cipher suites
-     */
-    private final int tagSize;
-
-    /**
-     * the record IV length, only apply to AEAD cipher suites
-     */
-    private final int recordIvSize;
-
-    /**
-     * cipher type
-     */
-    private final CipherType cipherType;
-
-    /**
-     * Fixed masks of various block size, as the initial decryption IVs
-     * for TLS 1.1 or later.
-     *
-     * For performance, we do not use random IVs. As the initial decryption
-     * IVs will be discarded by TLS decryption processes, so the fixed masks
-     * do not hurt cryptographic strength.
-     */
-    private static Hashtable&lt;Integer, IvParameterSpec&gt; masks;
-
-    /**
-     * NULL cipherbox. Identity operation, no encryption.
-     */
-    private CipherBox() {
-        this.protocolVersion = ProtocolVersion.DEFAULT;
-        this.cipher = null;
-        this.cipherType = STREAM_CIPHER;
-        this.fixedIv = new byte[0];
-        this.key = null;
-        this.mode = Cipher.ENCRYPT_MODE;    // choose at random
-        this.random = null;
-        this.tagSize = 0;
-        this.recordIvSize = 0;
-    }
-
-    /**
-     * Construct a new CipherBox using the cipher transformation.
-     *
-     * @exception NoSuchAlgorithmException if no appropriate JCE Cipher
-     * implementation could be found.
-     */
-    private CipherBox(ProtocolVersion protocolVersion, BulkCipher bulkCipher,
-            SecretKey key, IvParameterSpec iv, SecureRandom random,
-            boolean encrypt) throws NoSuchAlgorithmException {
-        try {
-            this.protocolVersion = protocolVersion;
-            this.cipher = JsseJce.getCipher(bulkCipher.transformation);
-            this.mode = encrypt ? Cipher.ENCRYPT_MODE : Cipher.DECRYPT_MODE;
-
-            if (random == null) {
-                random = JsseJce.getSecureRandom();
-            }
-            this.random = random;
-            this.cipherType = bulkCipher.cipherType;
-
-            /*
-             * RFC 4346 recommends two algorithms used to generated the
-             * per-record IV. The implementation uses the algorithm (2)(b),
-             * as described at section 6.2.3.2 of RFC 4346.
-             *
-             * As we don't care about the initial IV value for TLS 1.1 or
-             * later, so if the &quot;iv&quot; parameter is null, we use the default
-             * value generated by Cipher.init() for encryption, and a fixed
-             * mask for decryption.
-             */
-            if (iv == null &amp;&amp; bulkCipher.ivSize != 0 &amp;&amp;
-                    mode == Cipher.DECRYPT_MODE &amp;&amp;
-                    protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {
-                iv = getFixedMask(bulkCipher.ivSize);
-            }
-
-            if (cipherType == AEAD_CIPHER) {
-                // AEAD must completely initialize the cipher for each packet,
-                // and so we save initialization parameters for packet
-                // processing time.
-
-                // Set the tag size for AEAD cipher
-                tagSize = bulkCipher.tagSize;
-
-                // Reserve the key for AEAD cipher initialization
-                this.key = key;
-
-                fixedIv = iv.getIV();
-                if (fixedIv == null ||
-                        fixedIv.length != bulkCipher.fixedIvSize) {
-                    throw new RuntimeException(&quot;Improper fixed IV for AEAD&quot;);
-                }
-
-                // Set the record IV length for AEAD cipher
-                recordIvSize = bulkCipher.ivSize - bulkCipher.fixedIvSize;
-
-                // DON'T initialize the cipher for AEAD!
-            } else {
-                // CBC only requires one initialization during its lifetime
-                // (future packets/IVs set the proper CBC state), so we can
-                // initialize now.
-
-                // Zeroize the variables that only apply to AEAD cipher
-                this.tagSize = 0;
-                this.fixedIv = new byte[0];
-                this.recordIvSize = 0;
-                this.key = null;
-
-                // Initialize the cipher
-                cipher.init(mode, key, iv, random);
-            }
-        } catch (NoSuchAlgorithmException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new NoSuchAlgorithmException
-                    (&quot;Could not create cipher &quot; + bulkCipher, e);
-        } catch (ExceptionInInitializerError e) {
-            throw new NoSuchAlgorithmException
-                    (&quot;Could not create cipher &quot; + bulkCipher, e);
-        }
-    }
-
-    /*
-     * Factory method to obtain a new CipherBox object.
-     */
-    static CipherBox newCipherBox(ProtocolVersion version, BulkCipher cipher,
-            SecretKey key, IvParameterSpec iv, SecureRandom random,
-            boolean encrypt) throws NoSuchAlgorithmException {
-        if (cipher.allowed == false) {
-            throw new NoSuchAlgorithmException(&quot;Unsupported cipher &quot; + cipher);
-        }
-
-        if (cipher == B_NULL) {
-            return NULL;
-        } else {
-            return new CipherBox(version, cipher, key, iv, random, encrypt);
-        }
-    }
-
-    /*
-     * Get a fixed mask, as the initial decryption IVs for TLS 1.1 or later.
-     */
-    private static IvParameterSpec getFixedMask(int ivSize) {
-        if (masks == null) {
-            masks = new Hashtable&lt;Integer, IvParameterSpec&gt;(5);
-        }
-
-        IvParameterSpec iv = masks.get(ivSize);
-        if (iv == null) {
-            iv = new IvParameterSpec(new byte[ivSize]);
-            masks.put(ivSize, iv);
-        }
-
-        return iv;
-    }
-
-    /*
-     * Encrypts a block of data, returning the size of the
-     * resulting block.
-     */
-    int encrypt(byte[] buf, int offset, int len) {
-        if (cipher == null) {
-            return len;
-        }
-
-        try {
-            int blockSize = cipher.getBlockSize();
-            if (cipherType == BLOCK_CIPHER) {
-                len = addPadding(buf, offset, len, blockSize);
-            }
-
-            if (debug != null &amp;&amp; Debug.isOn(&quot;plaintext&quot;)) {
-                try {
-                    HexDumpEncoder hd = new HexDumpEncoder();
-
-                    System.out.println(
-                        &quot;Padded plaintext before ENCRYPTION:  len = &quot;
-                        + len);
-                    hd.encodeBuffer(
-                        new ByteArrayInputStream(buf, offset, len),
-                        System.out);
-                } catch (IOException e) { }
-            }
-
-
-            if (cipherType == AEAD_CIPHER) {
-                try {
-                    return cipher.doFinal(buf, offset, len, buf, offset);
-                } catch (IllegalBlockSizeException | BadPaddingException ibe) {
-                    // unlikely to happen
-                    throw new RuntimeException(
-                        &quot;Cipher error in AEAD mode in JCE provider &quot; +
-                        cipher.getProvider().getName(), ibe);
-                }
-            } else {
-                int newLen = cipher.update(buf, offset, len, buf, offset);
-                if (newLen != len) {
-                    // catch BouncyCastle buffering error
-                    throw new RuntimeException(&quot;Cipher buffering error &quot; +
-                        &quot;in JCE provider &quot; + cipher.getProvider().getName());
-                }
-                return newLen;
-            }
-        } catch (ShortBufferException e) {
-            // unlikely to happen, we should have enough buffer space here
-            throw new ArrayIndexOutOfBoundsException(e.toString());
-        }
-    }
-
-    /*
-     * Encrypts a ByteBuffer block of data, returning the size of the
-     * resulting block.
-     *
-     * The byte buffers position and limit initially define the amount
-     * to encrypt.  On return, the position and limit are
-     * set to last position padded/encrypted.  The limit may have changed
-     * because of the added padding bytes.
-     */
-    int encrypt(ByteBuffer bb, int outLimit) {
-
-        int len = bb.remaining();
-
-        if (cipher == null) {
-            bb.position(bb.limit());
-            return len;
-        }
-
-        int pos = bb.position();
-
-        int blockSize = cipher.getBlockSize();
-        if (cipherType == BLOCK_CIPHER) {
-            // addPadding adjusts pos/limit
-            len = addPadding(bb, blockSize);
-            bb.position(pos);
-        }
-
-        if (debug != null &amp;&amp; Debug.isOn(&quot;plaintext&quot;)) {
-            try {
-                HexDumpEncoder hd = new HexDumpEncoder();
-
-                System.out.println(
-                    &quot;Padded plaintext before ENCRYPTION:  len = &quot;
-                    + len);
-                hd.encodeBuffer(bb.duplicate(), System.out);
-
-            } catch (IOException e) { }
-        }
-
-        /*
-         * Encrypt &quot;in-place&quot;.  This does not add its own padding.
-         */
-        ByteBuffer dup = bb.duplicate();
-        if (cipherType == AEAD_CIPHER) {
-            try {
-                int outputSize = cipher.getOutputSize(dup.remaining());
-                if (outputSize &gt; bb.remaining()) {
-                    // need to expand the limit of the output buffer for
-                    // the authentication tag.
-                    //
-                    // DON'T worry about the buffer's capacity, we have
-                    // reserved space for the authentication tag.
-                    if (outLimit &lt; pos + outputSize) {
-                        // unlikely to happen
-                        throw new ShortBufferException(
-                                    &quot;need more space in output buffer&quot;);
-                    }
-                    bb.limit(pos + outputSize);
-                }
-                int newLen = cipher.doFinal(dup, bb);
-                if (newLen != outputSize) {
-                    throw new RuntimeException(
-                            &quot;Cipher buffering error in JCE provider &quot; +
-                            cipher.getProvider().getName());
-                }
-                return newLen;
-            } catch (IllegalBlockSizeException |
-                           BadPaddingException | ShortBufferException ibse) {
-                // unlikely to happen
-                throw new RuntimeException(
-                        &quot;Cipher error in AEAD mode in JCE provider &quot; +
-                        cipher.getProvider().getName(), ibse);
-            }
-        } else {
-            int newLen;
-            try {
-                newLen = cipher.update(dup, bb);
-            } catch (ShortBufferException sbe) {
-                // unlikely to happen
-                throw new RuntimeException(&quot;Cipher buffering error &quot; +
-                    &quot;in JCE provider &quot; + cipher.getProvider().getName());
-            }
-
-            if (bb.position() != dup.position()) {
-                throw new RuntimeException(&quot;bytebuffer padding error&quot;);
-            }
-
-            if (newLen != len) {
-                // catch BouncyCastle buffering error
-                throw new RuntimeException(&quot;Cipher buffering error &quot; +
-                    &quot;in JCE provider &quot; + cipher.getProvider().getName());
-            }
-            return newLen;
-        }
-    }
-
-
-    /*
-     * Decrypts a block of data, returning the size of the
-     * resulting block if padding was required.
-     *
-     * For SSLv3 and TLSv1.0, with block ciphers in CBC mode the
-     * Initialization Vector (IV) for the first record is generated by
-     * the handshake protocol, the IV for subsequent records is the
-     * last ciphertext block from the previous record.
-     *
-     * From TLSv1.1, the implicit IV is replaced with an explicit IV to
-     * protect against CBC attacks.
-     *
-     * Differentiating between bad_record_mac and decryption_failed alerts
-     * may permit certain attacks against CBC mode. It is preferable to
-     * uniformly use the bad_record_mac alert to hide the specific type of
-     * the error.
-     */
-    int decrypt(byte[] buf, int offset, int len,
-            int tagLen) throws BadPaddingException {
-        if (cipher == null) {
-            return len;
-        }
-
-        try {
-            int newLen;
-            if (cipherType == AEAD_CIPHER) {
-                try {
-                    newLen = cipher.doFinal(buf, offset, len, buf, offset);
-                } catch (IllegalBlockSizeException ibse) {
-                    // unlikely to happen
-                    throw new RuntimeException(
-                        &quot;Cipher error in AEAD mode in JCE provider &quot; +
-                        cipher.getProvider().getName(), ibse);
-                }
-            } else {
-                newLen = cipher.update(buf, offset, len, buf, offset);
-                if (newLen != len) {
-                    // catch BouncyCastle buffering error
-                    throw new RuntimeException(&quot;Cipher buffering error &quot; +
-                        &quot;in JCE provider &quot; + cipher.getProvider().getName());
-                }
-            }
-            if (debug != null &amp;&amp; Debug.isOn(&quot;plaintext&quot;)) {
-                try {
-                    HexDumpEncoder hd = new HexDumpEncoder();
-
-                    System.out.println(
-                        &quot;Padded plaintext after DECRYPTION:  len = &quot;
-                        + newLen);
-                    hd.encodeBuffer(
-                        new ByteArrayInputStream(buf, offset, newLen),
-                        System.out);
-                } catch (IOException e) { }
-            }
-
-            if (cipherType == BLOCK_CIPHER) {
-                int blockSize = cipher.getBlockSize();
-                newLen = removePadding(
-                    buf, offset, newLen, tagLen, blockSize, protocolVersion);
-
-                if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {
-                    if (newLen &lt; blockSize) {
-                        throw new BadPaddingException(&quot;invalid explicit IV&quot;);
-                    }
-                }
-            }
-            return newLen;
-        } catch (ShortBufferException e) {
-            // unlikely to happen, we should have enough buffer space here
-            throw new ArrayIndexOutOfBoundsException(e.toString());
-        }
-    }
-
-
-    /*
-     * Decrypts a block of data, returning the size of the
-     * resulting block if padding was required.  position and limit
-     * point to the end of the decrypted/depadded data.  The initial
-     * limit and new limit may be different, given we may
-     * have stripped off some padding bytes.
-     *
-     *  @see decrypt(byte[], int, int)
-     */
-    int decrypt(ByteBuffer bb, int tagLen) throws BadPaddingException {
-
-        int len = bb.remaining();
-
-        if (cipher == null) {
-            bb.position(bb.limit());
-            return len;
-        }
-
-        try {
-            /*
-             * Decrypt &quot;in-place&quot;.
-             */
-            int pos = bb.position();
-            ByteBuffer dup = bb.duplicate();
-            int newLen;
-            if (cipherType == AEAD_CIPHER) {
-                try {
-                    newLen = cipher.doFinal(dup, bb);
-                } catch (IllegalBlockSizeException ibse) {
-                    // unlikely to happen
-                    throw new RuntimeException(
-                        &quot;Cipher error in AEAD mode \&quot;&quot; + ibse.getMessage() +
-                        &quot; \&quot;in JCE provider &quot; + cipher.getProvider().getName());
-                }
-            } else {
-                newLen = cipher.update(dup, bb);
-                if (newLen != len) {
-                    // catch BouncyCastle buffering error
-                    throw new RuntimeException(&quot;Cipher buffering error &quot; +
-                        &quot;in JCE provider &quot; + cipher.getProvider().getName());
-                }
-            }
-
-            // reset the limit to the end of the decryted data
-            bb.limit(pos + newLen);
-
-            if (debug != null &amp;&amp; Debug.isOn(&quot;plaintext&quot;)) {
-                try {
-                    HexDumpEncoder hd = new HexDumpEncoder();
-
-                    System.out.println(
-                        &quot;Padded plaintext after DECRYPTION:  len = &quot;
-                        + newLen);
-
-                    hd.encodeBuffer(
-                        (ByteBuffer)bb.duplicate().position(pos), System.out);
-                } catch (IOException e) { }
-            }
-
-            /*
-             * Remove the block padding.
-             */
-            if (cipherType == BLOCK_CIPHER) {
-                int blockSize = cipher.getBlockSize();
-                bb.position(pos);
-                newLen = removePadding(bb, tagLen, blockSize, protocolVersion);
-
-                // check the explicit IV of TLS v1.1 or later
-                if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {
-                    if (newLen &lt; blockSize) {
-                        throw new BadPaddingException(&quot;invalid explicit IV&quot;);
-                    }
-
-                    // reset the position to the end of the decrypted data
-                    bb.position(bb.limit());
-                }
-            }
-            return newLen;
-        } catch (ShortBufferException e) {
-            // unlikely to happen, we should have enough buffer space here
-            throw new ArrayIndexOutOfBoundsException(e.toString());
-        }
-    }
-
-    private static int addPadding(byte[] buf, int offset, int len,
-            int blockSize) {
-        int     newlen = len + 1;
-        byte    pad;
-        int     i;
-
-        if ((newlen % blockSize) != 0) {
-            newlen += blockSize - 1;
-            newlen -= newlen % blockSize;
-        }
-        pad = (byte) (newlen - len);
-
-        if (buf.length &lt; (newlen + offset)) {
-            throw new IllegalArgumentException(&quot;no space to pad buffer&quot;);
-        }
-
-        /*
-         * TLS version of the padding works for both SSLv3 and TLSv1
-         */
-        for (i = 0, offset += len; i &lt; pad; i++) {
-            buf [offset++] = (byte) (pad - 1);
-        }
-        return newlen;
-    }
-
-    /*
-     * Apply the padding to the buffer.
-     *
-     * Limit is advanced to the new buffer length.
-     * Position is equal to limit.
-     */
-    private static int addPadding(ByteBuffer bb, int blockSize) {
-
-        int     len = bb.remaining();
-        int     offset = bb.position();
-
-        int     newlen = len + 1;
-        byte    pad;
-        int     i;
-
-        if ((newlen % blockSize) != 0) {
-            newlen += blockSize - 1;
-            newlen -= newlen % blockSize;
-        }
-        pad = (byte) (newlen - len);
-
-        /*
-         * Update the limit to what will be padded.
-         */
-        bb.limit(newlen + offset);
-
-        /*
-         * TLS version of the padding works for both SSLv3 and TLSv1
-         */
-        for (i = 0, offset += len; i &lt; pad; i++) {
-            bb.put(offset++, (byte) (pad - 1));
-        }
-
-        bb.position(offset);
-        bb.limit(offset);
-
-        return newlen;
-    }
-
-    /*
-     * A constant-time check of the padding.
-     *
-     * NOTE that we are checking both the padding and the padLen bytes here.
-     *
-     * The caller MUST ensure that the len parameter is a positive number.
-     */
-    private static int[] checkPadding(
-            byte[] buf, int offset, int len, byte pad) {
-
-        if (len &lt;= 0) {
-            throw new RuntimeException(&quot;padding len must be positive&quot;);
-        }
-
-        // An array of hits is used to prevent Hotspot optimization for
-        // the purpose of a constant-time check.
-        int[] results = {0, 0};    // {missed #, matched #}
-        for (int i = 0; i &lt;= 256;) {
-            for (int j = 0; j &lt; len &amp;&amp; i &lt;= 256; j++, i++) {     // j &lt;= i
-                if (buf[offset + j] != pad) {
-                    results[0]++;       // mismatched padding data
-                } else {
-                    results[1]++;       // matched padding data
-                }
-            }
-        }
-
-        return results;
-    }
-
-    /*
-     * A constant-time check of the padding.
-     *
-     * NOTE that we are checking both the padding and the padLen bytes here.
-     *
-     * The caller MUST ensure that the bb parameter has remaining.
-     */
-    private static int[] checkPadding(ByteBuffer bb, byte pad) {
-
-        if (!bb.hasRemaining()) {
-            throw new RuntimeException(&quot;hasRemaining() must be positive&quot;);
-        }
-
-        // An array of hits is used to prevent Hotspot optimization for
-        // the purpose of a constant-time check.
-        int[] results = {0, 0};    // {missed #, matched #}
-        bb.mark();
-        for (int i = 0; i &lt;= 256; bb.reset()) {
-            for (; bb.hasRemaining() &amp;&amp; i &lt;= 256; i++) {
-                if (bb.get() != pad) {
-                    results[0]++;       // mismatched padding data
-                } else {
-                    results[1]++;       // matched padding data
-                }
-            }
-        }
-
-        return results;
-    }
-
-    /*
-     * Typical TLS padding format for a 64 bit block cipher is as follows:
-     *   xx xx xx xx xx xx xx 00
-     *   xx xx xx xx xx xx 01 01
-     *   ...
-     *   xx 06 06 06 06 06 06 06
-     *   07 07 07 07 07 07 07 07
-     * TLS also allows any amount of padding from 1 and 256 bytes as long
-     * as it makes the data a multiple of the block size
-     */
-    private static int removePadding(byte[] buf, int offset, int len,
-            int tagLen, int blockSize,
-            ProtocolVersion protocolVersion) throws BadPaddingException {
-
-        // last byte is length byte (i.e. actual padding length - 1)
-        int padOffset = offset + len - 1;
-        int padLen = buf[padOffset] &amp; 0xFF;
-
-        int newLen = len - (padLen + 1);
-        if ((newLen - tagLen) &lt; 0) {
-            // If the buffer is not long enough to contain the padding plus
-            // a MAC tag, do a dummy constant-time padding check.
-            //
-            // Note that it is a dummy check, so we won't care about what is
-            // the actual padding data.
-            checkPadding(buf, offset, len, (byte)(padLen &amp; 0xFF));
-
-            throw new BadPaddingException(&quot;Invalid Padding length: &quot; + padLen);
-        }
-
-        // The padding data should be filled with the padding length value.
-        int[] results = checkPadding(buf, offset + newLen,
-                        padLen + 1, (byte)(padLen &amp; 0xFF));
-        if (protocolVersion.v &gt;= ProtocolVersion.TLS10.v) {
-            if (results[0] != 0) {          // padding data has invalid bytes
-                throw new BadPaddingException(&quot;Invalid TLS padding data&quot;);
-            }
-        } else { // SSLv3
-            // SSLv3 requires 0 &lt;= length byte &lt; block size
-            // some implementations do 1 &lt;= length byte &lt;= block size,
-            // so accept that as well
-            // v3 does not require any particular value for the other bytes
-            if (padLen &gt; blockSize) {
-                throw new BadPaddingException(&quot;Invalid SSLv3 padding&quot;);
-            }
-        }
-        return newLen;
-    }
-
-    /*
-     * Position/limit is equal the removed padding.
-     */
-    private static int removePadding(ByteBuffer bb,
-            int tagLen, int blockSize,
-            ProtocolVersion protocolVersion) throws BadPaddingException {
-
-        int len = bb.remaining();
-        int offset = bb.position();
-
-        // last byte is length byte (i.e. actual padding length - 1)
-        int padOffset = offset + len - 1;
-        int padLen = bb.get(padOffset) &amp; 0xFF;
-
-        int newLen = len - (padLen + 1);
-        if ((newLen - tagLen) &lt; 0) {
-            // If the buffer is not long enough to contain the padding plus
-            // a MAC tag, do a dummy constant-time padding check.
-            //
-            // Note that it is a dummy check, so we won't care about what is
-            // the actual padding data.
-            checkPadding(bb.duplicate(), (byte)(padLen &amp; 0xFF));
-
-            throw new BadPaddingException(&quot;Invalid Padding length: &quot; + padLen);
-        }
-
-        // The padding data should be filled with the padding length value.
-        int[] results = checkPadding(
-                (ByteBuffer)bb.duplicate().position(offset + newLen),
-                (byte)(padLen &amp; 0xFF));
-        if (protocolVersion.v &gt;= ProtocolVersion.TLS10.v) {
-            if (results[0] != 0) {          // padding data has invalid bytes
-                throw new BadPaddingException(&quot;Invalid TLS padding data&quot;);
-            }
-        } else { // SSLv3
-            // SSLv3 requires 0 &lt;= length byte &lt; block size
-            // some implementations do 1 &lt;= length byte &lt;= block size,
-            // so accept that as well
-            // v3 does not require any particular value for the other bytes
-            if (padLen &gt; blockSize) {
-                throw new BadPaddingException(&quot;Invalid SSLv3 padding&quot;);
-            }
-        }
-
-        /*
-         * Reset buffer limit to remove padding.
-         */
-        bb.position(offset + newLen);
-        bb.limit(offset + newLen);
-
-        return newLen;
-    }
-
-    /*
-     * Dispose of any intermediate state in the underlying cipher.
-     * For PKCS11 ciphers, this will release any attached sessions, and
-     * thus make finalization faster.
-     */
-    void dispose() {
-        try {
-            if (cipher != null) {
-                // ignore return value.
-                cipher.doFinal();
-            }
-        } catch (Exception e) {
-            // swallow all types of exceptions.
-        }
-    }
-
-    /*
-     * Does the cipher use CBC mode?
-     *
-     * @return true if the cipher use CBC mode, false otherwise.
-     */
-    boolean isCBCMode() {
-        return cipherType == BLOCK_CIPHER;
-    }
-
-    /*
-     * Does the cipher use AEAD mode?
-     *
-     * @return true if the cipher use AEAD mode, false otherwise.
-     */
-    boolean isAEADMode() {
-        return cipherType == AEAD_CIPHER;
-    }
-
-    /*
-     * Is the cipher null?
-     *
-     * @return true if the cipher is null, false otherwise.
-     */
-    boolean isNullCipher() {
-        return cipher == null;
-    }
-
-    /*
-     * Gets the explicit nonce/IV size of the cipher.
-     *
-     * The returned value is the SecurityParameters.record_iv_length in
-     * RFC 4346/5246.  It is the size of explicit IV for CBC mode, and the
-     * size of explicit nonce for AEAD mode.
-     *
-     * @return the explicit nonce size of the cipher.
-     */
-    int getExplicitNonceSize() {
-        switch (cipherType) {
-            case BLOCK_CIPHER:
-                // For block ciphers, the explicit IV length is of length
-                // SecurityParameters.record_iv_length, which is equal to
-                // the SecurityParameters.block_size.
-                if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {
-                    return cipher.getBlockSize();
-                }
-                break;
-            case AEAD_CIPHER:
-                return recordIvSize;
-                        // It is also the length of sequence number, which is
-                        // used as the nonce_explicit for AEAD cipher suites.
-        }
-
-        return 0;
-    }
-
-    /*
-     * Applies the explicit nonce/IV to this cipher. This method is used to
-     * decrypt an SSL/TLS input record.
-     *
-     * The returned value is the SecurityParameters.record_iv_length in
-     * RFC 4346/5246.  It is the size of explicit IV for CBC mode, and the
-     * size of explicit nonce for AEAD mode.
-     *
-     * @param  authenticator the authenticator to get the additional
-     *         authentication data
-     * @param  contentType the content type of the input record
-     * @param  bb the byte buffer to get the explicit nonce from
-     *
-     * @return the explicit nonce size of the cipher.
-     */
-    int applyExplicitNonce(Authenticator authenticator, byte contentType,
-            ByteBuffer bb) throws BadPaddingException {
-        switch (cipherType) {
-            case BLOCK_CIPHER:
-                // sanity check length of the ciphertext
-                int tagLen = (authenticator instanceof MAC) ?
-                                    ((MAC)authenticator).MAClen() : 0;
-                if (tagLen != 0) {
-                    if (!sanityCheck(tagLen, bb.remaining())) {
-                        throw new BadPaddingException(
-                                &quot;ciphertext sanity check failed&quot;);
-                    }
-                }
-
-                // For block ciphers, the explicit IV length is of length
-                // SecurityParameters.record_iv_length, which is equal to
-                // the SecurityParameters.block_size.
-                if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {
-                    return cipher.getBlockSize();
-                }
-                break;
-            case AEAD_CIPHER:
-                if (bb.remaining() &lt; (recordIvSize + tagSize)) {
-                    throw new BadPaddingException(
-                                        &quot;invalid AEAD cipher fragment&quot;);
-                }
-
-                // initialize the AEAD cipher for the unique IV
-                byte[] iv = Arrays.copyOf(fixedIv,
-                                    fixedIv.length + recordIvSize);
-                bb.get(iv, fixedIv.length, recordIvSize);
-                bb.position(bb.position() - recordIvSize);
-                GCMParameterSpec spec = new GCMParameterSpec(tagSize * 8, iv);
-                try {
-                    cipher.init(mode, key, spec, random);
-                } catch (InvalidKeyException |
-                            InvalidAlgorithmParameterException ikae) {
-                    // unlikely to happen
-                    throw new RuntimeException(
-                                &quot;invalid key or spec in GCM mode&quot;, ikae);
-                }
-
-                // update the additional authentication data
-                byte[] aad = authenticator.acquireAuthenticationBytes(
-                        contentType, bb.remaining() - recordIvSize - tagSize);
-                cipher.updateAAD(aad);
-
-                return recordIvSize;
-                        // It is also the length of sequence number, which is
-                        // used as the nonce_explicit for AEAD cipher suites.
-        }
-
-       return 0;
-    }
-
-    /*
-     * Applies the explicit nonce/IV to this cipher. This method is used to
-     * decrypt an SSL/TLS input record.
-     *
-     * The returned value is the SecurityParameters.record_iv_length in
-     * RFC 4346/5246.  It is the size of explicit IV for CBC mode, and the
-     * size of explicit nonce for AEAD mode.
-     *
-     * @param  authenticator the authenticator to get the additional
-     *         authentication data
-     * @param  contentType the content type of the input record
-     * @param  buf the byte array to get the explicit nonce from
-     * @param  offset the offset of the byte buffer
-     * @param  cipheredLength the ciphered fragment length of the output
-     *         record, it is the TLSCiphertext.length in RFC 4346/5246.
-     *
-     * @return the explicit nonce size of the cipher.
-     */
-    int applyExplicitNonce(Authenticator authenticator,
-            byte contentType, byte[] buf, int offset,
-            int cipheredLength) throws BadPaddingException {
-
-        ByteBuffer bb = ByteBuffer.wrap(buf, offset, cipheredLength);
-
-        return applyExplicitNonce(authenticator, contentType, bb);
-    }
-
-    /*
-     * Creates the explicit nonce/IV to this cipher. This method is used to
-     * encrypt an SSL/TLS output record.
-     *
-     * The size of the returned array is the SecurityParameters.record_iv_length
-     * in RFC 4346/5246.  It is the size of explicit IV for CBC mode, and the
-     * size of explicit nonce for AEAD mode.
-     *
-     * @param  authenticator the authenticator to get the additional
-     *         authentication data
-     * @param  contentType the content type of the input record
-     * @param  fragmentLength the fragment length of the output record, it is
-     *         the TLSCompressed.length in RFC 4346/5246.
-     *
-     * @return the explicit nonce of the cipher.
-     */
-    byte[] createExplicitNonce(Authenticator authenticator,
-            byte contentType, int fragmentLength) {
-
-        byte[] nonce = new byte[0];
-        switch (cipherType) {
-            case BLOCK_CIPHER:
-                if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {
-                    // For block ciphers, the explicit IV length is of length
-                    // SecurityParameters.record_iv_length, which is equal to
-                    // the SecurityParameters.block_size.
-                    //
-                    // Generate a random number as the explicit IV parameter.
-                    nonce = new byte[cipher.getBlockSize()];
-                    random.nextBytes(nonce);
-                }
-                break;
-            case AEAD_CIPHER:
-                // To be unique and aware of overflow-wrap, sequence number
-                // is used as the nonce_explicit of AEAD cipher suites.
-                nonce = authenticator.sequenceNumber();
-
-                // initialize the AEAD cipher for the unique IV
-                byte[] iv = Arrays.copyOf(fixedIv,
-                                            fixedIv.length + nonce.length);
-                System.arraycopy(nonce, 0, iv, fixedIv.length, nonce.length);
-                GCMParameterSpec spec = new GCMParameterSpec(tagSize * 8, iv);
-                try {
-                    cipher.init(mode, key, spec, random);
-                } catch (InvalidKeyException |
-                            InvalidAlgorithmParameterException ikae) {
-                    // unlikely to happen
-                    throw new RuntimeException(
-                                &quot;invalid key or spec in GCM mode&quot;, ikae);
-                }
-
-                // update the additional authentication data
-                byte[] aad = authenticator.acquireAuthenticationBytes(
-                                                contentType, fragmentLength);
-                cipher.updateAAD(aad);
-                break;
-        }
-
-        return nonce;
-    }
-
-    /*
-     * Is this cipher available?
-     *
-     * This method can only be called by CipherSuite.BulkCipher.isAvailable()
-     * to test the availability of a cipher suites.  Please DON'T use it in
-     * other places, otherwise, the behavior may be unexpected because we may
-     * initialize AEAD cipher improperly in the method.
-     */
-    Boolean isAvailable() {
-        // We won't know whether a cipher for a particular key size is
-        // available until the cipher is successfully initialized.
-        //
-        // We do not initialize AEAD cipher in the constructor.  Need to
-        // initialize the cipher to ensure that the AEAD mode for a
-        // particular key size is supported.
-        if (cipherType == AEAD_CIPHER) {
-            try {
-                Authenticator authenticator =
-                    new Authenticator(protocolVersion);
-                byte[] nonce = authenticator.sequenceNumber();
-                byte[] iv = Arrays.copyOf(fixedIv,
-                                            fixedIv.length + nonce.length);
-                System.arraycopy(nonce, 0, iv, fixedIv.length, nonce.length);
-                GCMParameterSpec spec = new GCMParameterSpec(tagSize * 8, iv);
-
-                cipher.init(mode, key, spec, random);
-            } catch (Exception e) {
-                return Boolean.FALSE;
-            }
-        }   // Otherwise, we have initialized the cipher in the constructor.
-
-        return Boolean.TRUE;
-    }
-
-    /**
-     * Sanity check the length of a fragment before decryption.
-     *
-     * In CBC mode, check that the fragment length is one or multiple times
-     * of the block size of the cipher suite, and is at least one (one is the
-     * smallest size of padding in CBC mode) bigger than the tag size of the
-     * MAC algorithm except the explicit IV size for TLS 1.1 or later.
-     *
-     * In non-CBC mode, check that the fragment length is not less than the
-     * tag size of the MAC algorithm.
-     *
-     * @return true if the length of a fragment matches above requirements
-     */
-    private boolean sanityCheck(int tagLen, int fragmentLen) {
-        if (!isCBCMode()) {
-            return fragmentLen &gt;= tagLen;
-        }
-
-        int blockSize = cipher.getBlockSize();
-        if ((fragmentLen % blockSize) == 0) {
-            int minimal = tagLen + 1;
-            minimal = (minimal &gt;= blockSize) ? minimal : blockSize;
-            if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {
-                minimal += blockSize;   // plus the size of the explicit IV
-            }
-
-            return (fragmentLen &gt;= minimal);
-        }
-
-        return false;
-    }
-
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre>package sun.security.ssl;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.io.ByteArrayInputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.io.IOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.util.Hashtable;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.util.Arrays;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.security.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import javax.crypto.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import javax.crypto.spec.IvParameterSpec;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import javax.crypto.spec.GCMParameterSpec;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import java.nio.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre>import sun.security.ssl.CipherSuite.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>import static sun.security.ssl.CipherSuite.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>import static sun.security.ssl.CipherSuite.CipherType.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre>import sun.misc.HexDumpEncoder;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre> * This class handles bulk data enciphering/deciphering for each SSLv3</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre> * message.  This provides data confidentiality.  Stream ciphers (such</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre> * as RC4) don't need to do padding; block ciphers (e.g. DES) need it.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre> * Individual instances are obtained by calling the static method</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre> * newCipherBox(), which should only be invoked by BulkCipher.newCipher().</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre> * In RFC 2246, with bock ciphers in CBC mode, the Initialization</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre> * Vector (IV) for the first record is generated with the other keys</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre> * and secrets when the security parameters are set.  The IV for</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre> * subsequent records is the last ciphertext block from the previous</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre> * record.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre> * In RFC 4346, the implicit Initialization Vector (IV) is replaced</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre> * with an explicit IV to protect against CBC attacks.  RFC 4346</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre> * recommends two algorithms used to generated the per-record IV.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre> * The implementation uses the algorithm (2)(b), as described at</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre> * section 6.2.3.2 of RFC 4346.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre> * The usage of IV in CBC block cipher can be illustrated in</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre> * the following diagrams.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre> *   (random)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre> *        R         P1                    IV        C1</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre> *        |          |                     |         |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre> *  SIV---+    |-----+    |-...            |-----    |------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre> *        |    |     |    |                |    |    |     |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre> *     +----+  |  +----+  |             +----+  |  +----+  |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre> *     | Ek |  |  + Ek +  |             | Dk |  |  | Dk |  |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre> *     +----+  |  +----+  |             +----+  |  +----+  |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre> *        |    |     |    |                |    |    |     |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre> *        |----|     |----|           SIV--+    |----|     |-...</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre> *        |          |                     |       |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre> *       IV         C1                     R      P1</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre> *                                     (discard)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre> *       CBC Encryption                    CBC Decryption</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre> * NOTE that any ciphering involved in key exchange (e.g. with RSA) is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre> * handled separately.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre> * @author David Brownell</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre> * @author Andreas Sterbenz</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>final class CipherBox {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>    // A CipherBox that implements the identity operation</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>    final static CipherBox NULL = new CipherBox();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>    /* Class and subclass dynamic debugging support */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>    private static final Debug debug = Debug.getInstance(&quot;ssl&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>    // the protocol version this cipher conforms to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>    private final ProtocolVersion protocolVersion;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>    // cipher object</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>    private final Cipher cipher;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>     * secure random</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>    private SecureRandom random;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>     * fixed IV, the implicit nonce of AEAD cipher suite, only apply to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>     * AEAD cipher suites</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>    private final byte[] fixedIv;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>     * the key, reserved only for AEAD cipher initialization</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>    private final Key key;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>     * the operation mode, reserved for AEAD cipher initialization</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>    private final int mode;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>     * the authentication tag size, only apply to AEAD cipher suites</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>    private final int tagSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>     * the record IV length, only apply to AEAD cipher suites</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>    private final int recordIvSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>     * cipher type</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>    private final CipherType cipherType;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>     * Fixed masks of various block size, as the initial decryption IVs</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>     * for TLS 1.1 or later.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>     * For performance, we do not use random IVs. As the initial decryption</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>     * IVs will be discarded by TLS decryption processes, so the fixed masks</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>     * do not hurt cryptographic strength.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>    private static Hashtable&lt;Integer, IvParameterSpec&gt; masks;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>     * NULL cipherbox. Identity operation, no encryption.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>    private CipherBox() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>        this.protocolVersion = ProtocolVersion.DEFAULT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>        this.cipher = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>        this.cipherType = STREAM_CIPHER;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>        this.fixedIv = new byte[0];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>        this.key = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>        this.mode = Cipher.ENCRYPT_MODE;    // choose at random</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>        this.random = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>        this.tagSize = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>        this.recordIvSize = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>     * Construct a new CipherBox using the cipher transformation.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>     * @exception NoSuchAlgorithmException if no appropriate JCE Cipher</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>     * implementation could be found.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>    private CipherBox(ProtocolVersion protocolVersion, BulkCipher bulkCipher,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>            SecretKey key, IvParameterSpec iv, SecureRandom random,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>            boolean encrypt) throws NoSuchAlgorithmException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>            this.protocolVersion = protocolVersion;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>            this.cipher = JsseJce.getCipher(bulkCipher.transformation);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>            this.mode = encrypt ? Cipher.ENCRYPT_MODE : Cipher.DECRYPT_MODE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>            if (random == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>                random = JsseJce.getSecureRandom();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>            this.random = random;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>            this.cipherType = bulkCipher.cipherType;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>            /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>             * RFC 4346 recommends two algorithms used to generated the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>             * per-record IV. The implementation uses the algorithm (2)(b),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>             * as described at section 6.2.3.2 of RFC 4346.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>             *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>             * As we don't care about the initial IV value for TLS 1.1 or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>             * later, so if the &quot;iv&quot; parameter is null, we use the default</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>             * value generated by Cipher.init() for encryption, and a fixed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>             * mask for decryption.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>             */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>            if (iv == null &amp;&amp; bulkCipher.ivSize != 0 &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>                    mode == Cipher.DECRYPT_MODE &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>                    protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>                iv = getFixedMask(bulkCipher.ivSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>            if (cipherType == AEAD_CIPHER) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>                // AEAD must completely initialize the cipher for each packet,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>                // and so we save initialization parameters for packet</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>                // processing time.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>                // Set the tag size for AEAD cipher</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>                tagSize = bulkCipher.tagSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>                // Reserve the key for AEAD cipher initialization</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>                this.key = key;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>                fixedIv = iv.getIV();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>                if (fixedIv == null ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>                        fixedIv.length != bulkCipher.fixedIvSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>                    throw new RuntimeException(&quot;Improper fixed IV for AEAD&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>                // Set the record IV length for AEAD cipher</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>                recordIvSize = bulkCipher.ivSize - bulkCipher.fixedIvSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>                // DON'T initialize the cipher for AEAD!</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>                // CBC only requires one initialization during its lifetime</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>                // (future packets/IVs set the proper CBC state), so we can</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>                // initialize now.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>                // Zeroize the variables that only apply to AEAD cipher</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>                this.tagSize = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>                this.fixedIv = new byte[0];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>                this.recordIvSize = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>                this.key = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>                // Initialize the cipher</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>                cipher.init(mode, key, iv, random);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>        } catch (NoSuchAlgorithmException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>            throw e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>            throw new NoSuchAlgorithmException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>                    (&quot;Could not create cipher &quot; + bulkCipher, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>        } catch (ExceptionInInitializerError e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>            throw new NoSuchAlgorithmException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>                    (&quot;Could not create cipher &quot; + bulkCipher, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>     * Factory method to obtain a new CipherBox object.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>    static CipherBox newCipherBox(ProtocolVersion version, BulkCipher cipher,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>            SecretKey key, IvParameterSpec iv, SecureRandom random,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>            boolean encrypt) throws NoSuchAlgorithmException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>        if (cipher.allowed == false) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>            throw new NoSuchAlgorithmException(&quot;Unsupported cipher &quot; + cipher);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>        if (cipher == B_NULL) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>            return NULL;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>            return new CipherBox(version, cipher, key, iv, random, encrypt);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>     * Get a fixed mask, as the initial decryption IVs for TLS 1.1 or later.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>    private static IvParameterSpec getFixedMask(int ivSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>        if (masks == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>            masks = new Hashtable&lt;Integer, IvParameterSpec&gt;(5);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>        IvParameterSpec iv = masks.get(ivSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>        if (iv == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>            iv = new IvParameterSpec(new byte[ivSize]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>            masks.put(ivSize, iv);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>        return iv;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>     * Encrypts a block of data, returning the size of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>     * resulting block.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>    int encrypt(byte[] buf, int offset, int len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>        if (cipher == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>            return len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>            int blockSize = cipher.getBlockSize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>            if (cipherType == BLOCK_CIPHER) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>                len = addPadding(buf, offset, len, blockSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>            if (debug != null &amp;&amp; Debug.isOn(&quot;plaintext&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>                    HexDumpEncoder hd = new HexDumpEncoder();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>                    System.out.println(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>                        &quot;Padded plaintext before ENCRYPTION:  len = &quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>                        + len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>                    hd.encodeBuffer(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>                        new ByteArrayInputStream(buf, offset, len),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>                        System.out);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>                } catch (IOException e) { }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>            if (cipherType == AEAD_CIPHER) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>                    return cipher.doFinal(buf, offset, len, buf, offset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>                } catch (IllegalBlockSizeException | BadPaddingException ibe) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>                    // unlikely to happen</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>                    throw new RuntimeException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>                        &quot;Cipher error in AEAD mode in JCE provider &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>                        cipher.getProvider().getName(), ibe);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>                int newLen = cipher.update(buf, offset, len, buf, offset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>                if (newLen != len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>                    // catch BouncyCastle buffering error</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>                    throw new RuntimeException(&quot;Cipher buffering error &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>                        &quot;in JCE provider &quot; + cipher.getProvider().getName());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>                return newLen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>        } catch (ShortBufferException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>            // unlikely to happen, we should have enough buffer space here</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>            throw new ArrayIndexOutOfBoundsException(e.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>     * Encrypts a ByteBuffer block of data, returning the size of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>     * resulting block.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>     * The byte buffers position and limit initially define the amount</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>     * to encrypt.  On return, the position and limit are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>     * set to last position padded/encrypted.  The limit may have changed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>     * because of the added padding bytes.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>    int encrypt(ByteBuffer bb, int outLimit) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>        int len = bb.remaining();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>        if (cipher == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>            bb.position(bb.limit());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>            return len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>        int pos = bb.position();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>        int blockSize = cipher.getBlockSize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>        if (cipherType == BLOCK_CIPHER) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>            // addPadding adjusts pos/limit</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>            len = addPadding(bb, blockSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>            bb.position(pos);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>        if (debug != null &amp;&amp; Debug.isOn(&quot;plaintext&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>                HexDumpEncoder hd = new HexDumpEncoder();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>                System.out.println(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>                    &quot;Padded plaintext before ENCRYPTION:  len = &quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>                    + len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>                hd.encodeBuffer(bb.duplicate(), System.out);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>            } catch (IOException e) { }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>         * Encrypt &quot;in-place&quot;.  This does not add its own padding.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>        ByteBuffer dup = bb.duplicate();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>        if (cipherType == AEAD_CIPHER) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>                int outputSize = cipher.getOutputSize(dup.remaining());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>                if (outputSize &gt; bb.remaining()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>                    // need to expand the limit of the output buffer for</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>                    // the authentication tag.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>                    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>                    // DON'T worry about the buffer's capacity, we have</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>                    // reserved space for the authentication tag.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>                    if (outLimit &lt; pos + outputSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>                        // unlikely to happen</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>                        throw new ShortBufferException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>                                    &quot;need more space in output buffer&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>                    bb.limit(pos + outputSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>                int newLen = cipher.doFinal(dup, bb);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>                if (newLen != outputSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>                    throw new RuntimeException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>                            &quot;Cipher buffering error in JCE provider &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>                            cipher.getProvider().getName());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>                return newLen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>            } catch (IllegalBlockSizeException |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>                           BadPaddingException | ShortBufferException ibse) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>                // unlikely to happen</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>                throw new RuntimeException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>                        &quot;Cipher error in AEAD mode in JCE provider &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>                        cipher.getProvider().getName(), ibse);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>            int newLen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>                newLen = cipher.update(dup, bb);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>            } catch (ShortBufferException sbe) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>                // unlikely to happen</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>                throw new RuntimeException(&quot;Cipher buffering error &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>                    &quot;in JCE provider &quot; + cipher.getProvider().getName());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>            if (bb.position() != dup.position()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>                throw new RuntimeException(&quot;bytebuffer padding error&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>            if (newLen != len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>                // catch BouncyCastle buffering error</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>                throw new RuntimeException(&quot;Cipher buffering error &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>                    &quot;in JCE provider &quot; + cipher.getProvider().getName());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>            return newLen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>     * Decrypts a block of data, returning the size of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>     * resulting block if padding was required.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>     * For SSLv3 and TLSv1.0, with block ciphers in CBC mode the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>     * Initialization Vector (IV) for the first record is generated by</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>     * the handshake protocol, the IV for subsequent records is the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>     * last ciphertext block from the previous record.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>     * From TLSv1.1, the implicit IV is replaced with an explicit IV to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>     * protect against CBC attacks.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>     * Differentiating between bad_record_mac and decryption_failed alerts</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>     * may permit certain attacks against CBC mode. It is preferable to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>     * uniformly use the bad_record_mac alert to hide the specific type of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>     * the error.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>    int decrypt(byte[] buf, int offset, int len,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>            int tagLen) throws BadPaddingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>        if (cipher == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>            return len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>            int newLen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>            if (cipherType == AEAD_CIPHER) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>                    newLen = cipher.doFinal(buf, offset, len, buf, offset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>                } catch (IllegalBlockSizeException ibse) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>                    // unlikely to happen</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>                    throw new RuntimeException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>                        &quot;Cipher error in AEAD mode in JCE provider &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>                        cipher.getProvider().getName(), ibse);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>                newLen = cipher.update(buf, offset, len, buf, offset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>                if (newLen != len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>                    // catch BouncyCastle buffering error</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>                    throw new RuntimeException(&quot;Cipher buffering error &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>                        &quot;in JCE provider &quot; + cipher.getProvider().getName());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>            if (debug != null &amp;&amp; Debug.isOn(&quot;plaintext&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>                    HexDumpEncoder hd = new HexDumpEncoder();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>                    System.out.println(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>                        &quot;Padded plaintext after DECRYPTION:  len = &quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>                        + newLen);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>                    hd.encodeBuffer(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>                        new ByteArrayInputStream(buf, offset, newLen),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>                        System.out);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>                } catch (IOException e) { }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>            if (cipherType == BLOCK_CIPHER) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>                int blockSize = cipher.getBlockSize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>                newLen = removePadding(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>                    buf, offset, newLen, tagLen, blockSize, protocolVersion);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>                if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>                    if (newLen &lt; blockSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>                        throw new BadPaddingException(&quot;invalid explicit IV&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>            return newLen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>        } catch (ShortBufferException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>            // unlikely to happen, we should have enough buffer space here</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>            throw new ArrayIndexOutOfBoundsException(e.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>     * Decrypts a block of data, returning the size of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>     * resulting block if padding was required.  position and limit</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>     * point to the end of the decrypted/depadded data.  The initial</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>     * limit and new limit may be different, given we may</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>     * have stripped off some padding bytes.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>     *  @see decrypt(byte[], int, int)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>    int decrypt(ByteBuffer bb, int tagLen) throws BadPaddingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>        int len = bb.remaining();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>        if (cipher == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>            bb.position(bb.limit());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>            return len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>            /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>             * Decrypt &quot;in-place&quot;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>             */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>            int pos = bb.position();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>            ByteBuffer dup = bb.duplicate();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>            int newLen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>            if (cipherType == AEAD_CIPHER) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>                    newLen = cipher.doFinal(dup, bb);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>                } catch (IllegalBlockSizeException ibse) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>                    // unlikely to happen</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>                    throw new RuntimeException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>                        &quot;Cipher error in AEAD mode \&quot;&quot; + ibse.getMessage() +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>                        &quot; \&quot;in JCE provider &quot; + cipher.getProvider().getName());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>                newLen = cipher.update(dup, bb);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>                if (newLen != len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre>                    // catch BouncyCastle buffering error</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>                    throw new RuntimeException(&quot;Cipher buffering error &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>                        &quot;in JCE provider &quot; + cipher.getProvider().getName());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>            // reset the limit to the end of the decryted data</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>            bb.limit(pos + newLen);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>            if (debug != null &amp;&amp; Debug.isOn(&quot;plaintext&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>                    HexDumpEncoder hd = new HexDumpEncoder();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>                    System.out.println(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>                        &quot;Padded plaintext after DECRYPTION:  len = &quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>                        + newLen);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>                    hd.encodeBuffer(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>                        (ByteBuffer)bb.duplicate().position(pos), System.out);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre>                } catch (IOException e) { }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>            /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>             * Remove the block padding.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>             */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>            if (cipherType == BLOCK_CIPHER) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre>                int blockSize = cipher.getBlockSize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>                bb.position(pos);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre>                newLen = removePadding(bb, tagLen, blockSize, protocolVersion);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>                // check the explicit IV of TLS v1.1 or later</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>                if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>                    if (newLen &lt; blockSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>                        throw new BadPaddingException(&quot;invalid explicit IV&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>                    // reset the position to the end of the decrypted data</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>                    bb.position(bb.limit());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>            return newLen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>        } catch (ShortBufferException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>            // unlikely to happen, we should have enough buffer space here</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>            throw new ArrayIndexOutOfBoundsException(e.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>    private static int addPadding(byte[] buf, int offset, int len,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>            int blockSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>        int     newlen = len + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>        byte    pad;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>        int     i;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>        if ((newlen % blockSize) != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>            newlen += blockSize - 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>            newlen -= newlen % blockSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>        pad = (byte) (newlen - len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>        if (buf.length &lt; (newlen + offset)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>            throw new IllegalArgumentException(&quot;no space to pad buffer&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>         * TLS version of the padding works for both SSLv3 and TLSv1</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>        for (i = 0, offset += len; i &lt; pad; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>            buf [offset++] = (byte) (pad - 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>        return newlen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>     * Apply the padding to the buffer.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>     * Limit is advanced to the new buffer length.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>     * Position is equal to limit.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>    private static int addPadding(ByteBuffer bb, int blockSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre>        int     len = bb.remaining();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>        int     offset = bb.position();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>        int     newlen = len + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre>        byte    pad;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>        int     i;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre>        if ((newlen % blockSize) != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>            newlen += blockSize - 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre>            newlen -= newlen % blockSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>        pad = (byte) (newlen - len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>         * Update the limit to what will be padded.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>        bb.limit(newlen + offset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>         * TLS version of the padding works for both SSLv3 and TLSv1</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre>        for (i = 0, offset += len; i &lt; pad; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>            bb.put(offset++, (byte) (pad - 1));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>        bb.position(offset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>        bb.limit(offset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>        return newlen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre>     * A constant-time check of the padding.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre>     * NOTE that we are checking both the padding and the padLen bytes here.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>     * The caller MUST ensure that the len parameter is a positive number.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre>    private static int[] checkPadding(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>            byte[] buf, int offset, int len, byte pad) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>        if (len &lt;= 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre>            throw new RuntimeException(&quot;padding len must be positive&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>        // An array of hits is used to prevent Hotspot optimization for</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>        // the purpose of a constant-time check.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre>        int[] results = {0, 0};    // {missed #, matched #}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt;= 256;) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>            for (int j = 0; j &lt; len &amp;&amp; i &lt;= 256; j++, i++) {     // j &lt;= i</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>                if (buf[offset + j] != pad) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>                    results[0]++;       // mismatched padding data</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre>                    results[1]++;       // matched padding data</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre>        return results;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre>     * A constant-time check of the padding.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>     * NOTE that we are checking both the padding and the padLen bytes here.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre>     * The caller MUST ensure that the bb parameter has remaining.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>    private static int[] checkPadding(ByteBuffer bb, byte pad) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>        if (!bb.hasRemaining()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre>            throw new RuntimeException(&quot;hasRemaining() must be positive&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre>        // An array of hits is used to prevent Hotspot optimization for</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>        // the purpose of a constant-time check.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre>        int[] results = {0, 0};    // {missed #, matched #}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre>        bb.mark();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt;= 256; bb.reset()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre>            for (; bb.hasRemaining() &amp;&amp; i &lt;= 256; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre>                if (bb.get() != pad) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>                    results[0]++;       // mismatched padding data</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre>                    results[1]++;       // matched padding data</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>        return results;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre>     * Typical TLS padding format for a 64 bit block cipher is as follows:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre>     *   xx xx xx xx xx xx xx 00</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="719" href="#"></a></td>
+<td><pre>     *   xx xx xx xx xx xx 01 01</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="720" href="#"></a></td>
+<td><pre>     *   ...</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="721" href="#"></a></td>
+<td><pre>     *   xx 06 06 06 06 06 06 06</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="722" href="#"></a></td>
+<td><pre>     *   07 07 07 07 07 07 07 07</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="723" href="#"></a></td>
+<td><pre>     * TLS also allows any amount of padding from 1 and 256 bytes as long</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="724" href="#"></a></td>
+<td><pre>     * as it makes the data a multiple of the block size</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="725" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="726" href="#"></a></td>
+<td><pre>    private static int removePadding(byte[] buf, int offset, int len,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="727" href="#"></a></td>
+<td><pre>            int tagLen, int blockSize,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="728" href="#"></a></td>
+<td><pre>            ProtocolVersion protocolVersion) throws BadPaddingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="729" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="730" href="#"></a></td>
+<td><pre>        // last byte is length byte (i.e. actual padding length - 1)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="731" href="#"></a></td>
+<td><pre>        int padOffset = offset + len - 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="732" href="#"></a></td>
+<td><pre>        int padLen = buf[padOffset] &amp; 0xFF;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="733" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="734" href="#"></a></td>
+<td><pre>        int newLen = len - (padLen + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="735" href="#"></a></td>
+<td><pre>        if ((newLen - tagLen) &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="736" href="#"></a></td>
+<td><pre>            // If the buffer is not long enough to contain the padding plus</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="737" href="#"></a></td>
+<td><pre>            // a MAC tag, do a dummy constant-time padding check.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="738" href="#"></a></td>
+<td><pre>            //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="739" href="#"></a></td>
+<td><pre>            // Note that it is a dummy check, so we won't care about what is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="740" href="#"></a></td>
+<td><pre>            // the actual padding data.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="741" href="#"></a></td>
+<td><pre>            checkPadding(buf, offset, len, (byte)(padLen &amp; 0xFF));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="742" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="743" href="#"></a></td>
+<td><pre>            throw new BadPaddingException(&quot;Invalid Padding length: &quot; + padLen);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="744" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="745" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="746" href="#"></a></td>
+<td><pre>        // The padding data should be filled with the padding length value.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="747" href="#"></a></td>
+<td><pre>        int[] results = checkPadding(buf, offset + newLen,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="748" href="#"></a></td>
+<td><pre>                        padLen + 1, (byte)(padLen &amp; 0xFF));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="749" href="#"></a></td>
+<td><pre>        if (protocolVersion.v &gt;= ProtocolVersion.TLS10.v) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="750" href="#"></a></td>
+<td><pre>            if (results[0] != 0) {          // padding data has invalid bytes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="751" href="#"></a></td>
+<td><pre>                throw new BadPaddingException(&quot;Invalid TLS padding data&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="752" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="753" href="#"></a></td>
+<td><pre>        } else { // SSLv3</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="754" href="#"></a></td>
+<td><pre>            // SSLv3 requires 0 &lt;= length byte &lt; block size</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="755" href="#"></a></td>
+<td><pre>            // some implementations do 1 &lt;= length byte &lt;= block size,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="756" href="#"></a></td>
+<td><pre>            // so accept that as well</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="757" href="#"></a></td>
+<td><pre>            // v3 does not require any particular value for the other bytes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="758" href="#"></a></td>
+<td><pre>            if (padLen &gt; blockSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="759" href="#"></a></td>
+<td><pre>                throw new BadPaddingException(&quot;Invalid SSLv3 padding&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="760" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="761" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="762" href="#"></a></td>
+<td><pre>        return newLen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="763" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="764" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="765" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="766" href="#"></a></td>
+<td><pre>     * Position/limit is equal the removed padding.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="767" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="768" href="#"></a></td>
+<td><pre>    private static int removePadding(ByteBuffer bb,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="769" href="#"></a></td>
+<td><pre>            int tagLen, int blockSize,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="770" href="#"></a></td>
+<td><pre>            ProtocolVersion protocolVersion) throws BadPaddingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="771" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="772" href="#"></a></td>
+<td><pre>        int len = bb.remaining();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="773" href="#"></a></td>
+<td><pre>        int offset = bb.position();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="774" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="775" href="#"></a></td>
+<td><pre>        // last byte is length byte (i.e. actual padding length - 1)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="776" href="#"></a></td>
+<td><pre>        int padOffset = offset + len - 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="777" href="#"></a></td>
+<td><pre>        int padLen = bb.get(padOffset) &amp; 0xFF;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="778" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="779" href="#"></a></td>
+<td><pre>        int newLen = len - (padLen + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="780" href="#"></a></td>
+<td><pre>        if ((newLen - tagLen) &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="781" href="#"></a></td>
+<td><pre>            // If the buffer is not long enough to contain the padding plus</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="782" href="#"></a></td>
+<td><pre>            // a MAC tag, do a dummy constant-time padding check.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="783" href="#"></a></td>
+<td><pre>            //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="784" href="#"></a></td>
+<td><pre>            // Note that it is a dummy check, so we won't care about what is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="785" href="#"></a></td>
+<td><pre>            // the actual padding data.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="786" href="#"></a></td>
+<td><pre>            checkPadding(bb.duplicate(), (byte)(padLen &amp; 0xFF));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="787" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="788" href="#"></a></td>
+<td><pre>            throw new BadPaddingException(&quot;Invalid Padding length: &quot; + padLen);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="789" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="790" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="791" href="#"></a></td>
+<td><pre>        // The padding data should be filled with the padding length value.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="792" href="#"></a></td>
+<td><pre>        int[] results = checkPadding(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="793" href="#"></a></td>
+<td><pre>                (ByteBuffer)bb.duplicate().position(offset + newLen),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="794" href="#"></a></td>
+<td><pre>                (byte)(padLen &amp; 0xFF));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="795" href="#"></a></td>
+<td><pre>        if (protocolVersion.v &gt;= ProtocolVersion.TLS10.v) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="796" href="#"></a></td>
+<td><pre>            if (results[0] != 0) {          // padding data has invalid bytes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="797" href="#"></a></td>
+<td><pre>                throw new BadPaddingException(&quot;Invalid TLS padding data&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="798" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="799" href="#"></a></td>
+<td><pre>        } else { // SSLv3</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="800" href="#"></a></td>
+<td><pre>            // SSLv3 requires 0 &lt;= length byte &lt; block size</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="801" href="#"></a></td>
+<td><pre>            // some implementations do 1 &lt;= length byte &lt;= block size,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="802" href="#"></a></td>
+<td><pre>            // so accept that as well</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="803" href="#"></a></td>
+<td><pre>            // v3 does not require any particular value for the other bytes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="804" href="#"></a></td>
+<td><pre>            if (padLen &gt; blockSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="805" href="#"></a></td>
+<td><pre>                throw new BadPaddingException(&quot;Invalid SSLv3 padding&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="806" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="807" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="808" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="809" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="810" href="#"></a></td>
+<td><pre>         * Reset buffer limit to remove padding.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="811" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="812" href="#"></a></td>
+<td><pre>        bb.position(offset + newLen);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="813" href="#"></a></td>
+<td><pre>        bb.limit(offset + newLen);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="814" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="815" href="#"></a></td>
+<td><pre>        return newLen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="816" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="817" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="818" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="819" href="#"></a></td>
+<td><pre>     * Dispose of any intermediate state in the underlying cipher.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="820" href="#"></a></td>
+<td><pre>     * For PKCS11 ciphers, this will release any attached sessions, and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="821" href="#"></a></td>
+<td><pre>     * thus make finalization faster.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="822" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="823" href="#"></a></td>
+<td><pre>    void dispose() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="824" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="825" href="#"></a></td>
+<td><pre>            if (cipher != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="826" href="#"></a></td>
+<td><pre>                // ignore return value.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="827" href="#"></a></td>
+<td><pre>                cipher.doFinal();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="828" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="829" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="830" href="#"></a></td>
+<td><pre>            // swallow all types of exceptions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="831" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="832" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="833" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="834" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="835" href="#"></a></td>
+<td><pre>     * Does the cipher use CBC mode?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="836" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="837" href="#"></a></td>
+<td><pre>     * @return true if the cipher use CBC mode, false otherwise.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="838" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="839" href="#"></a></td>
+<td><pre>    boolean isCBCMode() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="840" href="#"></a></td>
+<td><pre>        return cipherType == BLOCK_CIPHER;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="841" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="842" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="843" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="844" href="#"></a></td>
+<td><pre>     * Does the cipher use AEAD mode?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="845" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="846" href="#"></a></td>
+<td><pre>     * @return true if the cipher use AEAD mode, false otherwise.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="847" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="848" href="#"></a></td>
+<td><pre>    boolean isAEADMode() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="849" href="#"></a></td>
+<td><pre>        return cipherType == AEAD_CIPHER;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="850" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="851" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="852" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="853" href="#"></a></td>
+<td><pre>     * Is the cipher null?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="854" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="855" href="#"></a></td>
+<td><pre>     * @return true if the cipher is null, false otherwise.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="856" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="857" href="#"></a></td>
+<td><pre>    boolean isNullCipher() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="858" href="#"></a></td>
+<td><pre>        return cipher == null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="859" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="860" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="861" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="862" href="#"></a></td>
+<td><pre>     * Gets the explicit nonce/IV size of the cipher.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="863" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="864" href="#"></a></td>
+<td><pre>     * The returned value is the SecurityParameters.record_iv_length in</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="865" href="#"></a></td>
+<td><pre>     * RFC 4346/5246.  It is the size of explicit IV for CBC mode, and the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="866" href="#"></a></td>
+<td><pre>     * size of explicit nonce for AEAD mode.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="867" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="868" href="#"></a></td>
+<td><pre>     * @return the explicit nonce size of the cipher.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="869" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="870" href="#"></a></td>
+<td><pre>    int getExplicitNonceSize() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="871" href="#"></a></td>
+<td><pre>        switch (cipherType) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="872" href="#"></a></td>
+<td><pre>            case BLOCK_CIPHER:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="873" href="#"></a></td>
+<td><pre>                // For block ciphers, the explicit IV length is of length</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="874" href="#"></a></td>
+<td><pre>                // SecurityParameters.record_iv_length, which is equal to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="875" href="#"></a></td>
+<td><pre>                // the SecurityParameters.block_size.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="876" href="#"></a></td>
+<td><pre>                if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="877" href="#"></a></td>
+<td><pre>                    return cipher.getBlockSize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="878" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="879" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="880" href="#"></a></td>
+<td><pre>            case AEAD_CIPHER:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="881" href="#"></a></td>
+<td><pre>                return recordIvSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="882" href="#"></a></td>
+<td><pre>                        // It is also the length of sequence number, which is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="883" href="#"></a></td>
+<td><pre>                        // used as the nonce_explicit for AEAD cipher suites.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="884" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="885" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="886" href="#"></a></td>
+<td><pre>        return 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="887" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="888" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="889" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="890" href="#"></a></td>
+<td><pre>     * Applies the explicit nonce/IV to this cipher. This method is used to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="891" href="#"></a></td>
+<td><pre>     * decrypt an SSL/TLS input record.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="892" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="893" href="#"></a></td>
+<td><pre>     * The returned value is the SecurityParameters.record_iv_length in</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="894" href="#"></a></td>
+<td><pre>     * RFC 4346/5246.  It is the size of explicit IV for CBC mode, and the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="895" href="#"></a></td>
+<td><pre>     * size of explicit nonce for AEAD mode.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="896" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="897" href="#"></a></td>
+<td><pre>     * @param  authenticator the authenticator to get the additional</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="898" href="#"></a></td>
+<td><pre>     *         authentication data</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="899" href="#"></a></td>
+<td><pre>     * @param  contentType the content type of the input record</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="900" href="#"></a></td>
+<td><pre>     * @param  bb the byte buffer to get the explicit nonce from</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="901" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="902" href="#"></a></td>
+<td><pre>     * @return the explicit nonce size of the cipher.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="903" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="904" href="#"></a></td>
+<td><pre>    int applyExplicitNonce(Authenticator authenticator, byte contentType,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="905" href="#"></a></td>
+<td><pre>            ByteBuffer bb) throws BadPaddingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="906" href="#"></a></td>
+<td><pre>        switch (cipherType) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="907" href="#"></a></td>
+<td><pre>            case BLOCK_CIPHER:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="908" href="#"></a></td>
+<td><pre>                // sanity check length of the ciphertext</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="909" href="#"></a></td>
+<td><pre>                int tagLen = (authenticator instanceof MAC) ?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="910" href="#"></a></td>
+<td><pre>                                    ((MAC)authenticator).MAClen() : 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="911" href="#"></a></td>
+<td><pre>                if (tagLen != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="912" href="#"></a></td>
+<td><pre>                    if (!sanityCheck(tagLen, bb.remaining())) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="913" href="#"></a></td>
+<td><pre>                        throw new BadPaddingException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="914" href="#"></a></td>
+<td><pre>                                &quot;ciphertext sanity check failed&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="915" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="916" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="917" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="918" href="#"></a></td>
+<td><pre>                // For block ciphers, the explicit IV length is of length</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="919" href="#"></a></td>
+<td><pre>                // SecurityParameters.record_iv_length, which is equal to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="920" href="#"></a></td>
+<td><pre>                // the SecurityParameters.block_size.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="921" href="#"></a></td>
+<td><pre>                if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="922" href="#"></a></td>
+<td><pre>                    return cipher.getBlockSize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="923" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="924" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="925" href="#"></a></td>
+<td><pre>            case AEAD_CIPHER:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="926" href="#"></a></td>
+<td><pre>                if (bb.remaining() &lt; (recordIvSize + tagSize)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="927" href="#"></a></td>
+<td><pre>                    throw new BadPaddingException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="928" href="#"></a></td>
+<td><pre>                                        &quot;invalid AEAD cipher fragment&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="929" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="930" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="931" href="#"></a></td>
+<td><pre>                // initialize the AEAD cipher for the unique IV</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="932" href="#"></a></td>
+<td><pre>                byte[] iv = Arrays.copyOf(fixedIv,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="933" href="#"></a></td>
+<td><pre>                                    fixedIv.length + recordIvSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="934" href="#"></a></td>
+<td><pre>                bb.get(iv, fixedIv.length, recordIvSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="935" href="#"></a></td>
+<td><pre>                bb.position(bb.position() - recordIvSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="936" href="#"></a></td>
+<td><pre>                GCMParameterSpec spec = new GCMParameterSpec(tagSize * 8, iv);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="937" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="938" href="#"></a></td>
+<td><pre>                    cipher.init(mode, key, spec, random);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="939" href="#"></a></td>
+<td><pre>                } catch (InvalidKeyException |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="940" href="#"></a></td>
+<td><pre>                            InvalidAlgorithmParameterException ikae) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="941" href="#"></a></td>
+<td><pre>                    // unlikely to happen</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="942" href="#"></a></td>
+<td><pre>                    throw new RuntimeException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="943" href="#"></a></td>
+<td><pre>                                &quot;invalid key or spec in GCM mode&quot;, ikae);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="944" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="945" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="946" href="#"></a></td>
+<td><pre>                // update the additional authentication data</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="947" href="#"></a></td>
+<td><pre>                byte[] aad = authenticator.acquireAuthenticationBytes(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="948" href="#"></a></td>
+<td><pre>                        contentType, bb.remaining() - recordIvSize - tagSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="949" href="#"></a></td>
+<td><pre>                cipher.updateAAD(aad);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="950" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="951" href="#"></a></td>
+<td><pre>                return recordIvSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="952" href="#"></a></td>
+<td><pre>                        // It is also the length of sequence number, which is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="953" href="#"></a></td>
+<td><pre>                        // used as the nonce_explicit for AEAD cipher suites.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="954" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="955" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="956" href="#"></a></td>
+<td><pre>       return 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="957" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="958" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="959" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="960" href="#"></a></td>
+<td><pre>     * Applies the explicit nonce/IV to this cipher. This method is used to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="961" href="#"></a></td>
+<td><pre>     * decrypt an SSL/TLS input record.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="962" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="963" href="#"></a></td>
+<td><pre>     * The returned value is the SecurityParameters.record_iv_length in</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="964" href="#"></a></td>
+<td><pre>     * RFC 4346/5246.  It is the size of explicit IV for CBC mode, and the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="965" href="#"></a></td>
+<td><pre>     * size of explicit nonce for AEAD mode.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="966" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="967" href="#"></a></td>
+<td><pre>     * @param  authenticator the authenticator to get the additional</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="968" href="#"></a></td>
+<td><pre>     *         authentication data</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="969" href="#"></a></td>
+<td><pre>     * @param  contentType the content type of the input record</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="970" href="#"></a></td>
+<td><pre>     * @param  buf the byte array to get the explicit nonce from</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="971" href="#"></a></td>
+<td><pre>     * @param  offset the offset of the byte buffer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="972" href="#"></a></td>
+<td><pre>     * @param  cipheredLength the ciphered fragment length of the output</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="973" href="#"></a></td>
+<td><pre>     *         record, it is the TLSCiphertext.length in RFC 4346/5246.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="974" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="975" href="#"></a></td>
+<td><pre>     * @return the explicit nonce size of the cipher.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="976" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="977" href="#"></a></td>
+<td><pre>    int applyExplicitNonce(Authenticator authenticator,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="978" href="#"></a></td>
+<td><pre>            byte contentType, byte[] buf, int offset,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="979" href="#"></a></td>
+<td><pre>            int cipheredLength) throws BadPaddingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="980" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="981" href="#"></a></td>
+<td><pre>        ByteBuffer bb = ByteBuffer.wrap(buf, offset, cipheredLength);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="982" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="983" href="#"></a></td>
+<td><pre>        return applyExplicitNonce(authenticator, contentType, bb);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="984" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="985" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="986" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="987" href="#"></a></td>
+<td><pre>     * Creates the explicit nonce/IV to this cipher. This method is used to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="988" href="#"></a></td>
+<td><pre>     * encrypt an SSL/TLS output record.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="989" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="990" href="#"></a></td>
+<td><pre>     * The size of the returned array is the SecurityParameters.record_iv_length</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="991" href="#"></a></td>
+<td><pre>     * in RFC 4346/5246.  It is the size of explicit IV for CBC mode, and the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="992" href="#"></a></td>
+<td><pre>     * size of explicit nonce for AEAD mode.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="993" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="994" href="#"></a></td>
+<td><pre>     * @param  authenticator the authenticator to get the additional</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="995" href="#"></a></td>
+<td><pre>     *         authentication data</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="996" href="#"></a></td>
+<td><pre>     * @param  contentType the content type of the input record</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="997" href="#"></a></td>
+<td><pre>     * @param  fragmentLength the fragment length of the output record, it is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="998" href="#"></a></td>
+<td><pre>     *         the TLSCompressed.length in RFC 4346/5246.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="999" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1000" href="#"></a></td>
+<td><pre>     * @return the explicit nonce of the cipher.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1001" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1002" href="#"></a></td>
+<td><pre>    byte[] createExplicitNonce(Authenticator authenticator,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1003" href="#"></a></td>
+<td><pre>            byte contentType, int fragmentLength) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1004" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1005" href="#"></a></td>
+<td><pre>        byte[] nonce = new byte[0];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1006" href="#"></a></td>
+<td><pre>        switch (cipherType) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1007" href="#"></a></td>
+<td><pre>            case BLOCK_CIPHER:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1008" href="#"></a></td>
+<td><pre>                if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1009" href="#"></a></td>
+<td><pre>                    // For block ciphers, the explicit IV length is of length</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1010" href="#"></a></td>
+<td><pre>                    // SecurityParameters.record_iv_length, which is equal to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1011" href="#"></a></td>
+<td><pre>                    // the SecurityParameters.block_size.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1012" href="#"></a></td>
+<td><pre>                    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1013" href="#"></a></td>
+<td><pre>                    // Generate a random number as the explicit IV parameter.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1014" href="#"></a></td>
+<td><pre>                    nonce = new byte[cipher.getBlockSize()];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1015" href="#"></a></td>
+<td><pre>                    random.nextBytes(nonce);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1016" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1017" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1018" href="#"></a></td>
+<td><pre>            case AEAD_CIPHER:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1019" href="#"></a></td>
+<td><pre>                // To be unique and aware of overflow-wrap, sequence number</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1020" href="#"></a></td>
+<td><pre>                // is used as the nonce_explicit of AEAD cipher suites.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1021" href="#"></a></td>
+<td><pre>                nonce = authenticator.sequenceNumber();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1022" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1023" href="#"></a></td>
+<td><pre>                // initialize the AEAD cipher for the unique IV</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1024" href="#"></a></td>
+<td><pre>                byte[] iv = Arrays.copyOf(fixedIv,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1025" href="#"></a></td>
+<td><pre>                                            fixedIv.length + nonce.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1026" href="#"></a></td>
+<td><pre>                System.arraycopy(nonce, 0, iv, fixedIv.length, nonce.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1027" href="#"></a></td>
+<td><pre>                GCMParameterSpec spec = new GCMParameterSpec(tagSize * 8, iv);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1028" href="#"></a></td>
+<td><pre>                try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1029" href="#"></a></td>
+<td><pre>                    cipher.init(mode, key, spec, random);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1030" href="#"></a></td>
+<td><pre>                } catch (InvalidKeyException |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1031" href="#"></a></td>
+<td><pre>                            InvalidAlgorithmParameterException ikae) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1032" href="#"></a></td>
+<td><pre>                    // unlikely to happen</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1033" href="#"></a></td>
+<td><pre>                    throw new RuntimeException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1034" href="#"></a></td>
+<td><pre>                                &quot;invalid key or spec in GCM mode&quot;, ikae);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1035" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1036" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1037" href="#"></a></td>
+<td><pre>                // update the additional authentication data</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1038" href="#"></a></td>
+<td><pre>                byte[] aad = authenticator.acquireAuthenticationBytes(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1039" href="#"></a></td>
+<td><pre>                                                contentType, fragmentLength);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1040" href="#"></a></td>
+<td><pre>                cipher.updateAAD(aad);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1041" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1042" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1043" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1044" href="#"></a></td>
+<td><pre>        return nonce;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1045" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1046" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1047" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1048" href="#"></a></td>
+<td><pre>     * Is this cipher available?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1049" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1050" href="#"></a></td>
+<td><pre>     * This method can only be called by CipherSuite.BulkCipher.isAvailable()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1051" href="#"></a></td>
+<td><pre>     * to test the availability of a cipher suites.  Please DON'T use it in</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1052" href="#"></a></td>
+<td><pre>     * other places, otherwise, the behavior may be unexpected because we may</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1053" href="#"></a></td>
+<td><pre>     * initialize AEAD cipher improperly in the method.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1054" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1055" href="#"></a></td>
+<td><pre>    Boolean isAvailable() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1056" href="#"></a></td>
+<td><pre>        // We won't know whether a cipher for a particular key size is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1057" href="#"></a></td>
+<td><pre>        // available until the cipher is successfully initialized.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1058" href="#"></a></td>
+<td><pre>        //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1059" href="#"></a></td>
+<td><pre>        // We do not initialize AEAD cipher in the constructor.  Need to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1060" href="#"></a></td>
+<td><pre>        // initialize the cipher to ensure that the AEAD mode for a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1061" href="#"></a></td>
+<td><pre>        // particular key size is supported.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1062" href="#"></a></td>
+<td><pre>        if (cipherType == AEAD_CIPHER) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1063" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1064" href="#"></a></td>
+<td><pre>                Authenticator authenticator =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1065" href="#"></a></td>
+<td><pre>                    new Authenticator(protocolVersion);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1066" href="#"></a></td>
+<td><pre>                byte[] nonce = authenticator.sequenceNumber();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1067" href="#"></a></td>
+<td><pre>                byte[] iv = Arrays.copyOf(fixedIv,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1068" href="#"></a></td>
+<td><pre>                                            fixedIv.length + nonce.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1069" href="#"></a></td>
+<td><pre>                System.arraycopy(nonce, 0, iv, fixedIv.length, nonce.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1070" href="#"></a></td>
+<td><pre>                GCMParameterSpec spec = new GCMParameterSpec(tagSize * 8, iv);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1071" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1072" href="#"></a></td>
+<td><pre>                cipher.init(mode, key, spec, random);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1073" href="#"></a></td>
+<td><pre>            } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1074" href="#"></a></td>
+<td><pre>                return Boolean.FALSE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1075" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1076" href="#"></a></td>
+<td><pre>        }   // Otherwise, we have initialized the cipher in the constructor.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1077" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1078" href="#"></a></td>
+<td><pre>        return Boolean.TRUE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1079" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1080" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1081" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1082" href="#"></a></td>
+<td><pre>     * Sanity check the length of a fragment before decryption.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1083" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1084" href="#"></a></td>
+<td><pre>     * In CBC mode, check that the fragment length is one or multiple times</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1085" href="#"></a></td>
+<td><pre>     * of the block size of the cipher suite, and is at least one (one is the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1086" href="#"></a></td>
+<td><pre>     * smallest size of padding in CBC mode) bigger than the tag size of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1087" href="#"></a></td>
+<td><pre>     * MAC algorithm except the explicit IV size for TLS 1.1 or later.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1088" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1089" href="#"></a></td>
+<td><pre>     * In non-CBC mode, check that the fragment length is not less than the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1090" href="#"></a></td>
+<td><pre>     * tag size of the MAC algorithm.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1091" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1092" href="#"></a></td>
+<td><pre>     * @return true if the length of a fragment matches above requirements</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1093" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1094" href="#"></a></td>
+<td><pre>    private boolean sanityCheck(int tagLen, int fragmentLen) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1095" href="#"></a></td>
+<td><pre>        if (!isCBCMode()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1096" href="#"></a></td>
+<td><pre>            return fragmentLen &gt;= tagLen;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1097" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1098" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1099" href="#"></a></td>
+<td><pre>        int blockSize = cipher.getBlockSize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1100" href="#"></a></td>
+<td><pre>        if ((fragmentLen % blockSize) == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1101" href="#"></a></td>
+<td><pre>            int minimal = tagLen + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1102" href="#"></a></td>
+<td><pre>            minimal = (minimal &gt;= blockSize) ? minimal : blockSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1103" href="#"></a></td>
+<td><pre>            if (protocolVersion.v &gt;= ProtocolVersion.TLS11.v) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1104" href="#"></a></td>
+<td><pre>                minimal += blockSize;   // plus the size of the explicit IV</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1105" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1106" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1107" href="#"></a></td>
+<td><pre>            return (fragmentLen &gt;= minimal);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1108" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1109" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1110" href="#"></a></td>
+<td><pre>        return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1111" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1112" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1113" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

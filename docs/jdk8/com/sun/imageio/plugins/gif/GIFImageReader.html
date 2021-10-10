@@ -3,1090 +3,4339 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package com.sun.imageio.plugins.gif;
-
-import java.awt.Point;
-import java.awt.Rectangle;
-import java.awt.image.BufferedImage;
-import java.awt.image.DataBuffer;
-import java.awt.image.WritableRaster;
-import java.io.EOFException;
-import java.io.IOException;
-import java.nio.ByteOrder;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
-import javax.imageio.IIOException;
-import javax.imageio.ImageReader;
-import javax.imageio.ImageReadParam;
-import javax.imageio.ImageTypeSpecifier;
-import javax.imageio.metadata.IIOMetadata;
-import javax.imageio.spi.ImageReaderSpi;
-import javax.imageio.stream.ImageInputStream;
-import com.sun.imageio.plugins.common.ReaderUtil;
-import java.awt.image.ColorModel;
-import java.awt.image.IndexColorModel;
-import java.awt.image.MultiPixelPackedSampleModel;
-import java.awt.image.PixelInterleavedSampleModel;
-import java.awt.image.SampleModel;
-
-public class GIFImageReader extends ImageReader {
-
-    // The current ImageInputStream source.
-    ImageInputStream stream = null;
-
-    // Per-stream settings
-
-    // True if the file header including stream metadata has been read.
-    boolean gotHeader = false;
-
-    // Global metadata, read once per input setting.
-    GIFStreamMetadata streamMetadata = null;
-
-    // The current image index
-    int currIndex = -1;
-
-    // Metadata for image at 'currIndex', or null.
-    GIFImageMetadata imageMetadata = null;
-
-    // A List of Longs indicating the stream positions of the
-    // start of the metadata for each image.  Entries are added
-    // as needed.
-    List imageStartPosition = new ArrayList();
-
-    // Length of metadata for image at 'currIndex', valid only if
-    // imageMetadata != null.
-    int imageMetadataLength;
-
-    // The number of images in the stream, if known, otherwise -1.
-    int numImages = -1;
-
-    // Variables used by the LZW decoding process
-    byte[] block = new byte[255];
-    int blockLength = 0;
-    int bitPos = 0;
-    int nextByte = 0;
-    int initCodeSize;
-    int clearCode;
-    int eofCode;
-
-    // 32-bit lookahead buffer
-    int next32Bits = 0;
-
-    // Try if the end of the data blocks has been found,
-    // and we are simply draining the 32-bit buffer
-    boolean lastBlockFound = false;
-
-    // The image to be written.
-    BufferedImage theImage = null;
-
-    // The image's tile.
-    WritableRaster theTile = null;
-
-    // The image dimensions (from the stream).
-    int width = -1, height = -1;
-
-    // The pixel currently being decoded (in the stream's coordinates).
-    int streamX = -1, streamY = -1;
-
-    // The number of rows decoded
-    int rowsDone = 0;
-
-    // The current interlace pass, starting with 0.
-    int interlacePass = 0;
-
-    private byte[] fallbackColorTable = null;
-
-    // End per-stream settings
-
-    // Constants used to control interlacing.
-    static final int[] interlaceIncrement = { 8, 8, 4, 2, -1 };
-    static final int[] interlaceOffset = { 0, 4, 2, 1, -1 };
-
-    public GIFImageReader(ImageReaderSpi originatingProvider) {
-        super(originatingProvider);
-    }
-
-    // Take input from an ImageInputStream
-    public void setInput(Object input,
-                         boolean seekForwardOnly,
-                         boolean ignoreMetadata) {
-        super.setInput(input, seekForwardOnly, ignoreMetadata);
-        if (input != null) {
-            if (!(input instanceof ImageInputStream)) {
-                throw new IllegalArgumentException
-                    (&quot;input not an ImageInputStream!&quot;);
-            }
-            this.stream = (ImageInputStream)input;
-        } else {
-            this.stream = null;
-        }
-
-        // Clear all values based on the previous stream contents
-        resetStreamSettings();
-    }
-
-    public int getNumImages(boolean allowSearch) throws IIOException {
-        if (stream == null) {
-            throw new IllegalStateException(&quot;Input not set!&quot;);
-        }
-        if (seekForwardOnly &amp;&amp; allowSearch) {
-            throw new IllegalStateException
-                (&quot;seekForwardOnly and allowSearch can't both be true!&quot;);
-        }
-
-        if (numImages &gt; 0) {
-            return numImages;
-        }
-        if (allowSearch) {
-            this.numImages = locateImage(Integer.MAX_VALUE) + 1;
-        }
-        return numImages;
-    }
-
-    // Throw an IndexOutOfBoundsException if index &lt; minIndex,
-    // and bump minIndex if required.
-    private void checkIndex(int imageIndex) {
-        if (imageIndex &lt; minIndex) {
-            throw new IndexOutOfBoundsException(&quot;imageIndex &lt; minIndex!&quot;);
-        }
-        if (seekForwardOnly) {
-            minIndex = imageIndex;
-        }
-    }
-
-    public int getWidth(int imageIndex) throws IIOException {
-        checkIndex(imageIndex);
-
-        int index = locateImage(imageIndex);
-        if (index != imageIndex) {
-            throw new IndexOutOfBoundsException();
-        }
-        readMetadata();
-        return imageMetadata.imageWidth;
-    }
-
-    public int getHeight(int imageIndex) throws IIOException {
-        checkIndex(imageIndex);
-
-        int index = locateImage(imageIndex);
-        if (index != imageIndex) {
-            throw new IndexOutOfBoundsException();
-        }
-        readMetadata();
-        return imageMetadata.imageHeight;
-    }
-
-    // We don't check all parameters as ImageTypeSpecifier.createIndexed do
-    // since this method is private and we pass consistent data here
-    private ImageTypeSpecifier createIndexed(byte[] r, byte[] g, byte[] b,
-                                             int bits) {
-        ColorModel colorModel;
-        if (imageMetadata.transparentColorFlag) {
-            // Some files erroneously have a transparent color index
-            // of 255 even though there are fewer than 256 colors.
-            int idx = Math.min(imageMetadata.transparentColorIndex,
-                    r.length - 1);
-            colorModel = new IndexColorModel(bits, r.length, r, g, b, idx);
-        } else {
-            colorModel = new IndexColorModel(bits, r.length, r, g, b);
-        }
-
-        SampleModel sampleModel;
-        if (bits == 8) {
-            int[] bandOffsets = {0};
-            sampleModel =
-                    new PixelInterleavedSampleModel(DataBuffer.TYPE_BYTE,
-                    1, 1, 1, 1,
-                    bandOffsets);
-        } else {
-            sampleModel =
-                    new MultiPixelPackedSampleModel(DataBuffer.TYPE_BYTE,
-                    1, 1, bits);
-        }
-        return new ImageTypeSpecifier(colorModel, sampleModel);
-    }
-
-    public Iterator getImageTypes(int imageIndex) throws IIOException {
-        checkIndex(imageIndex);
-
-        int index = locateImage(imageIndex);
-        if (index != imageIndex) {
-            throw new IndexOutOfBoundsException();
-        }
-        readMetadata();
-
-        List l = new ArrayList(1);
-
-        byte[] colorTable;
-        if (imageMetadata.localColorTable != null) {
-            colorTable = imageMetadata.localColorTable;
-            fallbackColorTable = imageMetadata.localColorTable;
-        } else {
-            colorTable = streamMetadata.globalColorTable;
-        }
-
-        if (colorTable == null) {
-            if (fallbackColorTable == null) {
-                this.processWarningOccurred(&quot;Use default color table.&quot;);
-
-                // no color table, the spec allows to use any palette.
-                fallbackColorTable = getDefaultPalette();
-            }
-
-            colorTable = fallbackColorTable;
-        }
-
-        // Normalize color table length to 2^1, 2^2, 2^4, or 2^8
-        int length = colorTable.length/3;
-        int bits;
-        if (length == 2) {
-            bits = 1;
-        } else if (length == 4) {
-            bits = 2;
-        } else if (length == 8 || length == 16) {
-            // Bump from 3 to 4 bits
-            bits = 4;
-        } else {
-            // Bump to 8 bits
-            bits = 8;
-        }
-        int lutLength = 1 &lt;&lt; bits;
-        byte[] r = new byte[lutLength];
-        byte[] g = new byte[lutLength];
-        byte[] b = new byte[lutLength];
-
-        // Entries from length + 1 to lutLength - 1 will be 0
-        int rgbIndex = 0;
-        for (int i = 0; i &lt; length; i++) {
-            r[i] = colorTable[rgbIndex++];
-            g[i] = colorTable[rgbIndex++];
-            b[i] = colorTable[rgbIndex++];
-        }
-
-        l.add(createIndexed(r, g, b, bits));
-        return l.iterator();
-    }
-
-    public ImageReadParam getDefaultReadParam() {
-        return new ImageReadParam();
-    }
-
-    public IIOMetadata getStreamMetadata() throws IIOException {
-        readHeader();
-        return streamMetadata;
-    }
-
-    public IIOMetadata getImageMetadata(int imageIndex) throws IIOException {
-        checkIndex(imageIndex);
-
-        int index = locateImage(imageIndex);
-        if (index != imageIndex) {
-            throw new IndexOutOfBoundsException(&quot;Bad image index!&quot;);
-        }
-        readMetadata();
-        return imageMetadata;
-    }
-
-    // BEGIN LZW STUFF
-
-    private void initNext32Bits() {
-        next32Bits = block[0] &amp; 0xff;
-        next32Bits |= (block[1] &amp; 0xff) &lt;&lt; 8;
-        next32Bits |= (block[2] &amp; 0xff) &lt;&lt; 16;
-        next32Bits |= block[3] &lt;&lt; 24;
-        nextByte = 4;
-    }
-
-    // Load a block (1-255 bytes) at a time, and maintain
-    // a 32-bit lookahead buffer that is filled from the left
-    // and extracted from the right.
-    //
-    // When the last block is found, we continue to
-    //
-    private int getCode(int codeSize, int codeMask) throws IOException {
-        if (bitPos + codeSize &gt; 32) {
-            return eofCode; // No more data available
-        }
-
-        int code = (next32Bits &gt;&gt; bitPos) &amp; codeMask;
-        bitPos += codeSize;
-
-        // Shift in a byte of new data at a time
-        while (bitPos &gt;= 8 &amp;&amp; !lastBlockFound) {
-            next32Bits &gt;&gt;&gt;= 8;
-            bitPos -= 8;
-
-            // Check if current block is out of bytes
-            if (nextByte &gt;= blockLength) {
-                // Get next block size
-                blockLength = stream.readUnsignedByte();
-                if (blockLength == 0) {
-                    lastBlockFound = true;
-                    return code;
-                } else {
-                    int left = blockLength;
-                    int off = 0;
-                    while (left &gt; 0) {
-                        int nbytes = stream.read(block, off, left);
-                        off += nbytes;
-                        left -= nbytes;
-                    }
-                    nextByte = 0;
-                }
-            }
-
-            next32Bits |= block[nextByte++] &lt;&lt; 24;
-        }
-
-        return code;
-    }
-
-    public void initializeStringTable(int[] prefix,
-                                      byte[] suffix,
-                                      byte[] initial,
-                                      int[] length) {
-        int numEntries = 1 &lt;&lt; initCodeSize;
-        for (int i = 0; i &lt; numEntries; i++) {
-            prefix[i] = -1;
-            suffix[i] = (byte)i;
-            initial[i] = (byte)i;
-            length[i] = 1;
-        }
-
-        // Fill in the entire table for robustness against
-        // out-of-sequence codes.
-        for (int i = numEntries; i &lt; 4096; i++) {
-            prefix[i] = -1;
-            length[i] = 1;
-        }
-
-        // tableIndex = numEntries + 2;
-        // codeSize = initCodeSize + 1;
-        // codeMask = (1 &lt;&lt; codeSize) - 1;
-    }
-
-    Rectangle sourceRegion;
-    int sourceXSubsampling;
-    int sourceYSubsampling;
-    int sourceMinProgressivePass;
-    int sourceMaxProgressivePass;
-
-    Point destinationOffset;
-    Rectangle destinationRegion;
-
-    // Used only if IIOReadUpdateListeners are present
-    int updateMinY;
-    int updateYStep;
-
-    boolean decodeThisRow = true;
-    int destY = 0;
-
-    byte[] rowBuf;
-
-    private void outputRow() {
-        // Clip against ImageReadParam
-        int width = Math.min(sourceRegion.width,
-                             destinationRegion.width*sourceXSubsampling);
-        int destX = destinationRegion.x;
-
-        if (sourceXSubsampling == 1) {
-            theTile.setDataElements(destX, destY, width, 1, rowBuf);
-        } else {
-            for (int x = 0; x &lt; width; x += sourceXSubsampling, destX++) {
-                theTile.setSample(destX, destY, 0, rowBuf[x] &amp; 0xff);
-            }
-        }
-
-        // Update IIOReadUpdateListeners, if any
-        if (updateListeners != null) {
-            int[] bands = { 0 };
-            // updateYStep will have been initialized if
-            // updateListeners is non-null
-            processImageUpdate(theImage,
-                               destX, destY,
-                               width, 1, 1, updateYStep,
-                               bands);
-        }
-    }
-
-    private void computeDecodeThisRow() {
-        this.decodeThisRow =
-            (destY &lt; destinationRegion.y + destinationRegion.height) &amp;&amp;
-            (streamY &gt;= sourceRegion.y) &amp;&amp;
-            (streamY &lt; sourceRegion.y + sourceRegion.height) &amp;&amp;
-            (((streamY - sourceRegion.y) % sourceYSubsampling) == 0);
-    }
-
-    private void outputPixels(byte[] string, int len) {
-        if (interlacePass &lt; sourceMinProgressivePass ||
-            interlacePass &gt; sourceMaxProgressivePass) {
-            return;
-        }
-
-        for (int i = 0; i &lt; len; i++) {
-            if (streamX &gt;= sourceRegion.x) {
-                rowBuf[streamX - sourceRegion.x] = string[i];
-            }
-
-            // Process end-of-row
-            ++streamX;
-            if (streamX == width) {
-                // Update IIOReadProgressListeners
-                ++rowsDone;
-                processImageProgress(100.0F*rowsDone/height);
-
-                if (decodeThisRow) {
-                    outputRow();
-                }
-
-                streamX = 0;
-                if (imageMetadata.interlaceFlag) {
-                    streamY += interlaceIncrement[interlacePass];
-                    if (streamY &gt;= height) {
-                        // Inform IIOReadUpdateListeners of end of pass
-                        if (updateListeners != null) {
-                            processPassComplete(theImage);
-                        }
-
-                        ++interlacePass;
-                        if (interlacePass &gt; sourceMaxProgressivePass) {
-                            return;
-                        }
-                        streamY = interlaceOffset[interlacePass];
-                        startPass(interlacePass);
-                    }
-                } else {
-                    ++streamY;
-                }
-
-                // Determine whether pixels from this row will
-                // be written to the destination
-                this.destY = destinationRegion.y +
-                    (streamY - sourceRegion.y)/sourceYSubsampling;
-                computeDecodeThisRow();
-            }
-        }
-    }
-
-    // END LZW STUFF
-
-    private void readHeader() throws IIOException {
-        if (gotHeader) {
-            return;
-        }
-        if (stream == null) {
-            throw new IllegalStateException(&quot;Input not set!&quot;);
-        }
-
-        // Create an object to store the stream metadata
-        this.streamMetadata = new GIFStreamMetadata();
-
-        try {
-            stream.setByteOrder(ByteOrder.LITTLE_ENDIAN);
-
-            byte[] signature = new byte[6];
-            stream.readFully(signature);
-
-            StringBuffer version = new StringBuffer(3);
-            version.append((char)signature[3]);
-            version.append((char)signature[4]);
-            version.append((char)signature[5]);
-            streamMetadata.version = version.toString();
-
-            streamMetadata.logicalScreenWidth = stream.readUnsignedShort();
-            streamMetadata.logicalScreenHeight = stream.readUnsignedShort();
-
-            int packedFields = stream.readUnsignedByte();
-            boolean globalColorTableFlag = (packedFields &amp; 0x80) != 0;
-            streamMetadata.colorResolution = ((packedFields &gt;&gt; 4) &amp; 0x7) + 1;
-            streamMetadata.sortFlag = (packedFields &amp; 0x8) != 0;
-            int numGCTEntries = 1 &lt;&lt; ((packedFields &amp; 0x7) + 1);
-
-            streamMetadata.backgroundColorIndex = stream.readUnsignedByte();
-            streamMetadata.pixelAspectRatio = stream.readUnsignedByte();
-
-            if (globalColorTableFlag) {
-                streamMetadata.globalColorTable = new byte[3*numGCTEntries];
-                stream.readFully(streamMetadata.globalColorTable);
-            } else {
-                streamMetadata.globalColorTable = null;
-            }
-
-            // Found position of metadata for image 0
-            imageStartPosition.add(Long.valueOf(stream.getStreamPosition()));
-        } catch (IOException e) {
-            throw new IIOException(&quot;I/O error reading header!&quot;, e);
-        }
-
-        gotHeader = true;
-    }
-
-    private boolean skipImage() throws IIOException {
-        // Stream must be at the beginning of an image descriptor
-        // upon exit
-
-        try {
-            while (true) {
-                int blockType = stream.readUnsignedByte();
-
-                if (blockType == 0x2c) {
-                    stream.skipBytes(8);
-
-                    int packedFields = stream.readUnsignedByte();
-                    if ((packedFields &amp; 0x80) != 0) {
-                        // Skip color table if any
-                        int bits = (packedFields &amp; 0x7) + 1;
-                        stream.skipBytes(3*(1 &lt;&lt; bits));
-                    }
-
-                    stream.skipBytes(1);
-
-                    int length = 0;
-                    do {
-                        length = stream.readUnsignedByte();
-                        stream.skipBytes(length);
-                    } while (length &gt; 0);
-
-                    return true;
-                } else if (blockType == 0x3b) {
-                    return false;
-                } else if (blockType == 0x21) {
-                    int label = stream.readUnsignedByte();
-
-                    int length = 0;
-                    do {
-                        length = stream.readUnsignedByte();
-                        stream.skipBytes(length);
-                    } while (length &gt; 0);
-                } else if (blockType == 0x0) {
-                    // EOF
-                    return false;
-                } else {
-                    int length = 0;
-                    do {
-                        length = stream.readUnsignedByte();
-                        stream.skipBytes(length);
-                    } while (length &gt; 0);
-                }
-            }
-        } catch (EOFException e) {
-            return false;
-        } catch (IOException e) {
-            throw new IIOException(&quot;I/O error locating image!&quot;, e);
-        }
-    }
-
-    private int locateImage(int imageIndex) throws IIOException {
-        readHeader();
-
-        try {
-            // Find closest known index
-            int index = Math.min(imageIndex, imageStartPosition.size() - 1);
-
-            // Seek to that position
-            Long l = (Long)imageStartPosition.get(index);
-            stream.seek(l.longValue());
-
-            // Skip images until at desired index or last image found
-            while (index &lt; imageIndex) {
-                if (!skipImage()) {
-                    --index;
-                    return index;
-                }
-
-                Long l1 = new Long(stream.getStreamPosition());
-                imageStartPosition.add(l1);
-                ++index;
-            }
-        } catch (IOException e) {
-            throw new IIOException(&quot;Couldn't seek!&quot;, e);
-        }
-
-        if (currIndex != imageIndex) {
-            imageMetadata = null;
-        }
-        currIndex = imageIndex;
-        return imageIndex;
-    }
-
-    // Read blocks of 1-255 bytes, stop at a 0-length block
-    private byte[] concatenateBlocks() throws IOException {
-        byte[] data = new byte[0];
-        while (true) {
-            int length = stream.readUnsignedByte();
-            if (length == 0) {
-                break;
-            }
-            byte[] newData = new byte[data.length + length];
-            System.arraycopy(data, 0, newData, 0, data.length);
-            stream.readFully(newData, data.length, length);
-            data = newData;
-        }
-
-        return data;
-    }
-
-    // Stream must be positioned at start of metadata for 'currIndex'
-    private void readMetadata() throws IIOException {
-        if (stream == null) {
-            throw new IllegalStateException(&quot;Input not set!&quot;);
-        }
-
-        try {
-            // Create an object to store the image metadata
-            this.imageMetadata = new GIFImageMetadata();
-
-            long startPosition = stream.getStreamPosition();
-            while (true) {
-                int blockType = stream.readUnsignedByte();
-                if (blockType == 0x2c) { // Image Descriptor
-                    imageMetadata.imageLeftPosition =
-                        stream.readUnsignedShort();
-                    imageMetadata.imageTopPosition =
-                        stream.readUnsignedShort();
-                    imageMetadata.imageWidth = stream.readUnsignedShort();
-                    imageMetadata.imageHeight = stream.readUnsignedShort();
-
-                    int idPackedFields = stream.readUnsignedByte();
-                    boolean localColorTableFlag =
-                        (idPackedFields &amp; 0x80) != 0;
-                    imageMetadata.interlaceFlag = (idPackedFields &amp; 0x40) != 0;
-                    imageMetadata.sortFlag = (idPackedFields &amp; 0x20) != 0;
-                    int numLCTEntries = 1 &lt;&lt; ((idPackedFields &amp; 0x7) + 1);
-
-                    if (localColorTableFlag) {
-                        // Read color table if any
-                        imageMetadata.localColorTable =
-                            new byte[3*numLCTEntries];
-                        stream.readFully(imageMetadata.localColorTable);
-                    } else {
-                        imageMetadata.localColorTable = null;
-                    }
-
-                    // Record length of this metadata block
-                    this.imageMetadataLength =
-                        (int)(stream.getStreamPosition() - startPosition);
-
-                    // Now positioned at start of LZW-compressed pixels
-                    return;
-                } else if (blockType == 0x21) { // Extension block
-                    int label = stream.readUnsignedByte();
-
-                    if (label == 0xf9) { // Graphics Control Extension
-                        int gceLength = stream.readUnsignedByte(); // 4
-                        int gcePackedFields = stream.readUnsignedByte();
-                        imageMetadata.disposalMethod =
-                            (gcePackedFields &gt;&gt; 2) &amp; 0x3;
-                        imageMetadata.userInputFlag =
-                            (gcePackedFields &amp; 0x2) != 0;
-                        imageMetadata.transparentColorFlag =
-                            (gcePackedFields &amp; 0x1) != 0;
-
-                        imageMetadata.delayTime = stream.readUnsignedShort();
-                        imageMetadata.transparentColorIndex
-                            = stream.readUnsignedByte();
-
-                        int terminator = stream.readUnsignedByte();
-                    } else if (label == 0x1) { // Plain text extension
-                        int length = stream.readUnsignedByte();
-                        imageMetadata.hasPlainTextExtension = true;
-                        imageMetadata.textGridLeft =
-                            stream.readUnsignedShort();
-                        imageMetadata.textGridTop =
-                            stream.readUnsignedShort();
-                        imageMetadata.textGridWidth =
-                            stream.readUnsignedShort();
-                        imageMetadata.textGridHeight =
-                            stream.readUnsignedShort();
-                        imageMetadata.characterCellWidth =
-                            stream.readUnsignedByte();
-                        imageMetadata.characterCellHeight =
-                            stream.readUnsignedByte();
-                        imageMetadata.textForegroundColor =
-                            stream.readUnsignedByte();
-                        imageMetadata.textBackgroundColor =
-                            stream.readUnsignedByte();
-                        imageMetadata.text = concatenateBlocks();
-                    } else if (label == 0xfe) { // Comment extension
-                        byte[] comment = concatenateBlocks();
-                        if (imageMetadata.comments == null) {
-                            imageMetadata.comments = new ArrayList();
-                        }
-                        imageMetadata.comments.add(comment);
-                    } else if (label == 0xff) { // Application extension
-                        int blockSize = stream.readUnsignedByte();
-                        byte[] applicationID = new byte[8];
-                        byte[] authCode = new byte[3];
-
-                        // read available data
-                        byte[] blockData = new byte[blockSize];
-                        stream.readFully(blockData);
-
-                        int offset = copyData(blockData, 0, applicationID);
-                        offset = copyData(blockData, offset, authCode);
-
-                        byte[] applicationData = concatenateBlocks();
-
-                        if (offset &lt; blockSize) {
-                            int len = blockSize - offset;
-                            byte[] data =
-                                new byte[len + applicationData.length];
-
-                            System.arraycopy(blockData, offset, data, 0, len);
-                            System.arraycopy(applicationData, 0, data, len,
-                                             applicationData.length);
-
-                            applicationData = data;
-                        }
-
-                        // Init lists if necessary
-                        if (imageMetadata.applicationIDs == null) {
-                            imageMetadata.applicationIDs = new ArrayList();
-                            imageMetadata.authenticationCodes =
-                                new ArrayList();
-                            imageMetadata.applicationData = new ArrayList();
-                        }
-                        imageMetadata.applicationIDs.add(applicationID);
-                        imageMetadata.authenticationCodes.add(authCode);
-                        imageMetadata.applicationData.add(applicationData);
-                    } else {
-                        // Skip over unknown extension blocks
-                        int length = 0;
-                        do {
-                            length = stream.readUnsignedByte();
-                            stream.skipBytes(length);
-                        } while (length &gt; 0);
-                    }
-                } else if (blockType == 0x3b) { // Trailer
-                    throw new IndexOutOfBoundsException
-                        (&quot;Attempt to read past end of image sequence!&quot;);
-                } else {
-                    throw new IIOException(&quot;Unexpected block type &quot; +
-                                           blockType + &quot;!&quot;);
-                }
-            }
-        } catch (IIOException iioe) {
-            throw iioe;
-        } catch (IOException ioe) {
-            throw new IIOException(&quot;I/O error reading image metadata!&quot;, ioe);
-        }
-    }
-
-    private int copyData(byte[] src, int offset, byte[] dst) {
-        int len = dst.length;
-        int rest = src.length - offset;
-        if (len &gt; rest) {
-            len = rest;
-        }
-        System.arraycopy(src, offset, dst, 0, len);
-        return offset + len;
-    }
-
-    private void startPass(int pass) {
-        if (updateListeners == null || !imageMetadata.interlaceFlag) {
-            return;
-        }
-
-        int y = interlaceOffset[interlacePass];
-        int yStep = interlaceIncrement[interlacePass];
-
-        int[] vals = ReaderUtil.
-            computeUpdatedPixels(sourceRegion,
-                                 destinationOffset,
-                                 destinationRegion.x,
-                                 destinationRegion.y,
-                                 destinationRegion.x +
-                                 destinationRegion.width - 1,
-                                 destinationRegion.y +
-                                 destinationRegion.height - 1,
-                                 sourceXSubsampling,
-                                 sourceYSubsampling,
-                                 0,
-                                 y,
-                                 destinationRegion.width,
-                                 (destinationRegion.height + yStep - 1)/yStep,
-                                 1,
-                                 yStep);
-
-        // Initialized updateMinY and updateYStep
-        this.updateMinY = vals[1];
-        this.updateYStep = vals[5];
-
-        // Inform IIOReadUpdateListeners of new pass
-        int[] bands = { 0 };
-
-        processPassStarted(theImage,
-                           interlacePass,
-                           sourceMinProgressivePass,
-                           sourceMaxProgressivePass,
-                           0,
-                           updateMinY,
-                           1,
-                           updateYStep,
-                           bands);
-    }
-
-    public BufferedImage read(int imageIndex, ImageReadParam param)
-        throws IIOException {
-        if (stream == null) {
-            throw new IllegalStateException(&quot;Input not set!&quot;);
-        }
-        checkIndex(imageIndex);
-
-        int index = locateImage(imageIndex);
-        if (index != imageIndex) {
-            throw new IndexOutOfBoundsException(&quot;imageIndex out of bounds!&quot;);
-        }
-
-        clearAbortRequest();
-        readMetadata();
-
-        // A null ImageReadParam means we use the default
-        if (param == null) {
-            param = getDefaultReadParam();
-        }
-
-        // Initialize the destination image
-        Iterator imageTypes = getImageTypes(imageIndex);
-        this.theImage = getDestination(param,
-                                       imageTypes,
-                                       imageMetadata.imageWidth,
-                                       imageMetadata.imageHeight);
-        this.theTile = theImage.getWritableTile(0, 0);
-        this.width = imageMetadata.imageWidth;
-        this.height = imageMetadata.imageHeight;
-        this.streamX = 0;
-        this.streamY = 0;
-        this.rowsDone = 0;
-        this.interlacePass = 0;
-
-        // Get source region, taking subsampling offsets into account,
-        // and clipping against the true source bounds
-
-        this.sourceRegion = new Rectangle(0, 0, 0, 0);
-        this.destinationRegion = new Rectangle(0, 0, 0, 0);
-        computeRegions(param, width, height, theImage,
-                       sourceRegion, destinationRegion);
-        this.destinationOffset = new Point(destinationRegion.x,
-                                           destinationRegion.y);
-
-        this.sourceXSubsampling = param.getSourceXSubsampling();
-        this.sourceYSubsampling = param.getSourceYSubsampling();
-        this.sourceMinProgressivePass =
-            Math.max(param.getSourceMinProgressivePass(), 0);
-        this.sourceMaxProgressivePass =
-            Math.min(param.getSourceMaxProgressivePass(), 3);
-
-        this.destY = destinationRegion.y +
-            (streamY - sourceRegion.y)/sourceYSubsampling;
-        computeDecodeThisRow();
-
-        // Inform IIOReadProgressListeners of start of image
-        processImageStarted(imageIndex);
-        startPass(0);
-
-        this.rowBuf = new byte[width];
-
-        try {
-            // Read and decode the image data, fill in theImage
-            this.initCodeSize = stream.readUnsignedByte();
-
-            // Read first data block
-            this.blockLength = stream.readUnsignedByte();
-            int left = blockLength;
-            int off = 0;
-            while (left &gt; 0) {
-                int nbytes = stream.read(block, off, left);
-                left -= nbytes;
-                off += nbytes;
-            }
-
-            this.bitPos = 0;
-            this.nextByte = 0;
-            this.lastBlockFound = false;
-            this.interlacePass = 0;
-
-            // Init 32-bit buffer
-            initNext32Bits();
-
-            this.clearCode = 1 &lt;&lt; initCodeSize;
-            this.eofCode = clearCode + 1;
-
-            int code, oldCode = 0;
-
-            int[] prefix = new int[4096];
-            byte[] suffix = new byte[4096];
-            byte[] initial = new byte[4096];
-            int[] length = new int[4096];
-            byte[] string = new byte[4096];
-
-            initializeStringTable(prefix, suffix, initial, length);
-            int tableIndex = (1 &lt;&lt; initCodeSize) + 2;
-            int codeSize = initCodeSize + 1;
-            int codeMask = (1 &lt;&lt; codeSize) - 1;
-
-            while (!abortRequested()) {
-                code = getCode(codeSize, codeMask);
-
-                if (code == clearCode) {
-                    initializeStringTable(prefix, suffix, initial, length);
-                    tableIndex = (1 &lt;&lt; initCodeSize) + 2;
-                    codeSize = initCodeSize + 1;
-                    codeMask = (1 &lt;&lt; codeSize) - 1;
-
-                    code = getCode(codeSize, codeMask);
-                    if (code == eofCode) {
-                        // Inform IIOReadProgressListeners of end of image
-                        processImageComplete();
-                        return theImage;
-                    }
-                } else if (code == eofCode) {
-                    // Inform IIOReadProgressListeners of end of image
-                    processImageComplete();
-                    return theImage;
-                } else {
-                    int newSuffixIndex;
-                    if (code &lt; tableIndex) {
-                        newSuffixIndex = code;
-                    } else { // code == tableIndex
-                        newSuffixIndex = oldCode;
-                        if (code != tableIndex) {
-                            // warning - code out of sequence
-                            // possibly data corruption
-                            processWarningOccurred(&quot;Out-of-sequence code!&quot;);
-                        }
-                    }
-
-                    int ti = tableIndex;
-                    int oc = oldCode;
-
-                    prefix[ti] = oc;
-                    suffix[ti] = initial[newSuffixIndex];
-                    initial[ti] = initial[oc];
-                    length[ti] = length[oc] + 1;
-
-                    ++tableIndex;
-                    if ((tableIndex == (1 &lt;&lt; codeSize)) &amp;&amp;
-                        (tableIndex &lt; 4096)) {
-                        ++codeSize;
-                        codeMask = (1 &lt;&lt; codeSize) - 1;
-                    }
-                }
-
-                // Reverse code
-                int c = code;
-                int len = length[c];
-                for (int i = len - 1; i &gt;= 0; i--) {
-                    string[i] = suffix[c];
-                    c = prefix[c];
-                }
-
-                outputPixels(string, len);
-                oldCode = code;
-            }
-
-            processReadAborted();
-            return theImage;
-        } catch (IOException e) {
-            e.printStackTrace();
-            throw new IIOException(&quot;I/O error reading image!&quot;, e);
-        }
-    }
-
-    /**
-     * Remove all settings including global settings such as
-     * &lt;code&gt;Locale&lt;/code&gt;s and listeners, as well as stream settings.
-     */
-    public void reset() {
-        super.reset();
-        resetStreamSettings();
-    }
-
-    /**
-     * Remove local settings based on parsing of a stream.
-     */
-    private void resetStreamSettings() {
-        gotHeader = false;
-        streamMetadata = null;
-        currIndex = -1;
-        imageMetadata = null;
-        imageStartPosition = new ArrayList();
-        numImages = -1;
-
-        // No need to reinitialize 'block'
-        blockLength = 0;
-        bitPos = 0;
-        nextByte = 0;
-
-        next32Bits = 0;
-        lastBlockFound = false;
-
-        theImage = null;
-        theTile = null;
-        width = -1;
-        height = -1;
-        streamX = -1;
-        streamY = -1;
-        rowsDone = 0;
-        interlacePass = 0;
-
-        fallbackColorTable = null;
-    }
-
-    private static byte[] defaultPalette = null;
-
-    private static synchronized byte[] getDefaultPalette() {
-        if (defaultPalette == null) {
-            BufferedImage img = new BufferedImage(1, 1,
-                    BufferedImage.TYPE_BYTE_INDEXED);
-            IndexColorModel icm = (IndexColorModel) img.getColorModel();
-
-            final int size = icm.getMapSize();
-            byte[] r = new byte[size];
-            byte[] g = new byte[size];
-            byte[] b = new byte[size];
-            icm.getReds(r);
-            icm.getGreens(g);
-            icm.getBlues(b);
-
-            defaultPalette = new byte[size * 3];
-
-            for (int i = 0; i &lt; size; i++) {
-                defaultPalette[3 * i + 0] = r[i];
-                defaultPalette[3 * i + 1] = g[i];
-                defaultPalette[3 * i + 2] = b[i];
-            }
-        }
-        return defaultPalette;
-    }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package com.sun.imageio.plugins.gif;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.awt.Point;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.awt.Rectangle;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.awt.image.BufferedImage;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.awt.image.DataBuffer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.awt.image.WritableRaster;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.io.EOFException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.io.IOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import java.nio.ByteOrder;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.util.ArrayList;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import java.util.Iterator;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import java.util.List;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import javax.imageio.IIOException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre>import javax.imageio.ImageReader;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre>import javax.imageio.ImageReadParam;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>import javax.imageio.ImageTypeSpecifier;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>import javax.imageio.metadata.IIOMetadata;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre>import javax.imageio.spi.ImageReaderSpi;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre>import javax.imageio.stream.ImageInputStream;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>import com.sun.imageio.plugins.common.ReaderUtil;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre>import java.awt.image.ColorModel;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre>import java.awt.image.IndexColorModel;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre>import java.awt.image.MultiPixelPackedSampleModel;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre>import java.awt.image.PixelInterleavedSampleModel;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>import java.awt.image.SampleModel;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre>public class GIFImageReader extends ImageReader {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>    // The current ImageInputStream source.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre>    ImageInputStream stream = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>    // Per-stream settings</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>    // True if the file header including stream metadata has been read.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>    boolean gotHeader = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>    // Global metadata, read once per input setting.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>    GIFStreamMetadata streamMetadata = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>    // The current image index</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>    int currIndex = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>    // Metadata for image at 'currIndex', or null.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>    GIFImageMetadata imageMetadata = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>    // A List of Longs indicating the stream positions of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>    // start of the metadata for each image.  Entries are added</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>    // as needed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>    List imageStartPosition = new ArrayList();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>    // Length of metadata for image at 'currIndex', valid only if</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>    // imageMetadata != null.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>    int imageMetadataLength;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>    // The number of images in the stream, if known, otherwise -1.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>    int numImages = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>    // Variables used by the LZW decoding process</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>    byte[] block = new byte[255];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>    int blockLength = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>    int bitPos = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>    int nextByte = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>    int initCodeSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>    int clearCode;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>    int eofCode;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>    // 32-bit lookahead buffer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>    int next32Bits = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>    // Try if the end of the data blocks has been found,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>    // and we are simply draining the 32-bit buffer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>    boolean lastBlockFound = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>    // The image to be written.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>    BufferedImage theImage = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>    // The image's tile.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>    WritableRaster theTile = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>    // The image dimensions (from the stream).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>    int width = -1, height = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>    // The pixel currently being decoded (in the stream's coordinates).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>    int streamX = -1, streamY = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>    // The number of rows decoded</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>    int rowsDone = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>    // The current interlace pass, starting with 0.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>    int interlacePass = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>    private byte[] fallbackColorTable = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>    // End per-stream settings</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>    // Constants used to control interlacing.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>    static final int[] interlaceIncrement = { 8, 8, 4, 2, -1 };</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>    static final int[] interlaceOffset = { 0, 4, 2, 1, -1 };</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>    public GIFImageReader(ImageReaderSpi originatingProvider) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>        super(originatingProvider);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>    // Take input from an ImageInputStream</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>    public void setInput(Object input,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>                         boolean seekForwardOnly,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>                         boolean ignoreMetadata) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>        super.setInput(input, seekForwardOnly, ignoreMetadata);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>        if (input != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>            if (!(input instanceof ImageInputStream)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>                throw new IllegalArgumentException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>                    (&quot;input not an ImageInputStream!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>            this.stream = (ImageInputStream)input;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>            this.stream = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>        // Clear all values based on the previous stream contents</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>        resetStreamSettings();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>    public int getNumImages(boolean allowSearch) throws IIOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>        if (stream == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>            throw new IllegalStateException(&quot;Input not set!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>        if (seekForwardOnly &amp;&amp; allowSearch) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>            throw new IllegalStateException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>                (&quot;seekForwardOnly and allowSearch can't both be true!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>        if (numImages &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>            return numImages;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>        if (allowSearch) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>            this.numImages = locateImage(Integer.MAX_VALUE) + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>        return numImages;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>    // Throw an IndexOutOfBoundsException if index &lt; minIndex,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>    // and bump minIndex if required.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>    private void checkIndex(int imageIndex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>        if (imageIndex &lt; minIndex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>            throw new IndexOutOfBoundsException(&quot;imageIndex &lt; minIndex!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>        if (seekForwardOnly) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>            minIndex = imageIndex;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>    public int getWidth(int imageIndex) throws IIOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>        checkIndex(imageIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>        int index = locateImage(imageIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>        if (index != imageIndex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>            throw new IndexOutOfBoundsException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>        readMetadata();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>        return imageMetadata.imageWidth;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>    public int getHeight(int imageIndex) throws IIOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>        checkIndex(imageIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>        int index = locateImage(imageIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>        if (index != imageIndex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>            throw new IndexOutOfBoundsException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>        readMetadata();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>        return imageMetadata.imageHeight;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>    // We don't check all parameters as ImageTypeSpecifier.createIndexed do</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>    // since this method is private and we pass consistent data here</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>    private ImageTypeSpecifier createIndexed(byte[] r, byte[] g, byte[] b,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>                                             int bits) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>        ColorModel colorModel;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>        if (imageMetadata.transparentColorFlag) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>            // Some files erroneously have a transparent color index</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>            // of 255 even though there are fewer than 256 colors.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>            int idx = Math.min(imageMetadata.transparentColorIndex,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>                    r.length - 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>            colorModel = new IndexColorModel(bits, r.length, r, g, b, idx);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>            colorModel = new IndexColorModel(bits, r.length, r, g, b);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>        SampleModel sampleModel;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>        if (bits == 8) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>            int[] bandOffsets = {0};</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>            sampleModel =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>                    new PixelInterleavedSampleModel(DataBuffer.TYPE_BYTE,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>                    1, 1, 1, 1,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>                    bandOffsets);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>            sampleModel =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>                    new MultiPixelPackedSampleModel(DataBuffer.TYPE_BYTE,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>                    1, 1, bits);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>        return new ImageTypeSpecifier(colorModel, sampleModel);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>    public Iterator getImageTypes(int imageIndex) throws IIOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>        checkIndex(imageIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>        int index = locateImage(imageIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>        if (index != imageIndex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>            throw new IndexOutOfBoundsException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>        readMetadata();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>        List l = new ArrayList(1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>        byte[] colorTable;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>        if (imageMetadata.localColorTable != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>            colorTable = imageMetadata.localColorTable;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>            fallbackColorTable = imageMetadata.localColorTable;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>            colorTable = streamMetadata.globalColorTable;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>        if (colorTable == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>            if (fallbackColorTable == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>                this.processWarningOccurred(&quot;Use default color table.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>                // no color table, the spec allows to use any palette.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>                fallbackColorTable = getDefaultPalette();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>            colorTable = fallbackColorTable;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>        // Normalize color table length to 2^1, 2^2, 2^4, or 2^8</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>        int length = colorTable.length/3;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>        int bits;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>        if (length == 2) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>            bits = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>        } else if (length == 4) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>            bits = 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>        } else if (length == 8 || length == 16) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>            // Bump from 3 to 4 bits</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>            bits = 4;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>            // Bump to 8 bits</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>            bits = 8;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>        int lutLength = 1 &lt;&lt; bits;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>        byte[] r = new byte[lutLength];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>        byte[] g = new byte[lutLength];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>        byte[] b = new byte[lutLength];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>        // Entries from length + 1 to lutLength - 1 will be 0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>        int rgbIndex = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>            r[i] = colorTable[rgbIndex++];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>            g[i] = colorTable[rgbIndex++];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>            b[i] = colorTable[rgbIndex++];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>        l.add(createIndexed(r, g, b, bits));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>        return l.iterator();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>    public ImageReadParam getDefaultReadParam() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>        return new ImageReadParam();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>    public IIOMetadata getStreamMetadata() throws IIOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>        readHeader();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>        return streamMetadata;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>    public IIOMetadata getImageMetadata(int imageIndex) throws IIOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>        checkIndex(imageIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>        int index = locateImage(imageIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>        if (index != imageIndex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>            throw new IndexOutOfBoundsException(&quot;Bad image index!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>        readMetadata();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>        return imageMetadata;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>    // BEGIN LZW STUFF</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>    private void initNext32Bits() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>        next32Bits = block[0] &amp; 0xff;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>        next32Bits |= (block[1] &amp; 0xff) &lt;&lt; 8;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>        next32Bits |= (block[2] &amp; 0xff) &lt;&lt; 16;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>        next32Bits |= block[3] &lt;&lt; 24;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>        nextByte = 4;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>    // Load a block (1-255 bytes) at a time, and maintain</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>    // a 32-bit lookahead buffer that is filled from the left</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>    // and extracted from the right.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>    // When the last block is found, we continue to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>    //</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>    private int getCode(int codeSize, int codeMask) throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>        if (bitPos + codeSize &gt; 32) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>            return eofCode; // No more data available</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>        int code = (next32Bits &gt;&gt; bitPos) &amp; codeMask;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>        bitPos += codeSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>        // Shift in a byte of new data at a time</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>        while (bitPos &gt;= 8 &amp;&amp; !lastBlockFound) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>            next32Bits &gt;&gt;&gt;= 8;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>            bitPos -= 8;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>            // Check if current block is out of bytes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>            if (nextByte &gt;= blockLength) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>                // Get next block size</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>                blockLength = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>                if (blockLength == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>                    lastBlockFound = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>                    return code;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>                    int left = blockLength;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>                    int off = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>                    while (left &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>                        int nbytes = stream.read(block, off, left);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>                        off += nbytes;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>                        left -= nbytes;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>                    nextByte = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>            next32Bits |= block[nextByte++] &lt;&lt; 24;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>        return code;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>    public void initializeStringTable(int[] prefix,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>                                      byte[] suffix,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>                                      byte[] initial,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>                                      int[] length) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>        int numEntries = 1 &lt;&lt; initCodeSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; numEntries; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>            prefix[i] = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>            suffix[i] = (byte)i;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>            initial[i] = (byte)i;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>            length[i] = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>        // Fill in the entire table for robustness against</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>        // out-of-sequence codes.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>        for (int i = numEntries; i &lt; 4096; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>            prefix[i] = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>            length[i] = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>        // tableIndex = numEntries + 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>        // codeSize = initCodeSize + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>        // codeMask = (1 &lt;&lt; codeSize) - 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>    Rectangle sourceRegion;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>    int sourceXSubsampling;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>    int sourceYSubsampling;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>    int sourceMinProgressivePass;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>    int sourceMaxProgressivePass;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>    Point destinationOffset;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>    Rectangle destinationRegion;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>    // Used only if IIOReadUpdateListeners are present</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>    int updateMinY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>    int updateYStep;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>    boolean decodeThisRow = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>    int destY = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>    byte[] rowBuf;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>    private void outputRow() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>        // Clip against ImageReadParam</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>        int width = Math.min(sourceRegion.width,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>                             destinationRegion.width*sourceXSubsampling);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>        int destX = destinationRegion.x;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>        if (sourceXSubsampling == 1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>            theTile.setDataElements(destX, destY, width, 1, rowBuf);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>            for (int x = 0; x &lt; width; x += sourceXSubsampling, destX++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>                theTile.setSample(destX, destY, 0, rowBuf[x] &amp; 0xff);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>        // Update IIOReadUpdateListeners, if any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>        if (updateListeners != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>            int[] bands = { 0 };</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>            // updateYStep will have been initialized if</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>            // updateListeners is non-null</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>            processImageUpdate(theImage,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>                               destX, destY,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>                               width, 1, 1, updateYStep,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>                               bands);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>    private void computeDecodeThisRow() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>        this.decodeThisRow =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>            (destY &lt; destinationRegion.y + destinationRegion.height) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>            (streamY &gt;= sourceRegion.y) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>            (streamY &lt; sourceRegion.y + sourceRegion.height) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>            (((streamY - sourceRegion.y) % sourceYSubsampling) == 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>    private void outputPixels(byte[] string, int len) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>        if (interlacePass &lt; sourceMinProgressivePass ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>            interlacePass &gt; sourceMaxProgressivePass) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; len; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>            if (streamX &gt;= sourceRegion.x) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>                rowBuf[streamX - sourceRegion.x] = string[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>            // Process end-of-row</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>            ++streamX;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>            if (streamX == width) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>                // Update IIOReadProgressListeners</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>                ++rowsDone;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>                processImageProgress(100.0F*rowsDone/height);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>                if (decodeThisRow) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>                    outputRow();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>                streamX = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>                if (imageMetadata.interlaceFlag) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>                    streamY += interlaceIncrement[interlacePass];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>                    if (streamY &gt;= height) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>                        // Inform IIOReadUpdateListeners of end of pass</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>                        if (updateListeners != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>                            processPassComplete(theImage);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>                        ++interlacePass;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>                        if (interlacePass &gt; sourceMaxProgressivePass) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>                            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>                        streamY = interlaceOffset[interlacePass];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>                        startPass(interlacePass);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>                    ++streamY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>                // Determine whether pixels from this row will</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>                // be written to the destination</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>                this.destY = destinationRegion.y +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>                    (streamY - sourceRegion.y)/sourceYSubsampling;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>                computeDecodeThisRow();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>    // END LZW STUFF</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>    private void readHeader() throws IIOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>        if (gotHeader) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>        if (stream == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>            throw new IllegalStateException(&quot;Input not set!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>        // Create an object to store the stream metadata</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>        this.streamMetadata = new GIFStreamMetadata();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>            stream.setByteOrder(ByteOrder.LITTLE_ENDIAN);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>            byte[] signature = new byte[6];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>            stream.readFully(signature);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>            StringBuffer version = new StringBuffer(3);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>            version.append((char)signature[3]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>            version.append((char)signature[4]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>            version.append((char)signature[5]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>            streamMetadata.version = version.toString();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>            streamMetadata.logicalScreenWidth = stream.readUnsignedShort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>            streamMetadata.logicalScreenHeight = stream.readUnsignedShort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>            int packedFields = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>            boolean globalColorTableFlag = (packedFields &amp; 0x80) != 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>            streamMetadata.colorResolution = ((packedFields &gt;&gt; 4) &amp; 0x7) + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>            streamMetadata.sortFlag = (packedFields &amp; 0x8) != 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>            int numGCTEntries = 1 &lt;&lt; ((packedFields &amp; 0x7) + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>            streamMetadata.backgroundColorIndex = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>            streamMetadata.pixelAspectRatio = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>            if (globalColorTableFlag) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>                streamMetadata.globalColorTable = new byte[3*numGCTEntries];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>                stream.readFully(streamMetadata.globalColorTable);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>                streamMetadata.globalColorTable = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>            // Found position of metadata for image 0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>            imageStartPosition.add(Long.valueOf(stream.getStreamPosition()));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>        } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>            throw new IIOException(&quot;I/O error reading header!&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>        gotHeader = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre>    private boolean skipImage() throws IIOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>        // Stream must be at the beginning of an image descriptor</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>        // upon exit</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>            while (true) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>                int blockType = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>                if (blockType == 0x2c) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>                    stream.skipBytes(8);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>                    int packedFields = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>                    if ((packedFields &amp; 0x80) != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>                        // Skip color table if any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>                        int bits = (packedFields &amp; 0x7) + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>                        stream.skipBytes(3*(1 &lt;&lt; bits));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>                    stream.skipBytes(1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>                    int length = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre>                    do {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>                        length = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>                        stream.skipBytes(length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>                    } while (length &gt; 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre>                    return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>                } else if (blockType == 0x3b) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre>                    return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>                } else if (blockType == 0x21) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>                    int label = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>                    int length = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>                    do {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>                        length = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>                        stream.skipBytes(length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>                    } while (length &gt; 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>                } else if (blockType == 0x0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>                    // EOF</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>                    return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>                    int length = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>                    do {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>                        length = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>                        stream.skipBytes(length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre>                    } while (length &gt; 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>        } catch (EOFException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>            return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>        } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>            throw new IIOException(&quot;I/O error locating image!&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>    private int locateImage(int imageIndex) throws IIOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>        readHeader();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>            // Find closest known index</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>            int index = Math.min(imageIndex, imageStartPosition.size() - 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>            // Seek to that position</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>            Long l = (Long)imageStartPosition.get(index);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>            stream.seek(l.longValue());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>            // Skip images until at desired index or last image found</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>            while (index &lt; imageIndex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>                if (!skipImage()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>                    --index;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>                    return index;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>                Long l1 = new Long(stream.getStreamPosition());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>                imageStartPosition.add(l1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>                ++index;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre>        } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>            throw new IIOException(&quot;Couldn't seek!&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>        if (currIndex != imageIndex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>            imageMetadata = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre>        currIndex = imageIndex;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>        return imageIndex;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>    // Read blocks of 1-255 bytes, stop at a 0-length block</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre>    private byte[] concatenateBlocks() throws IOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>        byte[] data = new byte[0];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>        while (true) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre>            int length = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>            if (length == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>            byte[] newData = new byte[data.length + length];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>            System.arraycopy(data, 0, newData, 0, data.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>            stream.readFully(newData, data.length, length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>            data = newData;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>        return data;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>    // Stream must be positioned at start of metadata for 'currIndex'</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>    private void readMetadata() throws IIOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>        if (stream == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>            throw new IllegalStateException(&quot;Input not set!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre>            // Create an object to store the image metadata</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>            this.imageMetadata = new GIFImageMetadata();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>            long startPosition = stream.getStreamPosition();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>            while (true) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>                int blockType = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre>                if (blockType == 0x2c) { // Image Descriptor</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>                    imageMetadata.imageLeftPosition =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre>                        stream.readUnsignedShort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>                    imageMetadata.imageTopPosition =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre>                        stream.readUnsignedShort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>                    imageMetadata.imageWidth = stream.readUnsignedShort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre>                    imageMetadata.imageHeight = stream.readUnsignedShort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>                    int idPackedFields = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre>                    boolean localColorTableFlag =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>                        (idPackedFields &amp; 0x80) != 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>                    imageMetadata.interlaceFlag = (idPackedFields &amp; 0x40) != 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>                    imageMetadata.sortFlag = (idPackedFields &amp; 0x20) != 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>                    int numLCTEntries = 1 &lt;&lt; ((idPackedFields &amp; 0x7) + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre>                    if (localColorTableFlag) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre>                        // Read color table if any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>                        imageMetadata.localColorTable =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>                            new byte[3*numLCTEntries];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre>                        stream.readFully(imageMetadata.localColorTable);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre>                    } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre>                        imageMetadata.localColorTable = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre>                    // Record length of this metadata block</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre>                    this.imageMetadataLength =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>                        (int)(stream.getStreamPosition() - startPosition);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre>                    // Now positioned at start of LZW-compressed pixels</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre>                    return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>                } else if (blockType == 0x21) { // Extension block</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre>                    int label = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre>                    if (label == 0xf9) { // Graphics Control Extension</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre>                        int gceLength = stream.readUnsignedByte(); // 4</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre>                        int gcePackedFields = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre>                        imageMetadata.disposalMethod =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>                            (gcePackedFields &gt;&gt; 2) &amp; 0x3;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre>                        imageMetadata.userInputFlag =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre>                            (gcePackedFields &amp; 0x2) != 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>                        imageMetadata.transparentColorFlag =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre>                            (gcePackedFields &amp; 0x1) != 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>                        imageMetadata.delayTime = stream.readUnsignedShort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>                        imageMetadata.transparentColorIndex</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre>                            = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>                        int terminator = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre>                    } else if (label == 0x1) { // Plain text extension</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre>                        int length = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>                        imageMetadata.hasPlainTextExtension = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre>                        imageMetadata.textGridLeft =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre>                            stream.readUnsignedShort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre>                        imageMetadata.textGridTop =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre>                            stream.readUnsignedShort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre>                        imageMetadata.textGridWidth =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="719" href="#"></a></td>
+<td><pre>                            stream.readUnsignedShort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="720" href="#"></a></td>
+<td><pre>                        imageMetadata.textGridHeight =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="721" href="#"></a></td>
+<td><pre>                            stream.readUnsignedShort();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="722" href="#"></a></td>
+<td><pre>                        imageMetadata.characterCellWidth =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="723" href="#"></a></td>
+<td><pre>                            stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="724" href="#"></a></td>
+<td><pre>                        imageMetadata.characterCellHeight =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="725" href="#"></a></td>
+<td><pre>                            stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="726" href="#"></a></td>
+<td><pre>                        imageMetadata.textForegroundColor =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="727" href="#"></a></td>
+<td><pre>                            stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="728" href="#"></a></td>
+<td><pre>                        imageMetadata.textBackgroundColor =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="729" href="#"></a></td>
+<td><pre>                            stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="730" href="#"></a></td>
+<td><pre>                        imageMetadata.text = concatenateBlocks();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="731" href="#"></a></td>
+<td><pre>                    } else if (label == 0xfe) { // Comment extension</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="732" href="#"></a></td>
+<td><pre>                        byte[] comment = concatenateBlocks();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="733" href="#"></a></td>
+<td><pre>                        if (imageMetadata.comments == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="734" href="#"></a></td>
+<td><pre>                            imageMetadata.comments = new ArrayList();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="735" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="736" href="#"></a></td>
+<td><pre>                        imageMetadata.comments.add(comment);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="737" href="#"></a></td>
+<td><pre>                    } else if (label == 0xff) { // Application extension</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="738" href="#"></a></td>
+<td><pre>                        int blockSize = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="739" href="#"></a></td>
+<td><pre>                        byte[] applicationID = new byte[8];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="740" href="#"></a></td>
+<td><pre>                        byte[] authCode = new byte[3];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="741" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="742" href="#"></a></td>
+<td><pre>                        // read available data</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="743" href="#"></a></td>
+<td><pre>                        byte[] blockData = new byte[blockSize];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="744" href="#"></a></td>
+<td><pre>                        stream.readFully(blockData);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="745" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="746" href="#"></a></td>
+<td><pre>                        int offset = copyData(blockData, 0, applicationID);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="747" href="#"></a></td>
+<td><pre>                        offset = copyData(blockData, offset, authCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="748" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="749" href="#"></a></td>
+<td><pre>                        byte[] applicationData = concatenateBlocks();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="750" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="751" href="#"></a></td>
+<td><pre>                        if (offset &lt; blockSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="752" href="#"></a></td>
+<td><pre>                            int len = blockSize - offset;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="753" href="#"></a></td>
+<td><pre>                            byte[] data =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="754" href="#"></a></td>
+<td><pre>                                new byte[len + applicationData.length];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="755" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="756" href="#"></a></td>
+<td><pre>                            System.arraycopy(blockData, offset, data, 0, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="757" href="#"></a></td>
+<td><pre>                            System.arraycopy(applicationData, 0, data, len,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="758" href="#"></a></td>
+<td><pre>                                             applicationData.length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="759" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="760" href="#"></a></td>
+<td><pre>                            applicationData = data;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="761" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="762" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="763" href="#"></a></td>
+<td><pre>                        // Init lists if necessary</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="764" href="#"></a></td>
+<td><pre>                        if (imageMetadata.applicationIDs == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="765" href="#"></a></td>
+<td><pre>                            imageMetadata.applicationIDs = new ArrayList();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="766" href="#"></a></td>
+<td><pre>                            imageMetadata.authenticationCodes =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="767" href="#"></a></td>
+<td><pre>                                new ArrayList();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="768" href="#"></a></td>
+<td><pre>                            imageMetadata.applicationData = new ArrayList();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="769" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="770" href="#"></a></td>
+<td><pre>                        imageMetadata.applicationIDs.add(applicationID);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="771" href="#"></a></td>
+<td><pre>                        imageMetadata.authenticationCodes.add(authCode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="772" href="#"></a></td>
+<td><pre>                        imageMetadata.applicationData.add(applicationData);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="773" href="#"></a></td>
+<td><pre>                    } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="774" href="#"></a></td>
+<td><pre>                        // Skip over unknown extension blocks</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="775" href="#"></a></td>
+<td><pre>                        int length = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="776" href="#"></a></td>
+<td><pre>                        do {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="777" href="#"></a></td>
+<td><pre>                            length = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="778" href="#"></a></td>
+<td><pre>                            stream.skipBytes(length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="779" href="#"></a></td>
+<td><pre>                        } while (length &gt; 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="780" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="781" href="#"></a></td>
+<td><pre>                } else if (blockType == 0x3b) { // Trailer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="782" href="#"></a></td>
+<td><pre>                    throw new IndexOutOfBoundsException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="783" href="#"></a></td>
+<td><pre>                        (&quot;Attempt to read past end of image sequence!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="784" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="785" href="#"></a></td>
+<td><pre>                    throw new IIOException(&quot;Unexpected block type &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="786" href="#"></a></td>
+<td><pre>                                           blockType + &quot;!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="787" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="788" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="789" href="#"></a></td>
+<td><pre>        } catch (IIOException iioe) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="790" href="#"></a></td>
+<td><pre>            throw iioe;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="791" href="#"></a></td>
+<td><pre>        } catch (IOException ioe) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="792" href="#"></a></td>
+<td><pre>            throw new IIOException(&quot;I/O error reading image metadata!&quot;, ioe);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="793" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="794" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="795" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="796" href="#"></a></td>
+<td><pre>    private int copyData(byte[] src, int offset, byte[] dst) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="797" href="#"></a></td>
+<td><pre>        int len = dst.length;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="798" href="#"></a></td>
+<td><pre>        int rest = src.length - offset;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="799" href="#"></a></td>
+<td><pre>        if (len &gt; rest) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="800" href="#"></a></td>
+<td><pre>            len = rest;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="801" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="802" href="#"></a></td>
+<td><pre>        System.arraycopy(src, offset, dst, 0, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="803" href="#"></a></td>
+<td><pre>        return offset + len;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="804" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="805" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="806" href="#"></a></td>
+<td><pre>    private void startPass(int pass) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="807" href="#"></a></td>
+<td><pre>        if (updateListeners == null || !imageMetadata.interlaceFlag) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="808" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="809" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="810" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="811" href="#"></a></td>
+<td><pre>        int y = interlaceOffset[interlacePass];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="812" href="#"></a></td>
+<td><pre>        int yStep = interlaceIncrement[interlacePass];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="813" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="814" href="#"></a></td>
+<td><pre>        int[] vals = ReaderUtil.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="815" href="#"></a></td>
+<td><pre>            computeUpdatedPixels(sourceRegion,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="816" href="#"></a></td>
+<td><pre>                                 destinationOffset,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="817" href="#"></a></td>
+<td><pre>                                 destinationRegion.x,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="818" href="#"></a></td>
+<td><pre>                                 destinationRegion.y,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="819" href="#"></a></td>
+<td><pre>                                 destinationRegion.x +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="820" href="#"></a></td>
+<td><pre>                                 destinationRegion.width - 1,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="821" href="#"></a></td>
+<td><pre>                                 destinationRegion.y +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="822" href="#"></a></td>
+<td><pre>                                 destinationRegion.height - 1,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="823" href="#"></a></td>
+<td><pre>                                 sourceXSubsampling,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="824" href="#"></a></td>
+<td><pre>                                 sourceYSubsampling,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="825" href="#"></a></td>
+<td><pre>                                 0,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="826" href="#"></a></td>
+<td><pre>                                 y,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="827" href="#"></a></td>
+<td><pre>                                 destinationRegion.width,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="828" href="#"></a></td>
+<td><pre>                                 (destinationRegion.height + yStep - 1)/yStep,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="829" href="#"></a></td>
+<td><pre>                                 1,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="830" href="#"></a></td>
+<td><pre>                                 yStep);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="831" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="832" href="#"></a></td>
+<td><pre>        // Initialized updateMinY and updateYStep</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="833" href="#"></a></td>
+<td><pre>        this.updateMinY = vals[1];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="834" href="#"></a></td>
+<td><pre>        this.updateYStep = vals[5];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="835" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="836" href="#"></a></td>
+<td><pre>        // Inform IIOReadUpdateListeners of new pass</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="837" href="#"></a></td>
+<td><pre>        int[] bands = { 0 };</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="838" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="839" href="#"></a></td>
+<td><pre>        processPassStarted(theImage,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="840" href="#"></a></td>
+<td><pre>                           interlacePass,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="841" href="#"></a></td>
+<td><pre>                           sourceMinProgressivePass,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="842" href="#"></a></td>
+<td><pre>                           sourceMaxProgressivePass,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="843" href="#"></a></td>
+<td><pre>                           0,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="844" href="#"></a></td>
+<td><pre>                           updateMinY,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="845" href="#"></a></td>
+<td><pre>                           1,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="846" href="#"></a></td>
+<td><pre>                           updateYStep,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="847" href="#"></a></td>
+<td><pre>                           bands);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="848" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="849" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="850" href="#"></a></td>
+<td><pre>    public BufferedImage read(int imageIndex, ImageReadParam param)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="851" href="#"></a></td>
+<td><pre>        throws IIOException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="852" href="#"></a></td>
+<td><pre>        if (stream == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="853" href="#"></a></td>
+<td><pre>            throw new IllegalStateException(&quot;Input not set!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="854" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="855" href="#"></a></td>
+<td><pre>        checkIndex(imageIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="856" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="857" href="#"></a></td>
+<td><pre>        int index = locateImage(imageIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="858" href="#"></a></td>
+<td><pre>        if (index != imageIndex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="859" href="#"></a></td>
+<td><pre>            throw new IndexOutOfBoundsException(&quot;imageIndex out of bounds!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="860" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="861" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="862" href="#"></a></td>
+<td><pre>        clearAbortRequest();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="863" href="#"></a></td>
+<td><pre>        readMetadata();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="864" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="865" href="#"></a></td>
+<td><pre>        // A null ImageReadParam means we use the default</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="866" href="#"></a></td>
+<td><pre>        if (param == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="867" href="#"></a></td>
+<td><pre>            param = getDefaultReadParam();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="868" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="869" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="870" href="#"></a></td>
+<td><pre>        // Initialize the destination image</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="871" href="#"></a></td>
+<td><pre>        Iterator imageTypes = getImageTypes(imageIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="872" href="#"></a></td>
+<td><pre>        this.theImage = getDestination(param,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="873" href="#"></a></td>
+<td><pre>                                       imageTypes,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="874" href="#"></a></td>
+<td><pre>                                       imageMetadata.imageWidth,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="875" href="#"></a></td>
+<td><pre>                                       imageMetadata.imageHeight);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="876" href="#"></a></td>
+<td><pre>        this.theTile = theImage.getWritableTile(0, 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="877" href="#"></a></td>
+<td><pre>        this.width = imageMetadata.imageWidth;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="878" href="#"></a></td>
+<td><pre>        this.height = imageMetadata.imageHeight;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="879" href="#"></a></td>
+<td><pre>        this.streamX = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="880" href="#"></a></td>
+<td><pre>        this.streamY = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="881" href="#"></a></td>
+<td><pre>        this.rowsDone = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="882" href="#"></a></td>
+<td><pre>        this.interlacePass = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="883" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="884" href="#"></a></td>
+<td><pre>        // Get source region, taking subsampling offsets into account,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="885" href="#"></a></td>
+<td><pre>        // and clipping against the true source bounds</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="886" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="887" href="#"></a></td>
+<td><pre>        this.sourceRegion = new Rectangle(0, 0, 0, 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="888" href="#"></a></td>
+<td><pre>        this.destinationRegion = new Rectangle(0, 0, 0, 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="889" href="#"></a></td>
+<td><pre>        computeRegions(param, width, height, theImage,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="890" href="#"></a></td>
+<td><pre>                       sourceRegion, destinationRegion);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="891" href="#"></a></td>
+<td><pre>        this.destinationOffset = new Point(destinationRegion.x,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="892" href="#"></a></td>
+<td><pre>                                           destinationRegion.y);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="893" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="894" href="#"></a></td>
+<td><pre>        this.sourceXSubsampling = param.getSourceXSubsampling();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="895" href="#"></a></td>
+<td><pre>        this.sourceYSubsampling = param.getSourceYSubsampling();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="896" href="#"></a></td>
+<td><pre>        this.sourceMinProgressivePass =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="897" href="#"></a></td>
+<td><pre>            Math.max(param.getSourceMinProgressivePass(), 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="898" href="#"></a></td>
+<td><pre>        this.sourceMaxProgressivePass =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="899" href="#"></a></td>
+<td><pre>            Math.min(param.getSourceMaxProgressivePass(), 3);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="900" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="901" href="#"></a></td>
+<td><pre>        this.destY = destinationRegion.y +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="902" href="#"></a></td>
+<td><pre>            (streamY - sourceRegion.y)/sourceYSubsampling;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="903" href="#"></a></td>
+<td><pre>        computeDecodeThisRow();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="904" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="905" href="#"></a></td>
+<td><pre>        // Inform IIOReadProgressListeners of start of image</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="906" href="#"></a></td>
+<td><pre>        processImageStarted(imageIndex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="907" href="#"></a></td>
+<td><pre>        startPass(0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="908" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="909" href="#"></a></td>
+<td><pre>        this.rowBuf = new byte[width];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="910" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="911" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="912" href="#"></a></td>
+<td><pre>            // Read and decode the image data, fill in theImage</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="913" href="#"></a></td>
+<td><pre>            this.initCodeSize = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="914" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="915" href="#"></a></td>
+<td><pre>            // Read first data block</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="916" href="#"></a></td>
+<td><pre>            this.blockLength = stream.readUnsignedByte();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="917" href="#"></a></td>
+<td><pre>            int left = blockLength;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="918" href="#"></a></td>
+<td><pre>            int off = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="919" href="#"></a></td>
+<td><pre>            while (left &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="920" href="#"></a></td>
+<td><pre>                int nbytes = stream.read(block, off, left);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="921" href="#"></a></td>
+<td><pre>                left -= nbytes;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="922" href="#"></a></td>
+<td><pre>                off += nbytes;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="923" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="924" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="925" href="#"></a></td>
+<td><pre>            this.bitPos = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="926" href="#"></a></td>
+<td><pre>            this.nextByte = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="927" href="#"></a></td>
+<td><pre>            this.lastBlockFound = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="928" href="#"></a></td>
+<td><pre>            this.interlacePass = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="929" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="930" href="#"></a></td>
+<td><pre>            // Init 32-bit buffer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="931" href="#"></a></td>
+<td><pre>            initNext32Bits();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="932" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="933" href="#"></a></td>
+<td><pre>            this.clearCode = 1 &lt;&lt; initCodeSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="934" href="#"></a></td>
+<td><pre>            this.eofCode = clearCode + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="935" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="936" href="#"></a></td>
+<td><pre>            int code, oldCode = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="937" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="938" href="#"></a></td>
+<td><pre>            int[] prefix = new int[4096];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="939" href="#"></a></td>
+<td><pre>            byte[] suffix = new byte[4096];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="940" href="#"></a></td>
+<td><pre>            byte[] initial = new byte[4096];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="941" href="#"></a></td>
+<td><pre>            int[] length = new int[4096];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="942" href="#"></a></td>
+<td><pre>            byte[] string = new byte[4096];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="943" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="944" href="#"></a></td>
+<td><pre>            initializeStringTable(prefix, suffix, initial, length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="945" href="#"></a></td>
+<td><pre>            int tableIndex = (1 &lt;&lt; initCodeSize) + 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="946" href="#"></a></td>
+<td><pre>            int codeSize = initCodeSize + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="947" href="#"></a></td>
+<td><pre>            int codeMask = (1 &lt;&lt; codeSize) - 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="948" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="949" href="#"></a></td>
+<td><pre>            while (!abortRequested()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="950" href="#"></a></td>
+<td><pre>                code = getCode(codeSize, codeMask);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="951" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="952" href="#"></a></td>
+<td><pre>                if (code == clearCode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="953" href="#"></a></td>
+<td><pre>                    initializeStringTable(prefix, suffix, initial, length);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="954" href="#"></a></td>
+<td><pre>                    tableIndex = (1 &lt;&lt; initCodeSize) + 2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="955" href="#"></a></td>
+<td><pre>                    codeSize = initCodeSize + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="956" href="#"></a></td>
+<td><pre>                    codeMask = (1 &lt;&lt; codeSize) - 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="957" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="958" href="#"></a></td>
+<td><pre>                    code = getCode(codeSize, codeMask);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="959" href="#"></a></td>
+<td><pre>                    if (code == eofCode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="960" href="#"></a></td>
+<td><pre>                        // Inform IIOReadProgressListeners of end of image</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="961" href="#"></a></td>
+<td><pre>                        processImageComplete();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="962" href="#"></a></td>
+<td><pre>                        return theImage;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="963" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="964" href="#"></a></td>
+<td><pre>                } else if (code == eofCode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="965" href="#"></a></td>
+<td><pre>                    // Inform IIOReadProgressListeners of end of image</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="966" href="#"></a></td>
+<td><pre>                    processImageComplete();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="967" href="#"></a></td>
+<td><pre>                    return theImage;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="968" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="969" href="#"></a></td>
+<td><pre>                    int newSuffixIndex;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="970" href="#"></a></td>
+<td><pre>                    if (code &lt; tableIndex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="971" href="#"></a></td>
+<td><pre>                        newSuffixIndex = code;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="972" href="#"></a></td>
+<td><pre>                    } else { // code == tableIndex</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="973" href="#"></a></td>
+<td><pre>                        newSuffixIndex = oldCode;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="974" href="#"></a></td>
+<td><pre>                        if (code != tableIndex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="975" href="#"></a></td>
+<td><pre>                            // warning - code out of sequence</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="976" href="#"></a></td>
+<td><pre>                            // possibly data corruption</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="977" href="#"></a></td>
+<td><pre>                            processWarningOccurred(&quot;Out-of-sequence code!&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="978" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="979" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="980" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="981" href="#"></a></td>
+<td><pre>                    int ti = tableIndex;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="982" href="#"></a></td>
+<td><pre>                    int oc = oldCode;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="983" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="984" href="#"></a></td>
+<td><pre>                    prefix[ti] = oc;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="985" href="#"></a></td>
+<td><pre>                    suffix[ti] = initial[newSuffixIndex];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="986" href="#"></a></td>
+<td><pre>                    initial[ti] = initial[oc];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="987" href="#"></a></td>
+<td><pre>                    length[ti] = length[oc] + 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="988" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="989" href="#"></a></td>
+<td><pre>                    ++tableIndex;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="990" href="#"></a></td>
+<td><pre>                    if ((tableIndex == (1 &lt;&lt; codeSize)) &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="991" href="#"></a></td>
+<td><pre>                        (tableIndex &lt; 4096)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="992" href="#"></a></td>
+<td><pre>                        ++codeSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="993" href="#"></a></td>
+<td><pre>                        codeMask = (1 &lt;&lt; codeSize) - 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="994" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="995" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="996" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="997" href="#"></a></td>
+<td><pre>                // Reverse code</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="998" href="#"></a></td>
+<td><pre>                int c = code;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="999" href="#"></a></td>
+<td><pre>                int len = length[c];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1000" href="#"></a></td>
+<td><pre>                for (int i = len - 1; i &gt;= 0; i--) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1001" href="#"></a></td>
+<td><pre>                    string[i] = suffix[c];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1002" href="#"></a></td>
+<td><pre>                    c = prefix[c];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1003" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1004" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1005" href="#"></a></td>
+<td><pre>                outputPixels(string, len);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1006" href="#"></a></td>
+<td><pre>                oldCode = code;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1007" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1008" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1009" href="#"></a></td>
+<td><pre>            processReadAborted();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1010" href="#"></a></td>
+<td><pre>            return theImage;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1011" href="#"></a></td>
+<td><pre>        } catch (IOException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1012" href="#"></a></td>
+<td><pre>            e.printStackTrace();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1013" href="#"></a></td>
+<td><pre>            throw new IIOException(&quot;I/O error reading image!&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1014" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1015" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1016" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1017" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1018" href="#"></a></td>
+<td><pre>     * Remove all settings including global settings such as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1019" href="#"></a></td>
+<td><pre>     * &lt;code&gt;Locale&lt;/code&gt;s and listeners, as well as stream settings.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1020" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1021" href="#"></a></td>
+<td><pre>    public void reset() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1022" href="#"></a></td>
+<td><pre>        super.reset();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1023" href="#"></a></td>
+<td><pre>        resetStreamSettings();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1024" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1025" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1026" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1027" href="#"></a></td>
+<td><pre>     * Remove local settings based on parsing of a stream.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1028" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1029" href="#"></a></td>
+<td><pre>    private void resetStreamSettings() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1030" href="#"></a></td>
+<td><pre>        gotHeader = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1031" href="#"></a></td>
+<td><pre>        streamMetadata = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1032" href="#"></a></td>
+<td><pre>        currIndex = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1033" href="#"></a></td>
+<td><pre>        imageMetadata = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1034" href="#"></a></td>
+<td><pre>        imageStartPosition = new ArrayList();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1035" href="#"></a></td>
+<td><pre>        numImages = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1036" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1037" href="#"></a></td>
+<td><pre>        // No need to reinitialize 'block'</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1038" href="#"></a></td>
+<td><pre>        blockLength = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1039" href="#"></a></td>
+<td><pre>        bitPos = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1040" href="#"></a></td>
+<td><pre>        nextByte = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1041" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1042" href="#"></a></td>
+<td><pre>        next32Bits = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1043" href="#"></a></td>
+<td><pre>        lastBlockFound = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1044" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1045" href="#"></a></td>
+<td><pre>        theImage = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1046" href="#"></a></td>
+<td><pre>        theTile = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1047" href="#"></a></td>
+<td><pre>        width = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1048" href="#"></a></td>
+<td><pre>        height = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1049" href="#"></a></td>
+<td><pre>        streamX = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1050" href="#"></a></td>
+<td><pre>        streamY = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1051" href="#"></a></td>
+<td><pre>        rowsDone = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1052" href="#"></a></td>
+<td><pre>        interlacePass = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1053" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1054" href="#"></a></td>
+<td><pre>        fallbackColorTable = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1055" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1056" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1057" href="#"></a></td>
+<td><pre>    private static byte[] defaultPalette = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1058" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1059" href="#"></a></td>
+<td><pre>    private static synchronized byte[] getDefaultPalette() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1060" href="#"></a></td>
+<td><pre>        if (defaultPalette == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1061" href="#"></a></td>
+<td><pre>            BufferedImage img = new BufferedImage(1, 1,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1062" href="#"></a></td>
+<td><pre>                    BufferedImage.TYPE_BYTE_INDEXED);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1063" href="#"></a></td>
+<td><pre>            IndexColorModel icm = (IndexColorModel) img.getColorModel();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1064" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1065" href="#"></a></td>
+<td><pre>            final int size = icm.getMapSize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1066" href="#"></a></td>
+<td><pre>            byte[] r = new byte[size];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1067" href="#"></a></td>
+<td><pre>            byte[] g = new byte[size];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1068" href="#"></a></td>
+<td><pre>            byte[] b = new byte[size];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1069" href="#"></a></td>
+<td><pre>            icm.getReds(r);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1070" href="#"></a></td>
+<td><pre>            icm.getGreens(g);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1071" href="#"></a></td>
+<td><pre>            icm.getBlues(b);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1072" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1073" href="#"></a></td>
+<td><pre>            defaultPalette = new byte[size * 3];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1074" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1075" href="#"></a></td>
+<td><pre>            for (int i = 0; i &lt; size; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1076" href="#"></a></td>
+<td><pre>                defaultPalette[3 * i + 0] = r[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1077" href="#"></a></td>
+<td><pre>                defaultPalette[3 * i + 1] = g[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1078" href="#"></a></td>
+<td><pre>                defaultPalette[3 * i + 2] = b[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1079" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1080" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1081" href="#"></a></td>
+<td><pre>        return defaultPalette;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1082" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1083" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

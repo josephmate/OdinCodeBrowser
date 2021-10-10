@@ -3,725 +3,2879 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2008, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package java.lang.invoke;
-
-import sun.misc.Unsafe;
-import java.lang.reflect.Method;
-import java.util.Arrays;
-import sun.invoke.util.VerifyAccess;
-import static java.lang.invoke.MethodHandleNatives.Constants.*;
-import static java.lang.invoke.LambdaForm.*;
-import static java.lang.invoke.MethodTypeForm.*;
-import static java.lang.invoke.MethodHandleStatics.*;
-import java.lang.ref.WeakReference;
-import java.lang.reflect.Field;
-import sun.invoke.util.ValueConversions;
-import sun.invoke.util.VerifyType;
-import sun.invoke.util.Wrapper;
-
-/**
- * The flavor of method handle which implements a constant reference
- * to a class member.
- * @author jrose
- */
-class DirectMethodHandle extends MethodHandle {
-    final MemberName member;
-
-    // Constructors and factory methods in this class *must* be package scoped or private.
-    private DirectMethodHandle(MethodType mtype, LambdaForm form, MemberName member) {
-        super(mtype, form);
-        if (!member.isResolved())  throw new InternalError();
-
-        if (member.getDeclaringClass().isInterface() &amp;&amp;
-                member.isMethod() &amp;&amp; !member.isAbstract()) {
-            // Check for corner case: invokeinterface of Object method
-            MemberName m = new MemberName(Object.class, member.getName(), member.getMethodType(), member.getReferenceKind());
-            m = MemberName.getFactory().resolveOrNull(m.getReferenceKind(), m, null);
-            if (m != null &amp;&amp; m.isPublic()) {
-                member = m;
-            }
-        }
-
-        this.member = member;
-    }
-
-    // Factory methods:
-    static DirectMethodHandle make(byte refKind, Class&lt;?&gt; receiver, MemberName member) {
-        MethodType mtype = member.getMethodOrFieldType();
-        if (!member.isStatic()) {
-            if (!member.getDeclaringClass().isAssignableFrom(receiver) || member.isConstructor())
-                throw new InternalError(member.toString());
-            mtype = mtype.insertParameterTypes(0, receiver);
-        }
-        if (!member.isField()) {
-            if (refKind == REF_invokeSpecial) {
-                member = member.asSpecial();
-                LambdaForm lform = preparedLambdaForm(member);
-                return new Special(mtype, lform, member);
-            } else {
-                LambdaForm lform = preparedLambdaForm(member);
-                return new DirectMethodHandle(mtype, lform, member);
-            }
-        } else {
-            LambdaForm lform = preparedFieldLambdaForm(member);
-            if (member.isStatic()) {
-                long offset = MethodHandleNatives.staticFieldOffset(member);
-                Object base = MethodHandleNatives.staticFieldBase(member);
-                return new StaticAccessor(mtype, lform, member, base, offset);
-            } else {
-                long offset = MethodHandleNatives.objectFieldOffset(member);
-                assert(offset == (int)offset);
-                return new Accessor(mtype, lform, member, (int)offset);
-            }
-        }
-    }
-    static DirectMethodHandle make(Class&lt;?&gt; receiver, MemberName member) {
-        byte refKind = member.getReferenceKind();
-        if (refKind == REF_invokeSpecial)
-            refKind =  REF_invokeVirtual;
-        return make(refKind, receiver, member);
-    }
-    static DirectMethodHandle make(MemberName member) {
-        if (member.isConstructor())
-            return makeAllocator(member);
-        return make(member.getDeclaringClass(), member);
-    }
-    static DirectMethodHandle make(Method method) {
-        return make(method.getDeclaringClass(), new MemberName(method));
-    }
-    static DirectMethodHandle make(Field field) {
-        return make(field.getDeclaringClass(), new MemberName(field));
-    }
-    private static DirectMethodHandle makeAllocator(MemberName ctor) {
-        assert(ctor.isConstructor() &amp;&amp; ctor.getName().equals(&quot;&lt;init&gt;&quot;));
-        Class&lt;?&gt; instanceClass = ctor.getDeclaringClass();
-        ctor = ctor.asConstructor();
-        assert(ctor.isConstructor() &amp;&amp; ctor.getReferenceKind() == REF_newInvokeSpecial) : ctor;
-        MethodType mtype = ctor.getMethodType().changeReturnType(instanceClass);
-        LambdaForm lform = preparedLambdaForm(ctor);
-        MemberName init = ctor.asSpecial();
-        assert(init.getMethodType().returnType() == void.class);
-        return new Constructor(mtype, lform, ctor, init, instanceClass);
-    }
-
-    @Override
-    MethodHandle copyWith(MethodType mt, LambdaForm lf) {
-        return new DirectMethodHandle(mt, lf, member);
-    }
-
-    @Override
-    String internalProperties() {
-        return &quot;/DMH=&quot;+member.toString();
-    }
-
-    //// Implementation methods.
-    @Override
-    MethodHandle viewAsType(MethodType newType) {
-        return new DirectMethodHandle(newType, form, member);
-    }
-    @Override
-    @ForceInline
-    MemberName internalMemberName() {
-        return member;
-    }
-
-    @Override
-    MethodHandle bindArgument(int pos, char basicType, Object value) {
-        // If the member needs dispatching, do so.
-        if (pos == 0 &amp;&amp; basicType == 'L') {
-            DirectMethodHandle concrete = maybeRebind(value);
-            if (concrete != null)
-                return concrete.bindReceiver(value);
-        }
-        return super.bindArgument(pos, basicType, value);
-    }
-
-    @Override
-    MethodHandle bindReceiver(Object receiver) {
-        // If the member needs dispatching, do so.
-        DirectMethodHandle concrete = maybeRebind(receiver);
-        if (concrete != null)
-            return concrete.bindReceiver(receiver);
-        return super.bindReceiver(receiver);
-    }
-
-    private static final MemberName.Factory IMPL_NAMES = MemberName.getFactory();
-
-    private DirectMethodHandle maybeRebind(Object receiver) {
-        if (receiver != null) {
-            switch (member.getReferenceKind()) {
-            case REF_invokeInterface:
-            case REF_invokeVirtual:
-                // Pre-dispatch the member.
-                Class&lt;?&gt; concreteClass = receiver.getClass();
-                MemberName concrete = new MemberName(concreteClass, member.getName(), member.getMethodType(), REF_invokeSpecial);
-                concrete = IMPL_NAMES.resolveOrNull(REF_invokeSpecial, concrete, concreteClass);
-                if (concrete != null)
-                    return new DirectMethodHandle(type(), preparedLambdaForm(concrete), concrete);
-                break;
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Create a LF which can invoke the given method.
-     * Cache and share this structure among all methods with
-     * the same basicType and refKind.
-     */
-    private static LambdaForm preparedLambdaForm(MemberName m) {
-        assert(m.isInvocable()) : m;  // call preparedFieldLambdaForm instead
-        MethodType mtype = m.getInvocationType().basicType();
-        assert(!m.isMethodHandleInvoke() || &quot;invokeBasic&quot;.equals(m.getName())) : m;
-        int which;
-        switch (m.getReferenceKind()) {
-        case REF_invokeVirtual:    which = LF_INVVIRTUAL;    break;
-        case REF_invokeStatic:     which = LF_INVSTATIC;     break;
-        case REF_invokeSpecial:    which = LF_INVSPECIAL;    break;
-        case REF_invokeInterface:  which = LF_INVINTERFACE;  break;
-        case REF_newInvokeSpecial: which = LF_NEWINVSPECIAL; break;
-        default:  throw new InternalError(m.toString());
-        }
-        if (which == LF_INVSTATIC &amp;&amp; shouldBeInitialized(m)) {
-            // precompute the barrier-free version:
-            preparedLambdaForm(mtype, which);
-            which = LF_INVSTATIC_INIT;
-        }
-        LambdaForm lform = preparedLambdaForm(mtype, which);
-        maybeCompile(lform, m);
-        assert(lform.methodType().dropParameterTypes(0, 1)
-                .equals(m.getInvocationType().basicType()))
-                : Arrays.asList(m, m.getInvocationType().basicType(), lform, lform.methodType());
-        return lform;
-    }
-
-    private static LambdaForm preparedLambdaForm(MethodType mtype, int which) {
-        LambdaForm lform = mtype.form().cachedLambdaForm(which);
-        if (lform != null)  return lform;
-        lform = makePreparedLambdaForm(mtype, which);
-        return mtype.form().setCachedLambdaForm(which, lform);
-    }
-
-    private static LambdaForm makePreparedLambdaForm(MethodType mtype, int which) {
-        boolean needsInit = (which == LF_INVSTATIC_INIT);
-        boolean doesAlloc = (which == LF_NEWINVSPECIAL);
-        String linkerName, lambdaName;
-        switch (which) {
-        case LF_INVVIRTUAL:    linkerName = &quot;linkToVirtual&quot;;    lambdaName = &quot;DMH.invokeVirtual&quot;;    break;
-        case LF_INVSTATIC:     linkerName = &quot;linkToStatic&quot;;     lambdaName = &quot;DMH.invokeStatic&quot;;     break;
-        case LF_INVSTATIC_INIT:linkerName = &quot;linkToStatic&quot;;     lambdaName = &quot;DMH.invokeStaticInit&quot;; break;
-        case LF_INVSPECIAL:    linkerName = &quot;linkToSpecial&quot;;    lambdaName = &quot;DMH.invokeSpecial&quot;;    break;
-        case LF_INVINTERFACE:  linkerName = &quot;linkToInterface&quot;;  lambdaName = &quot;DMH.invokeInterface&quot;;  break;
-        case LF_NEWINVSPECIAL: linkerName = &quot;linkToSpecial&quot;;    lambdaName = &quot;DMH.newInvokeSpecial&quot;; break;
-        default:  throw new InternalError(&quot;which=&quot;+which);
-        }
-        MethodType mtypeWithArg = mtype.appendParameterTypes(MemberName.class);
-        if (doesAlloc)
-            mtypeWithArg = mtypeWithArg
-                    .insertParameterTypes(0, Object.class)  // insert newly allocated obj
-                    .changeReturnType(void.class);          // &lt;init&gt; returns void
-        MemberName linker = new MemberName(MethodHandle.class, linkerName, mtypeWithArg, REF_invokeStatic);
-        try {
-            linker = IMPL_NAMES.resolveOrFail(REF_invokeStatic, linker, null, NoSuchMethodException.class);
-        } catch (ReflectiveOperationException ex) {
-            throw newInternalError(ex);
-        }
-        final int DMH_THIS    = 0;
-        final int ARG_BASE    = 1;
-        final int ARG_LIMIT   = ARG_BASE + mtype.parameterCount();
-        int nameCursor = ARG_LIMIT;
-        final int NEW_OBJ     = (doesAlloc ? nameCursor++ : -1);
-        final int GET_MEMBER  = nameCursor++;
-        final int LINKER_CALL = nameCursor++;
-        Name[] names = arguments(nameCursor - ARG_LIMIT, mtype.invokerType());
-        assert(names.length == nameCursor);
-        if (doesAlloc) {
-            // names = { argx,y,z,... new C, init method }
-            names[NEW_OBJ] = new Name(Lazy.NF_allocateInstance, names[DMH_THIS]);
-            names[GET_MEMBER] = new Name(Lazy.NF_constructorMethod, names[DMH_THIS]);
-        } else if (needsInit) {
-            names[GET_MEMBER] = new Name(Lazy.NF_internalMemberNameEnsureInit, names[DMH_THIS]);
-        } else {
-            names[GET_MEMBER] = new Name(Lazy.NF_internalMemberName, names[DMH_THIS]);
-        }
-        Object[] outArgs = Arrays.copyOfRange(names, ARG_BASE, GET_MEMBER+1, Object[].class);
-        assert(outArgs[outArgs.length-1] == names[GET_MEMBER]);  // look, shifted args!
-        int result = LambdaForm.LAST_RESULT;
-        if (doesAlloc) {
-            assert(outArgs[outArgs.length-2] == names[NEW_OBJ]);  // got to move this one
-            System.arraycopy(outArgs, 0, outArgs, 1, outArgs.length-2);
-            outArgs[0] = names[NEW_OBJ];
-            result = NEW_OBJ;
-        }
-        names[LINKER_CALL] = new Name(linker, outArgs);
-        lambdaName += &quot;_&quot; + LambdaForm.basicTypeSignature(mtype);
-        LambdaForm lform = new LambdaForm(lambdaName, ARG_LIMIT, names, result);
-        // This is a tricky bit of code.  Don't send it through the LF interpreter.
-        lform.compileToBytecode();
-        return lform;
-    }
-
-    private static void maybeCompile(LambdaForm lform, MemberName m) {
-        if (VerifyAccess.isSamePackage(m.getDeclaringClass(), MethodHandle.class))
-            // Help along bootstrapping...
-            lform.compileToBytecode();
-    }
-
-    /** Static wrapper for DirectMethodHandle.internalMemberName. */
-    @ForceInline
-    /*non-public*/ static Object internalMemberName(Object mh) {
-        return ((DirectMethodHandle)mh).member;
-    }
-
-    /** Static wrapper for DirectMethodHandle.internalMemberName.
-     * This one also forces initialization.
-     */
-    /*non-public*/ static Object internalMemberNameEnsureInit(Object mh) {
-        DirectMethodHandle dmh = (DirectMethodHandle)mh;
-        dmh.ensureInitialized();
-        return dmh.member;
-    }
-
-    /*non-public*/ static
-    boolean shouldBeInitialized(MemberName member) {
-        switch (member.getReferenceKind()) {
-        case REF_invokeStatic:
-        case REF_getStatic:
-        case REF_putStatic:
-        case REF_newInvokeSpecial:
-            break;
-        default:
-            // No need to initialize the class on this kind of member.
-            return false;
-        }
-        Class&lt;?&gt; cls = member.getDeclaringClass();
-        if (cls == ValueConversions.class ||
-            cls == MethodHandleImpl.class ||
-            cls == Invokers.class) {
-            // These guys have lots of &lt;clinit&gt; DMH creation but we know
-            // the MHs will not be used until the system is booted.
-            return false;
-        }
-        if (VerifyAccess.isSamePackage(MethodHandle.class, cls) ||
-            VerifyAccess.isSamePackage(ValueConversions.class, cls)) {
-            // It is a system class.  It is probably in the process of
-            // being initialized, but we will help it along just to be safe.
-            if (UNSAFE.shouldBeInitialized(cls)) {
-                UNSAFE.ensureClassInitialized(cls);
-            }
-            return false;
-        }
-        return UNSAFE.shouldBeInitialized(cls);
-    }
-
-    private static class EnsureInitialized extends ClassValue&lt;WeakReference&lt;Thread&gt;&gt; {
-        @Override
-        protected WeakReference&lt;Thread&gt; computeValue(Class&lt;?&gt; type) {
-            UNSAFE.ensureClassInitialized(type);
-            if (UNSAFE.shouldBeInitialized(type))
-                // If the previous call didn't block, this can happen.
-                // We are executing inside &lt;clinit&gt;.
-                return new WeakReference&lt;&gt;(Thread.currentThread());
-            return null;
-        }
-        static final EnsureInitialized INSTANCE = new EnsureInitialized();
-    }
-
-    private void ensureInitialized() {
-        if (checkInitialized(member)) {
-            // The coast is clear.  Delete the &lt;clinit&gt; barrier.
-            if (member.isField())
-                updateForm(preparedFieldLambdaForm(member));
-            else
-                updateForm(preparedLambdaForm(member));
-        }
-    }
-    private static boolean checkInitialized(MemberName member) {
-        Class&lt;?&gt; defc = member.getDeclaringClass();
-        WeakReference&lt;Thread&gt; ref = EnsureInitialized.INSTANCE.get(defc);
-        if (ref == null) {
-            return true;  // the final state
-        }
-        Thread clinitThread = ref.get();
-        // Somebody may still be running defc.&lt;clinit&gt;.
-        if (clinitThread == Thread.currentThread()) {
-            // If anybody is running defc.&lt;clinit&gt;, it is this thread.
-            if (UNSAFE.shouldBeInitialized(defc))
-                // Yes, we are running it; keep the barrier for now.
-                return false;
-        } else {
-            // We are in a random thread.  Block.
-            UNSAFE.ensureClassInitialized(defc);
-        }
-        assert(!UNSAFE.shouldBeInitialized(defc));
-        // put it into the final state
-        EnsureInitialized.INSTANCE.remove(defc);
-        return true;
-    }
-
-    /*non-public*/ static void ensureInitialized(Object mh) {
-        ((DirectMethodHandle)mh).ensureInitialized();
-    }
-
-    /** This subclass represents invokespecial instructions. */
-    static class Special extends DirectMethodHandle {
-        private Special(MethodType mtype, LambdaForm form, MemberName member) {
-            super(mtype, form, member);
-        }
-        @Override
-        boolean isInvokeSpecial() {
-            return true;
-        }
-        @Override
-        MethodHandle viewAsType(MethodType newType) {
-            return new Special(newType, form, member);
-        }
-    }
-
-    /** This subclass handles constructor references. */
-    static class Constructor extends DirectMethodHandle {
-        final MemberName initMethod;
-        final Class&lt;?&gt;   instanceClass;
-
-        private Constructor(MethodType mtype, LambdaForm form, MemberName constructor,
-                            MemberName initMethod, Class&lt;?&gt; instanceClass) {
-            super(mtype, form, constructor);
-            this.initMethod = initMethod;
-            this.instanceClass = instanceClass;
-            assert(initMethod.isResolved());
-        }
-        @Override
-        MethodHandle viewAsType(MethodType newType) {
-            return new Constructor(newType, form, member, initMethod, instanceClass);
-        }
-    }
-
-    /*non-public*/ static Object constructorMethod(Object mh) {
-        Constructor dmh = (Constructor)mh;
-        return dmh.initMethod;
-    }
-
-    /*non-public*/ static Object allocateInstance(Object mh) throws InstantiationException {
-        Constructor dmh = (Constructor)mh;
-        return UNSAFE.allocateInstance(dmh.instanceClass);
-    }
-
-    /** This subclass handles non-static field references. */
-    static class Accessor extends DirectMethodHandle {
-        final Class&lt;?&gt; fieldType;
-        final int      fieldOffset;
-        private Accessor(MethodType mtype, LambdaForm form, MemberName member,
-                         int fieldOffset) {
-            super(mtype, form, member);
-            this.fieldType   = member.getFieldType();
-            this.fieldOffset = fieldOffset;
-        }
-
-        @Override Object checkCast(Object obj) {
-            return fieldType.cast(obj);
-        }
-        @Override
-        MethodHandle viewAsType(MethodType newType) {
-            return new Accessor(newType, form, member, fieldOffset);
-        }
-    }
-
-    @ForceInline
-    /*non-public*/ static long fieldOffset(Object accessorObj) {
-        // Note: We return a long because that is what Unsafe.getObject likes.
-        // We store a plain int because it is more compact.
-        return ((Accessor)accessorObj).fieldOffset;
-    }
-
-    @ForceInline
-    /*non-public*/ static Object checkBase(Object obj) {
-        // Note that the object's class has already been verified,
-        // since the parameter type of the Accessor method handle
-        // is either member.getDeclaringClass or a subclass.
-        // This was verified in DirectMethodHandle.make.
-        // Therefore, the only remaining check is for null.
-        // Since this check is *not* guaranteed by Unsafe.getInt
-        // and its siblings, we need to make an explicit one here.
-        obj.getClass();  // maybe throw NPE
-        return obj;
-    }
-
-    /** This subclass handles static field references. */
-    static class StaticAccessor extends DirectMethodHandle {
-        final private Class&lt;?&gt; fieldType;
-        final private Object   staticBase;
-        final private long     staticOffset;
-
-        private StaticAccessor(MethodType mtype, LambdaForm form, MemberName member,
-                               Object staticBase, long staticOffset) {
-            super(mtype, form, member);
-            this.fieldType    = member.getFieldType();
-            this.staticBase   = staticBase;
-            this.staticOffset = staticOffset;
-        }
-
-        @Override Object checkCast(Object obj) {
-            return fieldType.cast(obj);
-        }
-        @Override
-        MethodHandle viewAsType(MethodType newType) {
-            return new StaticAccessor(newType, form, member, staticBase, staticOffset);
-        }
-    }
-
-    @ForceInline
-    /*non-public*/ static Object nullCheck(Object obj) {
-        obj.getClass();
-        return obj;
-    }
-
-    @ForceInline
-    /*non-public*/ static Object staticBase(Object accessorObj) {
-        return ((StaticAccessor)accessorObj).staticBase;
-    }
-
-    @ForceInline
-    /*non-public*/ static long staticOffset(Object accessorObj) {
-        return ((StaticAccessor)accessorObj).staticOffset;
-    }
-
-    @ForceInline
-    /*non-public*/ static Object checkCast(Object mh, Object obj) {
-        return ((DirectMethodHandle) mh).checkCast(obj);
-    }
-
-    Object checkCast(Object obj) {
-        return member.getReturnType().cast(obj);
-    }
-
-    // Caching machinery for field accessors:
-    private static byte
-            AF_GETFIELD        = 0,
-            AF_PUTFIELD        = 1,
-            AF_GETSTATIC       = 2,
-            AF_PUTSTATIC       = 3,
-            AF_GETSTATIC_INIT  = 4,
-            AF_PUTSTATIC_INIT  = 5,
-            AF_LIMIT           = 6;
-    // Enumerate the different field kinds using Wrapper,
-    // with an extra case added for checked references.
-    private static int
-            FT_LAST_WRAPPER    = Wrapper.values().length-1,
-            FT_UNCHECKED_REF   = Wrapper.OBJECT.ordinal(),
-            FT_CHECKED_REF     = FT_LAST_WRAPPER+1,
-            FT_LIMIT           = FT_LAST_WRAPPER+2;
-    private static int afIndex(byte formOp, boolean isVolatile, int ftypeKind) {
-        return ((formOp * FT_LIMIT * 2)
-                + (isVolatile ? FT_LIMIT : 0)
-                + ftypeKind);
-    }
-    private static final LambdaForm[] ACCESSOR_FORMS
-            = new LambdaForm[afIndex(AF_LIMIT, false, 0)];
-    private static int ftypeKind(Class&lt;?&gt; ftype) {
-        if (ftype.isPrimitive())
-            return Wrapper.forPrimitiveType(ftype).ordinal();
-        else if (VerifyType.isNullReferenceConversion(Object.class, ftype))
-            return FT_UNCHECKED_REF;
-        else
-            return FT_CHECKED_REF;
-    }
-
-    /**
-     * Create a LF which can access the given field.
-     * Cache and share this structure among all fields with
-     * the same basicType and refKind.
-     */
-    private static LambdaForm preparedFieldLambdaForm(MemberName m) {
-        Class&lt;?&gt; ftype = m.getFieldType();
-        boolean isVolatile = m.isVolatile();
-        byte formOp;
-        switch (m.getReferenceKind()) {
-        case REF_getField:      formOp = AF_GETFIELD;    break;
-        case REF_putField:      formOp = AF_PUTFIELD;    break;
-        case REF_getStatic:     formOp = AF_GETSTATIC;   break;
-        case REF_putStatic:     formOp = AF_PUTSTATIC;   break;
-        default:  throw new InternalError(m.toString());
-        }
-        if (shouldBeInitialized(m)) {
-            // precompute the barrier-free version:
-            preparedFieldLambdaForm(formOp, isVolatile, ftype);
-            assert((AF_GETSTATIC_INIT - AF_GETSTATIC) ==
-                   (AF_PUTSTATIC_INIT - AF_PUTSTATIC));
-            formOp += (AF_GETSTATIC_INIT - AF_GETSTATIC);
-        }
-        LambdaForm lform = preparedFieldLambdaForm(formOp, isVolatile, ftype);
-        maybeCompile(lform, m);
-        assert(lform.methodType().dropParameterTypes(0, 1)
-                .equals(m.getInvocationType().basicType()))
-                : Arrays.asList(m, m.getInvocationType().basicType(), lform, lform.methodType());
-        return lform;
-    }
-    private static LambdaForm preparedFieldLambdaForm(byte formOp, boolean isVolatile, Class&lt;?&gt; ftype) {
-        int afIndex = afIndex(formOp, isVolatile, ftypeKind(ftype));
-        LambdaForm lform = ACCESSOR_FORMS[afIndex];
-        if (lform != null)  return lform;
-        lform = makePreparedFieldLambdaForm(formOp, isVolatile, ftypeKind(ftype));
-        ACCESSOR_FORMS[afIndex] = lform;  // don't bother with a CAS
-        return lform;
-    }
-
-    private static LambdaForm makePreparedFieldLambdaForm(byte formOp, boolean isVolatile, int ftypeKind) {
-        boolean isGetter  = (formOp &amp; 1) == (AF_GETFIELD &amp; 1);
-        boolean isStatic  = (formOp &gt;= AF_GETSTATIC);
-        boolean needsInit = (formOp &gt;= AF_GETSTATIC_INIT);
-        boolean needsCast = (ftypeKind == FT_CHECKED_REF);
-        Wrapper fw = (needsCast ? Wrapper.OBJECT : Wrapper.values()[ftypeKind]);
-        Class&lt;?&gt; ft = fw.primitiveType();
-        assert(ftypeKind(needsCast ? String.class : ft) == ftypeKind);
-        String tname  = fw.primitiveSimpleName();
-        String ctname = Character.toUpperCase(tname.charAt(0)) + tname.substring(1);
-        if (isVolatile)  ctname += &quot;Volatile&quot;;
-        String getOrPut = (isGetter ? &quot;get&quot; : &quot;put&quot;);
-        String linkerName = (getOrPut + ctname);  // getObject, putIntVolatile, etc.
-        MethodType linkerType;
-        if (isGetter)
-            linkerType = MethodType.methodType(ft, Object.class, long.class);
-        else
-            linkerType = MethodType.methodType(void.class, Object.class, long.class, ft);
-        MemberName linker = new MemberName(Unsafe.class, linkerName, linkerType, REF_invokeVirtual);
-        try {
-            linker = IMPL_NAMES.resolveOrFail(REF_invokeVirtual, linker, null, NoSuchMethodException.class);
-        } catch (ReflectiveOperationException ex) {
-            throw newInternalError(ex);
-        }
-
-        // What is the external type of the lambda form?
-        MethodType mtype;
-        if (isGetter)
-            mtype = MethodType.methodType(ft);
-        else
-            mtype = MethodType.methodType(void.class, ft);
-        mtype = mtype.basicType();  // erase short to int, etc.
-        if (!isStatic)
-            mtype = mtype.insertParameterTypes(0, Object.class);
-        final int DMH_THIS  = 0;
-        final int ARG_BASE  = 1;
-        final int ARG_LIMIT = ARG_BASE + mtype.parameterCount();
-        // if this is for non-static access, the base pointer is stored at this index:
-        final int OBJ_BASE  = isStatic ? -1 : ARG_BASE;
-        // if this is for write access, the value to be written is stored at this index:
-        final int SET_VALUE  = isGetter ? -1 : ARG_LIMIT - 1;
-        int nameCursor = ARG_LIMIT;
-        final int F_HOLDER  = (isStatic ? nameCursor++ : -1);  // static base if any
-        final int F_OFFSET  = nameCursor++;  // Either static offset or field offset.
-        final int OBJ_CHECK = (OBJ_BASE &gt;= 0 ? nameCursor++ : -1);
-        final int INIT_BAR  = (needsInit ? nameCursor++ : -1);
-        final int PRE_CAST  = (needsCast &amp;&amp; !isGetter ? nameCursor++ : -1);
-        final int LINKER_CALL = nameCursor++;
-        final int POST_CAST = (needsCast &amp;&amp; isGetter ? nameCursor++ : -1);
-        final int RESULT    = nameCursor-1;  // either the call or the cast
-        Name[] names = arguments(nameCursor - ARG_LIMIT, mtype.invokerType());
-        if (needsInit)
-            names[INIT_BAR] = new Name(Lazy.NF_ensureInitialized, names[DMH_THIS]);
-        if (needsCast &amp;&amp; !isGetter)
-            names[PRE_CAST] = new Name(Lazy.NF_checkCast, names[DMH_THIS], names[SET_VALUE]);
-        Object[] outArgs = new Object[1 + linkerType.parameterCount()];
-        assert(outArgs.length == (isGetter ? 3 : 4));
-        outArgs[0] = UNSAFE;
-        if (isStatic) {
-            outArgs[1] = names[F_HOLDER]  = new Name(Lazy.NF_staticBase, names[DMH_THIS]);
-            outArgs[2] = names[F_OFFSET]  = new Name(Lazy.NF_staticOffset, names[DMH_THIS]);
-        } else {
-            outArgs[1] = names[OBJ_CHECK] = new Name(Lazy.NF_checkBase, names[OBJ_BASE]);
-            outArgs[2] = names[F_OFFSET]  = new Name(Lazy.NF_fieldOffset, names[DMH_THIS]);
-        }
-        if (!isGetter) {
-            outArgs[3] = (needsCast ? names[PRE_CAST] : names[SET_VALUE]);
-        }
-        for (Object a : outArgs)  assert(a != null);
-        names[LINKER_CALL] = new Name(linker, outArgs);
-        if (needsCast &amp;&amp; isGetter)
-            names[POST_CAST] = new Name(Lazy.NF_checkCast, names[DMH_THIS], names[LINKER_CALL]);
-        for (Name n : names)  assert(n != null);
-        String fieldOrStatic = (isStatic ? &quot;Static&quot; : &quot;Field&quot;);
-        String lambdaName = (linkerName + fieldOrStatic);  // significant only for debugging
-        if (needsCast)  lambdaName += &quot;Cast&quot;;
-        if (needsInit)  lambdaName += &quot;Init&quot;;
-        return new LambdaForm(lambdaName, ARG_LIMIT, names, RESULT);
-    }
-
-    /**
-     * Pre-initialized NamedFunctions for bootstrapping purposes.
-     * Factored in an inner class to delay initialization until first usage.
-     */
-    private static class Lazy {
-        static final NamedFunction
-                NF_internalMemberName,
-                NF_internalMemberNameEnsureInit,
-                NF_ensureInitialized,
-                NF_fieldOffset,
-                NF_checkBase,
-                NF_staticBase,
-                NF_staticOffset,
-                NF_checkCast,
-                NF_allocateInstance,
-                NF_constructorMethod;
-        static {
-            try {
-                NamedFunction nfs[] = {
-                        NF_internalMemberName = new NamedFunction(DirectMethodHandle.class
-                                .getDeclaredMethod(&quot;internalMemberName&quot;, Object.class)),
-                        NF_internalMemberNameEnsureInit = new NamedFunction(DirectMethodHandle.class
-                                .getDeclaredMethod(&quot;internalMemberNameEnsureInit&quot;, Object.class)),
-                        NF_ensureInitialized = new NamedFunction(DirectMethodHandle.class
-                                .getDeclaredMethod(&quot;ensureInitialized&quot;, Object.class)),
-                        NF_fieldOffset = new NamedFunction(DirectMethodHandle.class
-                                .getDeclaredMethod(&quot;fieldOffset&quot;, Object.class)),
-                        NF_checkBase = new NamedFunction(DirectMethodHandle.class
-                                .getDeclaredMethod(&quot;checkBase&quot;, Object.class)),
-                        NF_staticBase = new NamedFunction(DirectMethodHandle.class
-                                .getDeclaredMethod(&quot;staticBase&quot;, Object.class)),
-                        NF_staticOffset = new NamedFunction(DirectMethodHandle.class
-                                .getDeclaredMethod(&quot;staticOffset&quot;, Object.class)),
-                        NF_checkCast = new NamedFunction(DirectMethodHandle.class
-                                .getDeclaredMethod(&quot;checkCast&quot;, Object.class, Object.class)),
-                        NF_allocateInstance = new NamedFunction(DirectMethodHandle.class
-                                .getDeclaredMethod(&quot;allocateInstance&quot;, Object.class)),
-                        NF_constructorMethod = new NamedFunction(DirectMethodHandle.class
-                                .getDeclaredMethod(&quot;constructorMethod&quot;, Object.class))
-                };
-                for (NamedFunction nf : nfs) {
-                    // Each nf must be statically invocable or we get tied up in our bootstraps.
-                    assert(InvokerBytecodeGenerator.isStaticallyInvocable(nf.member)) : nf;
-                    nf.resolve();
-                }
-            } catch (ReflectiveOperationException ex) {
-                throw newInternalError(ex);
-            }
-        }
-    }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2008, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package java.lang.invoke;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import sun.misc.Unsafe;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.lang.reflect.Method;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.util.Arrays;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import sun.invoke.util.VerifyAccess;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import static java.lang.invoke.MethodHandleNatives.Constants.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import static java.lang.invoke.LambdaForm.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import static java.lang.invoke.MethodTypeForm.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import static java.lang.invoke.MethodHandleStatics.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.lang.ref.WeakReference;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import java.lang.reflect.Field;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import sun.invoke.util.ValueConversions;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import sun.invoke.util.VerifyType;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre>import sun.invoke.util.Wrapper;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre> * The flavor of method handle which implements a constant reference</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre> * to a class member.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre> * @author jrose</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre>class DirectMethodHandle extends MethodHandle {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre>    final MemberName member;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre>    // Constructors and factory methods in this class *must* be package scoped or private.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>    private DirectMethodHandle(MethodType mtype, LambdaForm form, MemberName member) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre>        super(mtype, form);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre>        if (!member.isResolved())  throw new InternalError();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>        if (member.getDeclaringClass().isInterface() &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre>                member.isMethod() &amp;&amp; !member.isAbstract()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>            // Check for corner case: invokeinterface of Object method</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>            MemberName m = new MemberName(Object.class, member.getName(), member.getMethodType(), member.getReferenceKind());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre>            m = MemberName.getFactory().resolveOrNull(m.getReferenceKind(), m, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>            if (m != null &amp;&amp; m.isPublic()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>                member = m;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>        this.member = member;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>    // Factory methods:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>    static DirectMethodHandle make(byte refKind, Class&lt;?&gt; receiver, MemberName member) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>        MethodType mtype = member.getMethodOrFieldType();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>        if (!member.isStatic()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>            if (!member.getDeclaringClass().isAssignableFrom(receiver) || member.isConstructor())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>                throw new InternalError(member.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>            mtype = mtype.insertParameterTypes(0, receiver);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>        if (!member.isField()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>            if (refKind == REF_invokeSpecial) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>                member = member.asSpecial();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>                LambdaForm lform = preparedLambdaForm(member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>                return new Special(mtype, lform, member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>                LambdaForm lform = preparedLambdaForm(member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>                return new DirectMethodHandle(mtype, lform, member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>            LambdaForm lform = preparedFieldLambdaForm(member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>            if (member.isStatic()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>                long offset = MethodHandleNatives.staticFieldOffset(member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>                Object base = MethodHandleNatives.staticFieldBase(member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>                return new StaticAccessor(mtype, lform, member, base, offset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>                long offset = MethodHandleNatives.objectFieldOffset(member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>                assert(offset == (int)offset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>                return new Accessor(mtype, lform, member, (int)offset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>    static DirectMethodHandle make(Class&lt;?&gt; receiver, MemberName member) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>        byte refKind = member.getReferenceKind();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>        if (refKind == REF_invokeSpecial)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>            refKind =  REF_invokeVirtual;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>        return make(refKind, receiver, member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>    static DirectMethodHandle make(MemberName member) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>        if (member.isConstructor())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>            return makeAllocator(member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>        return make(member.getDeclaringClass(), member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>    static DirectMethodHandle make(Method method) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>        return make(method.getDeclaringClass(), new MemberName(method));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>    static DirectMethodHandle make(Field field) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>        return make(field.getDeclaringClass(), new MemberName(field));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>    private static DirectMethodHandle makeAllocator(MemberName ctor) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>        assert(ctor.isConstructor() &amp;&amp; ctor.getName().equals(&quot;&lt;init&gt;&quot;));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>        Class&lt;?&gt; instanceClass = ctor.getDeclaringClass();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>        ctor = ctor.asConstructor();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>        assert(ctor.isConstructor() &amp;&amp; ctor.getReferenceKind() == REF_newInvokeSpecial) : ctor;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>        MethodType mtype = ctor.getMethodType().changeReturnType(instanceClass);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>        LambdaForm lform = preparedLambdaForm(ctor);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>        MemberName init = ctor.asSpecial();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>        assert(init.getMethodType().returnType() == void.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>        return new Constructor(mtype, lform, ctor, init, instanceClass);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>    MethodHandle copyWith(MethodType mt, LambdaForm lf) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>        return new DirectMethodHandle(mt, lf, member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>    String internalProperties() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>        return &quot;/DMH=&quot;+member.toString();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>    //// Implementation methods.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>    MethodHandle viewAsType(MethodType newType) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>        return new DirectMethodHandle(newType, form, member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>    @ForceInline</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>    MemberName internalMemberName() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>        return member;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>    MethodHandle bindArgument(int pos, char basicType, Object value) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>        // If the member needs dispatching, do so.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>        if (pos == 0 &amp;&amp; basicType == 'L') {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>            DirectMethodHandle concrete = maybeRebind(value);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>            if (concrete != null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>                return concrete.bindReceiver(value);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>        return super.bindArgument(pos, basicType, value);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>    MethodHandle bindReceiver(Object receiver) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>        // If the member needs dispatching, do so.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>        DirectMethodHandle concrete = maybeRebind(receiver);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>        if (concrete != null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>            return concrete.bindReceiver(receiver);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>        return super.bindReceiver(receiver);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>    private static final MemberName.Factory IMPL_NAMES = MemberName.getFactory();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>    private DirectMethodHandle maybeRebind(Object receiver) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>        if (receiver != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>            switch (member.getReferenceKind()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>            case REF_invokeInterface:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>            case REF_invokeVirtual:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>                // Pre-dispatch the member.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>                Class&lt;?&gt; concreteClass = receiver.getClass();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>                MemberName concrete = new MemberName(concreteClass, member.getName(), member.getMethodType(), REF_invokeSpecial);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>                concrete = IMPL_NAMES.resolveOrNull(REF_invokeSpecial, concrete, concreteClass);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>                if (concrete != null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>                    return new DirectMethodHandle(type(), preparedLambdaForm(concrete), concrete);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>                break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>        return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>     * Create a LF which can invoke the given method.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>     * Cache and share this structure among all methods with</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>     * the same basicType and refKind.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>    private static LambdaForm preparedLambdaForm(MemberName m) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>        assert(m.isInvocable()) : m;  // call preparedFieldLambdaForm instead</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>        MethodType mtype = m.getInvocationType().basicType();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>        assert(!m.isMethodHandleInvoke() || &quot;invokeBasic&quot;.equals(m.getName())) : m;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>        int which;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>        switch (m.getReferenceKind()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>        case REF_invokeVirtual:    which = LF_INVVIRTUAL;    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>        case REF_invokeStatic:     which = LF_INVSTATIC;     break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>        case REF_invokeSpecial:    which = LF_INVSPECIAL;    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>        case REF_invokeInterface:  which = LF_INVINTERFACE;  break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>        case REF_newInvokeSpecial: which = LF_NEWINVSPECIAL; break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>        default:  throw new InternalError(m.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>        if (which == LF_INVSTATIC &amp;&amp; shouldBeInitialized(m)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>            // precompute the barrier-free version:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>            preparedLambdaForm(mtype, which);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>            which = LF_INVSTATIC_INIT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>        LambdaForm lform = preparedLambdaForm(mtype, which);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>        maybeCompile(lform, m);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>        assert(lform.methodType().dropParameterTypes(0, 1)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>                .equals(m.getInvocationType().basicType()))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>                : Arrays.asList(m, m.getInvocationType().basicType(), lform, lform.methodType());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>        return lform;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>    private static LambdaForm preparedLambdaForm(MethodType mtype, int which) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>        LambdaForm lform = mtype.form().cachedLambdaForm(which);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>        if (lform != null)  return lform;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>        lform = makePreparedLambdaForm(mtype, which);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>        return mtype.form().setCachedLambdaForm(which, lform);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>    private static LambdaForm makePreparedLambdaForm(MethodType mtype, int which) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>        boolean needsInit = (which == LF_INVSTATIC_INIT);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>        boolean doesAlloc = (which == LF_NEWINVSPECIAL);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>        String linkerName, lambdaName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>        switch (which) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>        case LF_INVVIRTUAL:    linkerName = &quot;linkToVirtual&quot;;    lambdaName = &quot;DMH.invokeVirtual&quot;;    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>        case LF_INVSTATIC:     linkerName = &quot;linkToStatic&quot;;     lambdaName = &quot;DMH.invokeStatic&quot;;     break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>        case LF_INVSTATIC_INIT:linkerName = &quot;linkToStatic&quot;;     lambdaName = &quot;DMH.invokeStaticInit&quot;; break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>        case LF_INVSPECIAL:    linkerName = &quot;linkToSpecial&quot;;    lambdaName = &quot;DMH.invokeSpecial&quot;;    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>        case LF_INVINTERFACE:  linkerName = &quot;linkToInterface&quot;;  lambdaName = &quot;DMH.invokeInterface&quot;;  break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>        case LF_NEWINVSPECIAL: linkerName = &quot;linkToSpecial&quot;;    lambdaName = &quot;DMH.newInvokeSpecial&quot;; break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>        default:  throw new InternalError(&quot;which=&quot;+which);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>        MethodType mtypeWithArg = mtype.appendParameterTypes(MemberName.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>        if (doesAlloc)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>            mtypeWithArg = mtypeWithArg</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>                    .insertParameterTypes(0, Object.class)  // insert newly allocated obj</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>                    .changeReturnType(void.class);          // &lt;init&gt; returns void</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>        MemberName linker = new MemberName(MethodHandle.class, linkerName, mtypeWithArg, REF_invokeStatic);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>            linker = IMPL_NAMES.resolveOrFail(REF_invokeStatic, linker, null, NoSuchMethodException.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>        } catch (ReflectiveOperationException ex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>            throw newInternalError(ex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>        final int DMH_THIS    = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>        final int ARG_BASE    = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>        final int ARG_LIMIT   = ARG_BASE + mtype.parameterCount();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>        int nameCursor = ARG_LIMIT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>        final int NEW_OBJ     = (doesAlloc ? nameCursor++ : -1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>        final int GET_MEMBER  = nameCursor++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>        final int LINKER_CALL = nameCursor++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>        Name[] names = arguments(nameCursor - ARG_LIMIT, mtype.invokerType());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>        assert(names.length == nameCursor);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>        if (doesAlloc) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>            // names = { argx,y,z,... new C, init method }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>            names[NEW_OBJ] = new Name(Lazy.NF_allocateInstance, names[DMH_THIS]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>            names[GET_MEMBER] = new Name(Lazy.NF_constructorMethod, names[DMH_THIS]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>        } else if (needsInit) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>            names[GET_MEMBER] = new Name(Lazy.NF_internalMemberNameEnsureInit, names[DMH_THIS]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>            names[GET_MEMBER] = new Name(Lazy.NF_internalMemberName, names[DMH_THIS]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>        Object[] outArgs = Arrays.copyOfRange(names, ARG_BASE, GET_MEMBER+1, Object[].class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>        assert(outArgs[outArgs.length-1] == names[GET_MEMBER]);  // look, shifted args!</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>        int result = LambdaForm.LAST_RESULT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>        if (doesAlloc) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>            assert(outArgs[outArgs.length-2] == names[NEW_OBJ]);  // got to move this one</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>            System.arraycopy(outArgs, 0, outArgs, 1, outArgs.length-2);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>            outArgs[0] = names[NEW_OBJ];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>            result = NEW_OBJ;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>        names[LINKER_CALL] = new Name(linker, outArgs);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>        lambdaName += &quot;_&quot; + LambdaForm.basicTypeSignature(mtype);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>        LambdaForm lform = new LambdaForm(lambdaName, ARG_LIMIT, names, result);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>        // This is a tricky bit of code.  Don't send it through the LF interpreter.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>        lform.compileToBytecode();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>        return lform;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>    private static void maybeCompile(LambdaForm lform, MemberName m) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>        if (VerifyAccess.isSamePackage(m.getDeclaringClass(), MethodHandle.class))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>            // Help along bootstrapping...</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>            lform.compileToBytecode();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>    /** Static wrapper for DirectMethodHandle.internalMemberName. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>    @ForceInline</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>    /*non-public*/ static Object internalMemberName(Object mh) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>        return ((DirectMethodHandle)mh).member;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>    /** Static wrapper for DirectMethodHandle.internalMemberName.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>     * This one also forces initialization.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>    /*non-public*/ static Object internalMemberNameEnsureInit(Object mh) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>        DirectMethodHandle dmh = (DirectMethodHandle)mh;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>        dmh.ensureInitialized();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>        return dmh.member;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>    /*non-public*/ static</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>    boolean shouldBeInitialized(MemberName member) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>        switch (member.getReferenceKind()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>        case REF_invokeStatic:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>        case REF_getStatic:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>        case REF_putStatic:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>        case REF_newInvokeSpecial:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>            break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>        default:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>            // No need to initialize the class on this kind of member.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>            return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>        Class&lt;?&gt; cls = member.getDeclaringClass();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>        if (cls == ValueConversions.class ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>            cls == MethodHandleImpl.class ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>            cls == Invokers.class) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>            // These guys have lots of &lt;clinit&gt; DMH creation but we know</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>            // the MHs will not be used until the system is booted.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>            return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>        if (VerifyAccess.isSamePackage(MethodHandle.class, cls) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>            VerifyAccess.isSamePackage(ValueConversions.class, cls)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>            // It is a system class.  It is probably in the process of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>            // being initialized, but we will help it along just to be safe.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>            if (UNSAFE.shouldBeInitialized(cls)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>                UNSAFE.ensureClassInitialized(cls);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>            return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>        return UNSAFE.shouldBeInitialized(cls);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>    private static class EnsureInitialized extends ClassValue&lt;WeakReference&lt;Thread&gt;&gt; {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>        protected WeakReference&lt;Thread&gt; computeValue(Class&lt;?&gt; type) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>            UNSAFE.ensureClassInitialized(type);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>            if (UNSAFE.shouldBeInitialized(type))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>                // If the previous call didn't block, this can happen.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>                // We are executing inside &lt;clinit&gt;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>                return new WeakReference&lt;&gt;(Thread.currentThread());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>        static final EnsureInitialized INSTANCE = new EnsureInitialized();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>    private void ensureInitialized() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>        if (checkInitialized(member)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>            // The coast is clear.  Delete the &lt;clinit&gt; barrier.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>            if (member.isField())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>                updateForm(preparedFieldLambdaForm(member));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>            else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>                updateForm(preparedLambdaForm(member));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>    private static boolean checkInitialized(MemberName member) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>        Class&lt;?&gt; defc = member.getDeclaringClass();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>        WeakReference&lt;Thread&gt; ref = EnsureInitialized.INSTANCE.get(defc);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>        if (ref == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>            return true;  // the final state</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>        Thread clinitThread = ref.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>        // Somebody may still be running defc.&lt;clinit&gt;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>        if (clinitThread == Thread.currentThread()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>            // If anybody is running defc.&lt;clinit&gt;, it is this thread.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>            if (UNSAFE.shouldBeInitialized(defc))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>                // Yes, we are running it; keep the barrier for now.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>                return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>            // We are in a random thread.  Block.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>            UNSAFE.ensureClassInitialized(defc);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>        assert(!UNSAFE.shouldBeInitialized(defc));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>        // put it into the final state</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>        EnsureInitialized.INSTANCE.remove(defc);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>        return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>    /*non-public*/ static void ensureInitialized(Object mh) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>        ((DirectMethodHandle)mh).ensureInitialized();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>    /** This subclass represents invokespecial instructions. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>    static class Special extends DirectMethodHandle {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>        private Special(MethodType mtype, LambdaForm form, MemberName member) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>            super(mtype, form, member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>        boolean isInvokeSpecial() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>            return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>        MethodHandle viewAsType(MethodType newType) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>            return new Special(newType, form, member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>    /** This subclass handles constructor references. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>    static class Constructor extends DirectMethodHandle {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>        final MemberName initMethod;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>        final Class&lt;?&gt;   instanceClass;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>        private Constructor(MethodType mtype, LambdaForm form, MemberName constructor,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>                            MemberName initMethod, Class&lt;?&gt; instanceClass) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>            super(mtype, form, constructor);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>            this.initMethod = initMethod;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>            this.instanceClass = instanceClass;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>            assert(initMethod.isResolved());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>        MethodHandle viewAsType(MethodType newType) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>            return new Constructor(newType, form, member, initMethod, instanceClass);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>    /*non-public*/ static Object constructorMethod(Object mh) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>        Constructor dmh = (Constructor)mh;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>        return dmh.initMethod;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>    /*non-public*/ static Object allocateInstance(Object mh) throws InstantiationException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>        Constructor dmh = (Constructor)mh;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>        return UNSAFE.allocateInstance(dmh.instanceClass);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>    /** This subclass handles non-static field references. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>    static class Accessor extends DirectMethodHandle {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>        final Class&lt;?&gt; fieldType;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>        final int      fieldOffset;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>        private Accessor(MethodType mtype, LambdaForm form, MemberName member,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>                         int fieldOffset) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>            super(mtype, form, member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>            this.fieldType   = member.getFieldType();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>            this.fieldOffset = fieldOffset;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>        @Override Object checkCast(Object obj) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>            return fieldType.cast(obj);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>        MethodHandle viewAsType(MethodType newType) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>            return new Accessor(newType, form, member, fieldOffset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>    @ForceInline</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>    /*non-public*/ static long fieldOffset(Object accessorObj) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>        // Note: We return a long because that is what Unsafe.getObject likes.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>        // We store a plain int because it is more compact.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>        return ((Accessor)accessorObj).fieldOffset;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>    @ForceInline</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>    /*non-public*/ static Object checkBase(Object obj) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>        // Note that the object's class has already been verified,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>        // since the parameter type of the Accessor method handle</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>        // is either member.getDeclaringClass or a subclass.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>        // This was verified in DirectMethodHandle.make.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>        // Therefore, the only remaining check is for null.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>        // Since this check is *not* guaranteed by Unsafe.getInt</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>        // and its siblings, we need to make an explicit one here.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>        obj.getClass();  // maybe throw NPE</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>        return obj;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>    /** This subclass handles static field references. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>    static class StaticAccessor extends DirectMethodHandle {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>        final private Class&lt;?&gt; fieldType;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>        final private Object   staticBase;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>        final private long     staticOffset;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>        private StaticAccessor(MethodType mtype, LambdaForm form, MemberName member,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>                               Object staticBase, long staticOffset) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>            super(mtype, form, member);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>            this.fieldType    = member.getFieldType();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>            this.staticBase   = staticBase;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>            this.staticOffset = staticOffset;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>        @Override Object checkCast(Object obj) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>            return fieldType.cast(obj);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>        @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>        MethodHandle viewAsType(MethodType newType) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>            return new StaticAccessor(newType, form, member, staticBase, staticOffset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>    @ForceInline</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>    /*non-public*/ static Object nullCheck(Object obj) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>        obj.getClass();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>        return obj;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>    @ForceInline</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>    /*non-public*/ static Object staticBase(Object accessorObj) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>        return ((StaticAccessor)accessorObj).staticBase;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>    @ForceInline</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre>    /*non-public*/ static long staticOffset(Object accessorObj) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>        return ((StaticAccessor)accessorObj).staticOffset;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>    @ForceInline</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>    /*non-public*/ static Object checkCast(Object mh, Object obj) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>        return ((DirectMethodHandle) mh).checkCast(obj);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>    Object checkCast(Object obj) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>        return member.getReturnType().cast(obj);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>    // Caching machinery for field accessors:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>    private static byte</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>            AF_GETFIELD        = 0,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>            AF_PUTFIELD        = 1,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>            AF_GETSTATIC       = 2,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>            AF_PUTSTATIC       = 3,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>            AF_GETSTATIC_INIT  = 4,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>            AF_PUTSTATIC_INIT  = 5,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>            AF_LIMIT           = 6;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>    // Enumerate the different field kinds using Wrapper,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>    // with an extra case added for checked references.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>    private static int</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>            FT_LAST_WRAPPER    = Wrapper.values().length-1,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>            FT_UNCHECKED_REF   = Wrapper.OBJECT.ordinal(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>            FT_CHECKED_REF     = FT_LAST_WRAPPER+1,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>            FT_LIMIT           = FT_LAST_WRAPPER+2;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>    private static int afIndex(byte formOp, boolean isVolatile, int ftypeKind) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>        return ((formOp * FT_LIMIT * 2)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>                + (isVolatile ? FT_LIMIT : 0)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>                + ftypeKind);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>    private static final LambdaForm[] ACCESSOR_FORMS</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>            = new LambdaForm[afIndex(AF_LIMIT, false, 0)];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>    private static int ftypeKind(Class&lt;?&gt; ftype) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>        if (ftype.isPrimitive())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>            return Wrapper.forPrimitiveType(ftype).ordinal();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>        else if (VerifyType.isNullReferenceConversion(Object.class, ftype))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>            return FT_UNCHECKED_REF;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre>        else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>            return FT_CHECKED_REF;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>     * Create a LF which can access the given field.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>     * Cache and share this structure among all fields with</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>     * the same basicType and refKind.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>    private static LambdaForm preparedFieldLambdaForm(MemberName m) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>        Class&lt;?&gt; ftype = m.getFieldType();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>        boolean isVolatile = m.isVolatile();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>        byte formOp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>        switch (m.getReferenceKind()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>        case REF_getField:      formOp = AF_GETFIELD;    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>        case REF_putField:      formOp = AF_PUTFIELD;    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>        case REF_getStatic:     formOp = AF_GETSTATIC;   break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>        case REF_putStatic:     formOp = AF_PUTSTATIC;   break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>        default:  throw new InternalError(m.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>        if (shouldBeInitialized(m)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre>            // precompute the barrier-free version:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>            preparedFieldLambdaForm(formOp, isVolatile, ftype);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>            assert((AF_GETSTATIC_INIT - AF_GETSTATIC) ==</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>                   (AF_PUTSTATIC_INIT - AF_PUTSTATIC));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>            formOp += (AF_GETSTATIC_INIT - AF_GETSTATIC);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>        LambdaForm lform = preparedFieldLambdaForm(formOp, isVolatile, ftype);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre>        maybeCompile(lform, m);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>        assert(lform.methodType().dropParameterTypes(0, 1)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>                .equals(m.getInvocationType().basicType()))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>                : Arrays.asList(m, m.getInvocationType().basicType(), lform, lform.methodType());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>        return lform;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>    private static LambdaForm preparedFieldLambdaForm(byte formOp, boolean isVolatile, Class&lt;?&gt; ftype) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>        int afIndex = afIndex(formOp, isVolatile, ftypeKind(ftype));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>        LambdaForm lform = ACCESSOR_FORMS[afIndex];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>        if (lform != null)  return lform;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>        lform = makePreparedFieldLambdaForm(formOp, isVolatile, ftypeKind(ftype));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>        ACCESSOR_FORMS[afIndex] = lform;  // don't bother with a CAS</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>        return lform;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>    private static LambdaForm makePreparedFieldLambdaForm(byte formOp, boolean isVolatile, int ftypeKind) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>        boolean isGetter  = (formOp &amp; 1) == (AF_GETFIELD &amp; 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre>        boolean isStatic  = (formOp &gt;= AF_GETSTATIC);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre>        boolean needsInit = (formOp &gt;= AF_GETSTATIC_INIT);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>        boolean needsCast = (ftypeKind == FT_CHECKED_REF);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>        Wrapper fw = (needsCast ? Wrapper.OBJECT : Wrapper.values()[ftypeKind]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>        Class&lt;?&gt; ft = fw.primitiveType();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>        assert(ftypeKind(needsCast ? String.class : ft) == ftypeKind);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>        String tname  = fw.primitiveSimpleName();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>        String ctname = Character.toUpperCase(tname.charAt(0)) + tname.substring(1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>        if (isVolatile)  ctname += &quot;Volatile&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>        String getOrPut = (isGetter ? &quot;get&quot; : &quot;put&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>        String linkerName = (getOrPut + ctname);  // getObject, putIntVolatile, etc.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>        MethodType linkerType;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>        if (isGetter)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>            linkerType = MethodType.methodType(ft, Object.class, long.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>        else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>            linkerType = MethodType.methodType(void.class, Object.class, long.class, ft);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre>        MemberName linker = new MemberName(Unsafe.class, linkerName, linkerType, REF_invokeVirtual);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>            linker = IMPL_NAMES.resolveOrFail(REF_invokeVirtual, linker, null, NoSuchMethodException.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>        } catch (ReflectiveOperationException ex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre>            throw newInternalError(ex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>        // What is the external type of the lambda form?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>        MethodType mtype;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>        if (isGetter)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>            mtype = MethodType.methodType(ft);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>        else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>            mtype = MethodType.methodType(void.class, ft);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>        mtype = mtype.basicType();  // erase short to int, etc.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>        if (!isStatic)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>            mtype = mtype.insertParameterTypes(0, Object.class);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre>        final int DMH_THIS  = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>        final int ARG_BASE  = 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre>        final int ARG_LIMIT = ARG_BASE + mtype.parameterCount();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre>        // if this is for non-static access, the base pointer is stored at this index:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>        final int OBJ_BASE  = isStatic ? -1 : ARG_BASE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>        // if this is for write access, the value to be written is stored at this index:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>        final int SET_VALUE  = isGetter ? -1 : ARG_LIMIT - 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre>        int nameCursor = ARG_LIMIT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>        final int F_HOLDER  = (isStatic ? nameCursor++ : -1);  // static base if any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>        final int F_OFFSET  = nameCursor++;  // Either static offset or field offset.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre>        final int OBJ_CHECK = (OBJ_BASE &gt;= 0 ? nameCursor++ : -1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>        final int INIT_BAR  = (needsInit ? nameCursor++ : -1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre>        final int PRE_CAST  = (needsCast &amp;&amp; !isGetter ? nameCursor++ : -1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>        final int LINKER_CALL = nameCursor++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>        final int POST_CAST = (needsCast &amp;&amp; isGetter ? nameCursor++ : -1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre>        final int RESULT    = nameCursor-1;  // either the call or the cast</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>        Name[] names = arguments(nameCursor - ARG_LIMIT, mtype.invokerType());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>        if (needsInit)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre>            names[INIT_BAR] = new Name(Lazy.NF_ensureInitialized, names[DMH_THIS]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>        if (needsCast &amp;&amp; !isGetter)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>            names[PRE_CAST] = new Name(Lazy.NF_checkCast, names[DMH_THIS], names[SET_VALUE]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>        Object[] outArgs = new Object[1 + linkerType.parameterCount()];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>        assert(outArgs.length == (isGetter ? 3 : 4));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>        outArgs[0] = UNSAFE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre>        if (isStatic) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>            outArgs[1] = names[F_HOLDER]  = new Name(Lazy.NF_staticBase, names[DMH_THIS]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>            outArgs[2] = names[F_OFFSET]  = new Name(Lazy.NF_staticOffset, names[DMH_THIS]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>            outArgs[1] = names[OBJ_CHECK] = new Name(Lazy.NF_checkBase, names[OBJ_BASE]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>            outArgs[2] = names[F_OFFSET]  = new Name(Lazy.NF_fieldOffset, names[DMH_THIS]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>        if (!isGetter) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>            outArgs[3] = (needsCast ? names[PRE_CAST] : names[SET_VALUE]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre>        for (Object a : outArgs)  assert(a != null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre>        names[LINKER_CALL] = new Name(linker, outArgs);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>        if (needsCast &amp;&amp; isGetter)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre>            names[POST_CAST] = new Name(Lazy.NF_checkCast, names[DMH_THIS], names[LINKER_CALL]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>        for (Name n : names)  assert(n != null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>        String fieldOrStatic = (isStatic ? &quot;Static&quot; : &quot;Field&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>        String lambdaName = (linkerName + fieldOrStatic);  // significant only for debugging</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre>        if (needsCast)  lambdaName += &quot;Cast&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>        if (needsInit)  lambdaName += &quot;Init&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre>        return new LambdaForm(lambdaName, ARG_LIMIT, names, RESULT);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre>     * Pre-initialized NamedFunctions for bootstrapping purposes.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>     * Factored in an inner class to delay initialization until first usage.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre>    private static class Lazy {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>        static final NamedFunction</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>                NF_internalMemberName,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>                NF_internalMemberNameEnsureInit,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>                NF_ensureInitialized,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre>                NF_fieldOffset,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre>                NF_checkBase,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre>                NF_staticBase,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>                NF_staticOffset,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>                NF_checkCast,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre>                NF_allocateInstance,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre>                NF_constructorMethod;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre>        static {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>            try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre>                NamedFunction nfs[] = {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre>                        NF_internalMemberName = new NamedFunction(DirectMethodHandle.class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre>                                .getDeclaredMethod(&quot;internalMemberName&quot;, Object.class)),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>                        NF_internalMemberNameEnsureInit = new NamedFunction(DirectMethodHandle.class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre>                                .getDeclaredMethod(&quot;internalMemberNameEnsureInit&quot;, Object.class)),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre>                        NF_ensureInitialized = new NamedFunction(DirectMethodHandle.class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre>                                .getDeclaredMethod(&quot;ensureInitialized&quot;, Object.class)),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>                        NF_fieldOffset = new NamedFunction(DirectMethodHandle.class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre>                                .getDeclaredMethod(&quot;fieldOffset&quot;, Object.class)),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>                        NF_checkBase = new NamedFunction(DirectMethodHandle.class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre>                                .getDeclaredMethod(&quot;checkBase&quot;, Object.class)),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre>                        NF_staticBase = new NamedFunction(DirectMethodHandle.class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre>                                .getDeclaredMethod(&quot;staticBase&quot;, Object.class)),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre>                        NF_staticOffset = new NamedFunction(DirectMethodHandle.class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>                                .getDeclaredMethod(&quot;staticOffset&quot;, Object.class)),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre>                        NF_checkCast = new NamedFunction(DirectMethodHandle.class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre>                                .getDeclaredMethod(&quot;checkCast&quot;, Object.class, Object.class)),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>                        NF_allocateInstance = new NamedFunction(DirectMethodHandle.class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre>                                .getDeclaredMethod(&quot;allocateInstance&quot;, Object.class)),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre>                        NF_constructorMethod = new NamedFunction(DirectMethodHandle.class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>                                .getDeclaredMethod(&quot;constructorMethod&quot;, Object.class))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>                };</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre>                for (NamedFunction nf : nfs) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre>                    // Each nf must be statically invocable or we get tied up in our bootstraps.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>                    assert(InvokerBytecodeGenerator.isStaticallyInvocable(nf.member)) : nf;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre>                    nf.resolve();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>            } catch (ReflectiveOperationException ex) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre>                throw newInternalError(ex);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

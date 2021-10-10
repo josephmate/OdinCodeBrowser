@@ -3,1096 +3,4363 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package com.sun.jndi.dns;
-
-
-import java.util.Enumeration;
-import java.util.Hashtable;
-
-import javax.naming.*;
-import javax.naming.directory.*;
-import javax.naming.spi.DirectoryManager;
-
-import com.sun.jndi.toolkit.ctx.*;
-
-
-/**
- * A DnsContext is a directory context representing a DNS node.
- *
- * @author Scott Seligman
- */
-
-
-public class DnsContext extends ComponentDirContext {
-
-    DnsName domain;             // fully-qualified domain name of this context,
-                                // with a root (empty) label at position 0
-    Hashtable&lt;Object,Object&gt; environment;
-    private boolean envShared;  // true if environment is possibly shared
-                                // and so must be copied on write
-    private boolean parentIsDns;        // was this DnsContext created by
-                                        // another?  see composeName()
-    private String[] servers;
-    private Resolver resolver;
-
-    private boolean authoritative;      // must all responses be authoritative?
-    private boolean recursion;          // request recursion on queries?
-    private int timeout;                // initial timeout on UDP queries in ms
-    private int retries;                // number of UDP retries
-
-    static final NameParser nameParser = new DnsNameParser();
-
-    // Timeouts for UDP queries use exponential backoff:  each retry
-    // is for twice as long as the last.  The following constants set
-    // the defaults for the initial timeout (in ms) and the number of
-    // retries, and name the environment properties used to override
-    // these defaults.
-    private static final int DEFAULT_INIT_TIMEOUT = 1000;
-    private static final int DEFAULT_RETRIES = 4;
-    private static final String INIT_TIMEOUT =
-                                          &quot;com.sun.jndi.dns.timeout.initial&quot;;
-    private static final String RETRIES = &quot;com.sun.jndi.dns.timeout.retries&quot;;
-
-    // The resource record type and class to use for lookups, and the
-    // property used to modify them
-    private CT lookupCT;
-    private static final String LOOKUP_ATTR = &quot;com.sun.jndi.dns.lookup.attr&quot;;
-
-    // Property used to disallow recursion on queries
-    private static final String RECURSION = &quot;com.sun.jndi.dns.recursion&quot;;
-
-    // ANY == ResourceRecord.QCLASS_STAR == ResourceRecord.QTYPE_STAR
-    private static final int ANY = ResourceRecord.QTYPE_STAR;
-
-    // The zone tree used for list operations
-    private static final ZoneNode zoneTree = new ZoneNode(null);
-
-
-    /**
-     * Returns a DNS context for a given domain and servers.
-     * Each server is of the form &quot;server[:port]&quot;.
-     * IPv6 literal host names include delimiting brackets.
-     * There must be at least one server.
-     * The environment must not be null; it is cloned before being stored.
-     */
-    @SuppressWarnings(&quot;unchecked&quot;)
-    public DnsContext(String domain, String[] servers, Hashtable&lt;?,?&gt; environment)
-            throws NamingException {
-
-        this.domain = new DnsName(domain.endsWith(&quot;.&quot;)
-                                  ? domain
-                                  : domain + &quot;.&quot;);
-        this.servers = (servers == null) ? null : servers.clone();
-        this.environment = (Hashtable&lt;Object,Object&gt;) environment.clone();
-        envShared = false;
-        parentIsDns = false;
-        resolver = null;
-
-        initFromEnvironment();
-    }
-
-    /*
-     * Returns a clone of a DNS context, just like DnsContext(DnsContext)
-     * but with a different domain name and with parentIsDns set to true.
-     */
-    DnsContext(DnsContext ctx, DnsName domain) {
-        this(ctx);
-        this.domain = domain;
-        parentIsDns = true;
-    }
-
-    /*
-     * Returns a clone of a DNS context.  The context's modifiable
-     * private state is independent of the original's (so closing one
-     * context, for example, won't close the other).  The two contexts
-     * share &lt;tt&gt;environment&lt;/tt&gt;, but it's copy-on-write so there's
-     * no conflict.
-     */
-    private DnsContext(DnsContext ctx) {
-        environment = ctx.environment;  // shared environment, copy-on-write
-        envShared = ctx.envShared = true;
-        parentIsDns = ctx.parentIsDns;
-        domain = ctx.domain;
-        servers = ctx.servers;          // shared servers, no write operation
-        resolver = ctx.resolver;
-        authoritative = ctx.authoritative;
-        recursion = ctx.recursion;
-        timeout = ctx.timeout;
-        retries = ctx.retries;
-        lookupCT = ctx.lookupCT;
-    }
-
-    public void close() {
-        if (resolver != null) {
-            resolver.close();
-            resolver = null;
-        }
-    }
-
-
-    //---------- Environment operations
-
-    /*
-     * Override default with a noncloning version.
-     */
-    protected Hashtable&lt;?,?&gt; p_getEnvironment() {
-        return environment;
-    }
-
-    public Hashtable&lt;?,?&gt; getEnvironment() throws NamingException {
-        return (Hashtable&lt;?,?&gt;) environment.clone();
-    }
-
-    @SuppressWarnings(&quot;unchecked&quot;)
-    public Object addToEnvironment(String propName, Object propVal)
-            throws NamingException {
-
-        if (propName.equals(LOOKUP_ATTR)) {
-            lookupCT = getLookupCT((String) propVal);
-        } else if (propName.equals(Context.AUTHORITATIVE)) {
-            authoritative = &quot;true&quot;.equalsIgnoreCase((String) propVal);
-        } else if (propName.equals(RECURSION)) {
-            recursion = &quot;true&quot;.equalsIgnoreCase((String) propVal);
-        } else if (propName.equals(INIT_TIMEOUT)) {
-            int val = Integer.parseInt((String) propVal);
-            if (timeout != val) {
-                timeout = val;
-                resolver = null;
-            }
-        } else if (propName.equals(RETRIES)) {
-            int val = Integer.parseInt((String) propVal);
-            if (retries != val) {
-                retries = val;
-                resolver = null;
-            }
-        }
-
-        if (!envShared) {
-            return environment.put(propName, propVal);
-        } else if (environment.get(propName) != propVal) {
-            // copy on write
-            environment = (Hashtable&lt;Object,Object&gt;) environment.clone();
-            envShared = false;
-            return environment.put(propName, propVal);
-        } else {
-            return propVal;
-        }
-    }
-
-    @SuppressWarnings(&quot;unchecked&quot;)
-    public Object removeFromEnvironment(String propName)
-            throws NamingException {
-
-        if (propName.equals(LOOKUP_ATTR)) {
-            lookupCT = getLookupCT(null);
-        } else if (propName.equals(Context.AUTHORITATIVE)) {
-            authoritative = false;
-        } else if (propName.equals(RECURSION)) {
-            recursion = true;
-        } else if (propName.equals(INIT_TIMEOUT)) {
-            if (timeout != DEFAULT_INIT_TIMEOUT) {
-                timeout = DEFAULT_INIT_TIMEOUT;
-                resolver = null;
-            }
-        } else if (propName.equals(RETRIES)) {
-            if (retries != DEFAULT_RETRIES) {
-                retries = DEFAULT_RETRIES;
-                resolver = null;
-            }
-        }
-
-        if (!envShared) {
-            return environment.remove(propName);
-        } else if (environment.get(propName) != null) {
-            // copy-on-write
-            environment = (Hashtable&lt;Object,Object&gt;) environment.clone();
-            envShared = false;
-            return environment.remove(propName);
-        } else {
-            return null;
-        }
-    }
-
-    /*
-     * Update PROVIDER_URL property.  Call this only when environment
-     * is not being shared.
-     */
-    void setProviderUrl(String url) {
-        // assert !envShared;
-        environment.put(Context.PROVIDER_URL, url);
-    }
-
-    /*
-     * Read environment properties and set parameters.
-     */
-    private void initFromEnvironment()
-            throws InvalidAttributeIdentifierException {
-
-        lookupCT = getLookupCT((String) environment.get(LOOKUP_ATTR));
-        authoritative = &quot;true&quot;.equalsIgnoreCase((String)
-                                       environment.get(Context.AUTHORITATIVE));
-        String val = (String) environment.get(RECURSION);
-        recursion = ((val == null) ||
-                     &quot;true&quot;.equalsIgnoreCase(val));
-        val = (String) environment.get(INIT_TIMEOUT);
-        timeout = (val == null)
-            ? DEFAULT_INIT_TIMEOUT
-            : Integer.parseInt(val);
-        val = (String) environment.get(RETRIES);
-        retries = (val == null)
-            ? DEFAULT_RETRIES
-            : Integer.parseInt(val);
-    }
-
-    private CT getLookupCT(String attrId)
-            throws InvalidAttributeIdentifierException {
-        return (attrId == null)
-            ? new CT(ResourceRecord.CLASS_INTERNET, ResourceRecord.TYPE_TXT)
-            : fromAttrId(attrId);
-    }
-
-
-    //---------- Naming operations
-
-    public Object c_lookup(Name name, Continuation cont)
-            throws NamingException {
-
-        cont.setSuccess();
-        if (name.isEmpty()) {
-            DnsContext ctx = new DnsContext(this);
-            ctx.resolver = new Resolver(servers, timeout, retries);
-                                                // clone for parallelism
-            return ctx;
-        }
-        try {
-            DnsName fqdn = fullyQualify(name);
-            ResourceRecords rrs =
-                getResolver().query(fqdn, lookupCT.rrclass, lookupCT.rrtype,
-                                    recursion, authoritative);
-            Attributes attrs = rrsToAttrs(rrs, null);
-            DnsContext ctx = new DnsContext(this, fqdn);
-            return DirectoryManager.getObjectInstance(ctx, name, this,
-                                                      environment, attrs);
-        } catch (NamingException e) {
-            cont.setError(this, name);
-            throw cont.fillInException(e);
-        } catch (Exception e) {
-            cont.setError(this, name);
-            NamingException ne = new NamingException(
-                    &quot;Problem generating object using object factory&quot;);
-            ne.setRootCause(e);
-            throw cont.fillInException(ne);
-        }
-    }
-
-    public Object c_lookupLink(Name name, Continuation cont)
-            throws NamingException {
-        return c_lookup(name, cont);
-    }
-
-    public NamingEnumeration&lt;NameClassPair&gt; c_list(Name name, Continuation cont)
-            throws NamingException {
-        cont.setSuccess();
-        try {
-            DnsName fqdn = fullyQualify(name);
-            NameNode nnode = getNameNode(fqdn);
-            DnsContext ctx = new DnsContext(this, fqdn);
-            return new NameClassPairEnumeration(ctx, nnode.getChildren());
-
-        } catch (NamingException e) {
-            cont.setError(this, name);
-            throw cont.fillInException(e);
-        }
-    }
-
-    public NamingEnumeration&lt;Binding&gt; c_listBindings(Name name, Continuation cont)
-            throws NamingException {
-        cont.setSuccess();
-        try {
-            DnsName fqdn = fullyQualify(name);
-            NameNode nnode = getNameNode(fqdn);
-            DnsContext ctx = new DnsContext(this, fqdn);
-            return new BindingEnumeration(ctx, nnode.getChildren());
-
-        } catch (NamingException e) {
-            cont.setError(this, name);
-            throw cont.fillInException(e);
-        }
-    }
-
-    public void c_bind(Name name, Object obj, Continuation cont)
-            throws NamingException {
-        cont.setError(this, name);
-        throw cont.fillInException(
-                new OperationNotSupportedException());
-    }
-
-    public void c_rebind(Name name, Object obj, Continuation cont)
-            throws NamingException {
-        cont.setError(this, name);
-        throw cont.fillInException(
-                new OperationNotSupportedException());
-    }
-
-    public void c_unbind(Name name, Continuation cont)
-            throws NamingException {
-        cont.setError(this, name);
-        throw cont.fillInException(
-                new OperationNotSupportedException());
-    }
-
-    public void c_rename(Name oldname, Name newname, Continuation cont)
-            throws NamingException {
-        cont.setError(this, oldname);
-        throw cont.fillInException(
-                new OperationNotSupportedException());
-    }
-
-    public Context c_createSubcontext(Name name, Continuation cont)
-            throws NamingException {
-        cont.setError(this, name);
-        throw cont.fillInException(
-                new OperationNotSupportedException());
-    }
-
-    public void c_destroySubcontext(Name name, Continuation cont)
-            throws NamingException {
-        cont.setError(this, name);
-        throw cont.fillInException(
-                new OperationNotSupportedException());
-    }
-
-    public NameParser c_getNameParser(Name name, Continuation cont)
-            throws NamingException {
-        cont.setSuccess();
-        return nameParser;
-    }
-
-
-    //---------- Directory operations
-
-    public void c_bind(Name name,
-                       Object obj,
-                       Attributes attrs,
-                       Continuation cont)
-            throws NamingException {
-        cont.setError(this, name);
-        throw cont.fillInException(
-                new OperationNotSupportedException());
-    }
-
-    public void c_rebind(Name name,
-                         Object obj,
-                         Attributes attrs,
-                         Continuation cont)
-            throws NamingException {
-        cont.setError(this, name);
-        throw cont.fillInException(
-                new OperationNotSupportedException());
-    }
-
-    public DirContext c_createSubcontext(Name name,
-                                         Attributes attrs,
-                                         Continuation cont)
-            throws NamingException {
-        cont.setError(this, name);
-        throw cont.fillInException(
-                new OperationNotSupportedException());
-    }
-
-    public Attributes c_getAttributes(Name name,
-                                      String[] attrIds,
-                                      Continuation cont)
-            throws NamingException {
-
-        cont.setSuccess();
-        try {
-            DnsName fqdn = fullyQualify(name);
-            CT[] cts = attrIdsToClassesAndTypes(attrIds);
-            CT ct = getClassAndTypeToQuery(cts);
-            ResourceRecords rrs =
-                getResolver().query(fqdn, ct.rrclass, ct.rrtype,
-                                    recursion, authoritative);
-            return rrsToAttrs(rrs, cts);
-
-        } catch (NamingException e) {
-            cont.setError(this, name);
-            throw cont.fillInException(e);
-        }
-    }
-
-    public void c_modifyAttributes(Name name,
-                                   int mod_op,
-                                   Attributes attrs,
-                                   Continuation cont)
-            throws NamingException {
-        cont.setError(this, name);
-        throw cont.fillInException(
-                new OperationNotSupportedException());
-    }
-
-    public void c_modifyAttributes(Name name,
-                                   ModificationItem[] mods,
-                                   Continuation cont)
-            throws NamingException {
-        cont.setError(this, name);
-        throw cont.fillInException(
-                new OperationNotSupportedException());
-    }
-
-    public NamingEnumeration&lt;SearchResult&gt; c_search(Name name,
-                                      Attributes matchingAttributes,
-                                      String[] attributesToReturn,
-                                      Continuation cont)
-            throws NamingException {
-        throw new OperationNotSupportedException();
-    }
-
-    public NamingEnumeration&lt;SearchResult&gt; c_search(Name name,
-                                      String filter,
-                                      SearchControls cons,
-                                      Continuation cont)
-            throws NamingException {
-        throw new OperationNotSupportedException();
-    }
-
-    public NamingEnumeration&lt;SearchResult&gt; c_search(Name name,
-                                      String filterExpr,
-                                      Object[] filterArgs,
-                                      SearchControls cons,
-                                      Continuation cont)
-            throws NamingException {
-        throw new OperationNotSupportedException();
-    }
-
-    public DirContext c_getSchema(Name name, Continuation cont)
-            throws NamingException {
-        cont.setError(this, name);
-        throw cont.fillInException(
-                new OperationNotSupportedException());
-    }
-
-    public DirContext c_getSchemaClassDefinition(Name name, Continuation cont)
-            throws NamingException {
-        cont.setError(this, name);
-        throw cont.fillInException(
-                new OperationNotSupportedException());
-    }
-
-
-    //---------- Name-related operations
-
-    public String getNameInNamespace() {
-        return domain.toString();
-    }
-
-    public Name composeName(Name name, Name prefix) throws NamingException {
-        Name result;
-
-        // Any name that's not a CompositeName is assumed to be a DNS
-        // compound name.  Convert each to a DnsName for syntax checking.
-        if (!(prefix instanceof DnsName || prefix instanceof CompositeName)) {
-            prefix = (new DnsName()).addAll(prefix);
-        }
-        if (!(name instanceof DnsName || name instanceof CompositeName)) {
-            name = (new DnsName()).addAll(name);
-        }
-
-        // Each of prefix and name is now either a DnsName or a CompositeName.
-
-        // If we have two DnsNames, simply join them together.
-        if ((prefix instanceof DnsName) &amp;&amp; (name instanceof DnsName)) {
-            result = (DnsName) (prefix.clone());
-            result.addAll(name);
-            return new CompositeName().add(result.toString());
-        }
-
-        // Wrap compound names in composite names.
-        Name prefixC = (prefix instanceof CompositeName)
-            ? prefix
-            : new CompositeName().add(prefix.toString());
-        Name nameC = (name instanceof CompositeName)
-            ? name
-            : new CompositeName().add(name.toString());
-        int prefixLast = prefixC.size() - 1;
-
-        // Let toolkit do the work at namespace boundaries.
-        if (nameC.isEmpty() || nameC.get(0).equals(&quot;&quot;) ||
-                prefixC.isEmpty() || prefixC.get(prefixLast).equals(&quot;&quot;)) {
-            return super.composeName(nameC, prefixC);
-        }
-
-        result = (prefix == prefixC)
-            ? (CompositeName) prefixC.clone()
-            : prefixC;                  // prefixC is already a clone
-        result.addAll(nameC);
-
-        if (parentIsDns) {
-            DnsName dnsComp = (prefix instanceof DnsName)
-                           ? (DnsName) prefix.clone()
-                           : new DnsName(prefixC.get(prefixLast));
-            dnsComp.addAll((name instanceof DnsName)
-                           ? name
-                           : new DnsName(nameC.get(0)));
-            result.remove(prefixLast + 1);
-            result.remove(prefixLast);
-            result.add(prefixLast, dnsComp.toString());
-        }
-        return result;
-    }
-
-
-    //---------- Helper methods
-
-    /*
-     * Resolver is not created until needed, to allow time for updates
-     * to the environment.
-     */
-    private synchronized Resolver getResolver() throws NamingException {
-        if (resolver == null) {
-            resolver = new Resolver(servers, timeout, retries);
-        }
-        return resolver;
-    }
-
-    /*
-     * Returns the fully-qualified domain name of a name given
-     * relative to this context.  Result includes a root label (an
-     * empty component at position 0).
-     */
-    DnsName fullyQualify(Name name) throws NamingException {
-        if (name.isEmpty()) {
-            return domain;
-        }
-        DnsName dnsName = (name instanceof CompositeName)
-            ? new DnsName(name.get(0))                  // parse name
-            : (DnsName) (new DnsName()).addAll(name);   // clone &amp; check syntax
-
-        if (dnsName.hasRootLabel()) {
-            // Be overly generous and allow root label if we're in root domain.
-            if (domain.size() == 1) {
-                return dnsName;
-            } else {
-                throw new InvalidNameException(
-                       &quot;DNS name &quot; + dnsName + &quot; not relative to &quot; + domain);
-            }
-        }
-        return (DnsName) dnsName.addAll(0, domain);
-    }
-
-    /*
-     * Converts resource records to an attribute set.  Only resource
-     * records in the answer section are used, and only those that
-     * match the classes and types in cts (see classAndTypeMatch()
-     * for matching rules).
-     */
-    private static Attributes rrsToAttrs(ResourceRecords rrs, CT[] cts) {
-
-        BasicAttributes attrs = new BasicAttributes(true);
-
-        for (int i = 0; i &lt; rrs.answer.size(); i++) {
-            ResourceRecord rr = rrs.answer.elementAt(i);
-            int rrtype  = rr.getType();
-            int rrclass = rr.getRrclass();
-
-            if (!classAndTypeMatch(rrclass, rrtype, cts)) {
-                continue;
-            }
-
-            String attrId = toAttrId(rrclass, rrtype);
-            Attribute attr = attrs.get(attrId);
-            if (attr == null) {
-                attr = new BasicAttribute(attrId);
-                attrs.put(attr);
-            }
-            attr.add(rr.getRdata());
-        }
-        return attrs;
-    }
-
-    /*
-     * Returns true if rrclass and rrtype match some element of cts.
-     * A match occurs if corresponding classes and types are equal,
-     * or if the array value is ANY.  If cts is null, then any class
-     * and type match.
-     */
-    private static boolean classAndTypeMatch(int rrclass, int rrtype,
-                                             CT[] cts) {
-        if (cts == null) {
-            return true;
-        }
-        for (int i = 0; i &lt; cts.length; i++) {
-            CT ct = cts[i];
-            boolean classMatch = (ct.rrclass == ANY) ||
-                                 (ct.rrclass == rrclass);
-            boolean typeMatch  = (ct.rrtype == ANY) ||
-                                 (ct.rrtype == rrtype);
-            if (classMatch &amp;&amp; typeMatch) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /*
-     * Returns the attribute ID for a resource record given its class
-     * and type.  If the record is in the internet class, the
-     * corresponding attribute ID is the record's type name (or the
-     * integer type value if the name is not known).  If the record is
-     * not in the internet class, the class name (or integer class
-     * value) is prepended to the attribute ID, separated by a space.
-     *
-     * A class or type value of ANY represents an indeterminate class
-     * or type, and is represented within the attribute ID by &quot;*&quot;.
-     * For example, the attribute ID &quot;IN *&quot; represents
-     * any type in the internet class, and &quot;* NS&quot; represents an NS
-     * record of any class.
-     */
-    private static String toAttrId(int rrclass, int rrtype) {
-        String attrId = ResourceRecord.getTypeName(rrtype);
-        if (rrclass != ResourceRecord.CLASS_INTERNET) {
-            attrId = ResourceRecord.getRrclassName(rrclass) + &quot; &quot; + attrId;
-        }
-        return attrId;
-    }
-
-    /*
-     * Returns the class and type values corresponding to an attribute
-     * ID.  An indeterminate class or type is represented by ANY.  See
-     * toAttrId() for the format of attribute IDs.
-     *
-     * @throws InvalidAttributeIdentifierException
-     *          if class or type is unknown
-     */
-    private static CT fromAttrId(String attrId)
-            throws InvalidAttributeIdentifierException {
-
-        if (attrId.equals(&quot;&quot;)) {
-            throw new InvalidAttributeIdentifierException(
-                    &quot;Attribute ID cannot be empty&quot;);
-        }
-        int rrclass;
-        int rrtype;
-        int space = attrId.indexOf(' ');
-
-        // class
-        if (space &lt; 0) {
-            rrclass = ResourceRecord.CLASS_INTERNET;
-        } else {
-            String className = attrId.substring(0, space);
-            rrclass = ResourceRecord.getRrclass(className);
-            if (rrclass &lt; 0) {
-                throw new InvalidAttributeIdentifierException(
-                        &quot;Unknown resource record class '&quot; + className + '\'');
-            }
-        }
-
-        // type
-        String typeName = attrId.substring(space + 1);
-        rrtype = ResourceRecord.getType(typeName);
-        if (rrtype &lt; 0) {
-            throw new InvalidAttributeIdentifierException(
-                    &quot;Unknown resource record type '&quot; + typeName + '\'');
-        }
-
-        return new CT(rrclass, rrtype);
-    }
-
-    /*
-     * Returns an array of the classes and types corresponding to a
-     * set of attribute IDs.  See toAttrId() for the format of
-     * attribute IDs, and classAndTypeMatch() for the format of the
-     * array returned.
-     */
-    private static CT[] attrIdsToClassesAndTypes(String[] attrIds)
-            throws InvalidAttributeIdentifierException {
-        if (attrIds == null) {
-            return null;
-        }
-        CT[] cts = new CT[attrIds.length];
-
-        for (int i = 0; i &lt; attrIds.length; i++) {
-            cts[i] = fromAttrId(attrIds[i]);
-        }
-        return cts;
-    }
-
-    /*
-     * Returns the most restrictive resource record class and type
-     * that may be used to query for records matching cts.
-     * See classAndTypeMatch() for matching rules.
-     */
-    private static CT getClassAndTypeToQuery(CT[] cts) {
-        int rrclass;
-        int rrtype;
-
-        if (cts == null) {
-            // Query all records.
-            rrclass = ANY;
-            rrtype  = ANY;
-        } else if (cts.length == 0) {
-            // No records are requested, but we need to ask for something.
-            rrclass = ResourceRecord.CLASS_INTERNET;
-            rrtype  = ANY;
-        } else {
-            rrclass = cts[0].rrclass;
-            rrtype  = cts[0].rrtype;
-            for (int i = 1; i &lt; cts.length; i++) {
-                if (rrclass != cts[i].rrclass) {
-                    rrclass = ANY;
-                }
-                if (rrtype != cts[i].rrtype) {
-                    rrtype = ANY;
-                }
-            }
-        }
-        return new CT(rrclass, rrtype);
-    }
-
-
-    //---------- Support for list operations
-
-    /*
-     * Synchronization notes:
-     *
-     * Any access to zoneTree that walks the tree, whether it modifies
-     * the tree or not, is synchronized on zoneTree.
-     * [%%% Note:  a read/write lock would allow increased concurrency.]
-     * The depth of a ZoneNode can thereafter be accessed without
-     * further synchronization.  Access to other fields and methods
-     * should be synchronized on the node itself.
-     *
-     * A zone's contents is a NameNode tree that, once created, is never
-     * modified.  The only synchronization needed is to ensure that it
-     * gets flushed into shared memory after being created, which is
-     * accomplished by ZoneNode.populate().  The contents are accessed
-     * via a soft reference, so a ZoneNode may be seen to be populated
-     * one moment and unpopulated the next.
-     */
-
-    /*
-     * Returns the node in the zone tree corresponding to a
-     * fully-qualified domain name.  If the desired portion of the
-     * tree has not yet been populated or has been outdated, a zone
-     * transfer is done to populate the tree.
-     */
-    private NameNode getNameNode(DnsName fqdn) throws NamingException {
-        dprint(&quot;getNameNode(&quot; + fqdn + &quot;)&quot;);
-
-        // Find deepest related zone in zone tree.
-        ZoneNode znode;
-        DnsName zone;
-        synchronized (zoneTree) {
-            znode = zoneTree.getDeepestPopulated(fqdn);
-        }
-        dprint(&quot;Deepest related zone in zone tree: &quot; +
-               ((znode != null) ? znode.getLabel() : &quot;[none]&quot;));
-
-        NameNode topOfZone;
-        NameNode nnode;
-
-        if (znode != null) {
-            synchronized (znode) {
-                topOfZone = znode.getContents();
-            }
-            // If fqdn is in znode's zone, is not at a zone cut, and
-            // is current, we're done.
-            if (topOfZone != null) {
-                nnode = topOfZone.get(fqdn, znode.depth() + 1); // +1 for root
-
-                if ((nnode != null) &amp;&amp; !nnode.isZoneCut()) {
-                    dprint(&quot;Found node &quot; + fqdn + &quot; in zone tree&quot;);
-                    zone = (DnsName)
-                        fqdn.getPrefix(znode.depth() + 1);      // +1 for root
-                    boolean current = isZoneCurrent(znode, zone);
-                    boolean restart = false;
-
-                    synchronized (znode) {
-                        if (topOfZone != znode.getContents()) {
-                            // Zone was modified while we were examining it.
-                            // All bets are off.
-                            restart = true;
-                        } else if (!current) {
-                            znode.depopulate();
-                        } else {
-                            return nnode;                       // cache hit!
-                        }
-                    }
-                    dprint(&quot;Zone not current; discarding node&quot;);
-                    if (restart) {
-                        return getNameNode(fqdn);
-                    }
-                }
-            }
-        }
-
-        // Cache miss...  do it the expensive way.
-        dprint(&quot;Adding node &quot; + fqdn + &quot; to zone tree&quot;);
-
-        // Find fqdn's zone and add it to the tree.
-        zone = getResolver().findZoneName(fqdn, ResourceRecord.CLASS_INTERNET,
-                                          recursion);
-        dprint(&quot;Node's zone is &quot; + zone);
-        synchronized (zoneTree) {
-            znode = (ZoneNode) zoneTree.add(zone, 1);   // &quot;1&quot; to skip root
-        }
-
-        // If znode is now populated we know -- because the first half of
-        // getNodeName() didn't find it -- that it was populated by another
-        // thread during this method call.  Assume then that it's current.
-
-        synchronized (znode) {
-            topOfZone = znode.isPopulated()
-                ? znode.getContents()
-                : populateZone(znode, zone);
-        }
-        // Desired node should now be in znode's populated zone.  Find it.
-        nnode = topOfZone.get(fqdn, zone.size());
-        if (nnode == null) {
-            throw new ConfigurationException(
-                    &quot;DNS error: node not found in its own zone&quot;);
-        }
-        dprint(&quot;Found node in newly-populated zone&quot;);
-        return nnode;
-    }
-
-    /*
-     * Does a zone transfer to [re]populate a zone in the zone tree.
-     * Returns the zone's new contents.
-     */
-    private NameNode populateZone(ZoneNode znode, DnsName zone)
-            throws NamingException {
-        dprint(&quot;Populating zone &quot; + zone);
-        // assert Thread.holdsLock(znode);
-        ResourceRecords rrs =
-            getResolver().queryZone(zone,
-                                    ResourceRecord.CLASS_INTERNET, recursion);
-        dprint(&quot;zone xfer complete: &quot; + rrs.answer.size() + &quot; records&quot;);
-        return znode.populate(zone, rrs);
-    }
-
-    /*
-     * Determine if a ZoneNode's data is current.
-     * We base this on a comparison between the cached serial
-     * number and the latest SOA record.
-     *
-     * If there is no SOA record, znode is not (or is no longer) a zone:
-     * depopulate znode and return false.
-     *
-     * Since this method may perform a network operation, it is best
-     * to call it with znode unlocked.  Caller must then note that the
-     * result may be outdated by the time this method returns.
-     */
-    private boolean isZoneCurrent(ZoneNode znode, DnsName zone)
-            throws NamingException {
-        // former version:  return !znode.isExpired();
-
-        if (!znode.isPopulated()) {
-            return false;
-        }
-        ResourceRecord soa =
-            getResolver().findSoa(zone, ResourceRecord.CLASS_INTERNET,
-                                  recursion);
-        synchronized (znode) {
-            if (soa == null) {
-                znode.depopulate();
-            }
-            return (znode.isPopulated() &amp;&amp;
-                    znode.compareSerialNumberTo(soa) &gt;= 0);
-        }
-    }
-
-
-    //---------- Debugging
-
-    private static final boolean debug = false;
-
-    private static final void dprint(String msg) {
-        if (debug) {
-            System.err.println(&quot;** &quot; + msg);
-        }
-    }
-}
-
-
-//----------
-
-/*
- * A pairing of a resource record class and a resource record type.
- * A value of ANY in either field represents an indeterminate value.
- */
-class CT {
-    int rrclass;
-    int rrtype;
-
-    CT(int rrclass, int rrtype) {
-        this.rrclass = rrclass;
-        this.rrtype = rrtype;
-    }
-}
-
-
-//----------
-
-/*
- * Common base class for NameClassPairEnumeration and BindingEnumeration.
- */
-abstract class BaseNameClassPairEnumeration&lt;T&gt; implements NamingEnumeration&lt;T&gt; {
-
-    protected Enumeration&lt;NameNode&gt; nodes;    // nodes to be enumerated, or null if none
-    protected DnsContext ctx;       // context being enumerated
-
-    BaseNameClassPairEnumeration(DnsContext ctx, Hashtable&lt;String,NameNode&gt; nodes) {
-        this.ctx = ctx;
-        this.nodes = (nodes != null)
-            ? nodes.elements()
-            : null;
-    }
-
-    /*
-     * ctx will be set to null when no longer needed by the enumeration.
-     */
-    public final void close() {
-        nodes = null;
-        ctx = null;
-    }
-
-    public final boolean hasMore() {
-        boolean more = ((nodes != null) &amp;&amp; nodes.hasMoreElements());
-        if (!more) {
-            close();
-        }
-        return more;
-    }
-
-    public final boolean hasMoreElements() {
-        return hasMore();
-    }
-
-    abstract public T next() throws NamingException;
-
-    public final T nextElement() {
-        try {
-            return next();
-        } catch (NamingException e) {
-            java.util.NoSuchElementException nsee =
-                    new java.util.NoSuchElementException();
-            nsee.initCause(e);
-            throw nsee;
-        }
-    }
-}
-
-/*
- * An enumeration of name/classname pairs.
- *
- * Nodes that have children or that are zone cuts are returned with
- * classname DirContext.  Other nodes are returned with classname
- * Object even though they are DirContexts as well, since this might
- * make the namespace easier to browse.
- */
-final class NameClassPairEnumeration
-        extends BaseNameClassPairEnumeration&lt;NameClassPair&gt;
-        implements NamingEnumeration&lt;NameClassPair&gt; {
-
-    NameClassPairEnumeration(DnsContext ctx, Hashtable&lt;String,NameNode&gt; nodes) {
-        super(ctx, nodes);
-    }
-
-    @Override
-    public NameClassPair next() throws NamingException {
-        if (!hasMore()) {
-            throw new java.util.NoSuchElementException();
-        }
-        NameNode nnode = nodes.nextElement();
-        String className = (nnode.isZoneCut() ||
-                            (nnode.getChildren() != null))
-            ? &quot;javax.naming.directory.DirContext&quot;
-            : &quot;java.lang.Object&quot;;
-
-        String label = nnode.getLabel();
-        Name compName = (new DnsName()).add(label);
-        Name cname = (new CompositeName()).add(compName.toString());
-
-        NameClassPair ncp = new NameClassPair(cname.toString(), className);
-        ncp.setNameInNamespace(ctx.fullyQualify(cname).toString());
-        return ncp;
-    }
-}
-
-/*
- * An enumeration of Bindings.
- */
-final class BindingEnumeration extends BaseNameClassPairEnumeration&lt;Binding&gt;
-                         implements NamingEnumeration&lt;Binding&gt; {
-
-    BindingEnumeration(DnsContext ctx, Hashtable&lt;String,NameNode&gt; nodes) {
-        super(ctx, nodes);
-    }
-
-    // Finalizer not needed since it's safe to leave ctx unclosed.
-//  protected void finalize() {
-//      close();
-//  }
-
-    @Override
-    public Binding next() throws NamingException {
-        if (!hasMore()) {
-            throw (new java.util.NoSuchElementException());
-        }
-        NameNode nnode = nodes.nextElement();
-
-        String label = nnode.getLabel();
-        Name compName = (new DnsName()).add(label);
-        String compNameStr = compName.toString();
-        Name cname = (new CompositeName()).add(compNameStr);
-        String cnameStr = cname.toString();
-
-        DnsName fqdn = ctx.fullyQualify(compName);
-
-        // Clone ctx to create the child context.
-        DnsContext child = new DnsContext(ctx, fqdn);
-
-        try {
-            Object obj = DirectoryManager.getObjectInstance(
-                    child, cname, ctx, child.environment, null);
-            Binding binding = new Binding(cnameStr, obj);
-            binding.setNameInNamespace(ctx.fullyQualify(cname).toString());
-            return binding;
-        } catch (Exception e) {
-            NamingException ne = new NamingException(
-                    &quot;Problem generating object using object factory&quot;);
-            ne.setRootCause(e);
-            throw ne;
-        }
-    }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2000, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package com.sun.jndi.dns;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.util.Enumeration;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.util.Hashtable;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import javax.naming.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import javax.naming.directory.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import javax.naming.spi.DirectoryManager;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import com.sun.jndi.toolkit.ctx.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre> * A DnsContext is a directory context representing a DNS node.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre> * @author Scott Seligman</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>public class DnsContext extends ComponentDirContext {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre>    DnsName domain;             // fully-qualified domain name of this context,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre>                                // with a root (empty) label at position 0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre>    Hashtable&lt;Object,Object&gt; environment;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>    private boolean envShared;  // true if environment is possibly shared</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre>                                // and so must be copied on write</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre>    private boolean parentIsDns;        // was this DnsContext created by</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre>                                        // another?  see composeName()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>    private String[] servers;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre>    private Resolver resolver;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>    private boolean authoritative;      // must all responses be authoritative?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre>    private boolean recursion;          // request recursion on queries?</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>    private int timeout;                // initial timeout on UDP queries in ms</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>    private int retries;                // number of UDP retries</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>    static final NameParser nameParser = new DnsNameParser();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>    // Timeouts for UDP queries use exponential backoff:  each retry</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>    // is for twice as long as the last.  The following constants set</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>    // the defaults for the initial timeout (in ms) and the number of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>    // retries, and name the environment properties used to override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>    // these defaults.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>    private static final int DEFAULT_INIT_TIMEOUT = 1000;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>    private static final int DEFAULT_RETRIES = 4;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>    private static final String INIT_TIMEOUT =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>                                          &quot;com.sun.jndi.dns.timeout.initial&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>    private static final String RETRIES = &quot;com.sun.jndi.dns.timeout.retries&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>    // The resource record type and class to use for lookups, and the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>    // property used to modify them</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>    private CT lookupCT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>    private static final String LOOKUP_ATTR = &quot;com.sun.jndi.dns.lookup.attr&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>    // Property used to disallow recursion on queries</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>    private static final String RECURSION = &quot;com.sun.jndi.dns.recursion&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>    // ANY == ResourceRecord.QCLASS_STAR == ResourceRecord.QTYPE_STAR</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>    private static final int ANY = ResourceRecord.QTYPE_STAR;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>    // The zone tree used for list operations</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>    private static final ZoneNode zoneTree = new ZoneNode(null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>     * Returns a DNS context for a given domain and servers.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>     * Each server is of the form &quot;server[:port]&quot;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>     * IPv6 literal host names include delimiting brackets.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>     * There must be at least one server.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>     * The environment must not be null; it is cloned before being stored.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre>    @SuppressWarnings(&quot;unchecked&quot;)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>    public DnsContext(String domain, String[] servers, Hashtable&lt;?,?&gt; environment)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>        this.domain = new DnsName(domain.endsWith(&quot;.&quot;)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>                                  ? domain</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>                                  : domain + &quot;.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>        this.servers = (servers == null) ? null : servers.clone();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>        this.environment = (Hashtable&lt;Object,Object&gt;) environment.clone();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>        envShared = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>        parentIsDns = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>        resolver = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>        initFromEnvironment();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>     * Returns a clone of a DNS context, just like DnsContext(DnsContext)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>     * but with a different domain name and with parentIsDns set to true.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>    DnsContext(DnsContext ctx, DnsName domain) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>        this(ctx);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>        this.domain = domain;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>        parentIsDns = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>     * Returns a clone of a DNS context.  The context's modifiable</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>     * private state is independent of the original's (so closing one</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>     * context, for example, won't close the other).  The two contexts</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>     * share &lt;tt&gt;environment&lt;/tt&gt;, but it's copy-on-write so there's</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>     * no conflict.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>    private DnsContext(DnsContext ctx) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>        environment = ctx.environment;  // shared environment, copy-on-write</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>        envShared = ctx.envShared = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>        parentIsDns = ctx.parentIsDns;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>        domain = ctx.domain;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>        servers = ctx.servers;          // shared servers, no write operation</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>        resolver = ctx.resolver;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>        authoritative = ctx.authoritative;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>        recursion = ctx.recursion;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>        timeout = ctx.timeout;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>        retries = ctx.retries;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>        lookupCT = ctx.lookupCT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>    public void close() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>        if (resolver != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>            resolver.close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>            resolver = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>    //---------- Environment operations</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>     * Override default with a noncloning version.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>    protected Hashtable&lt;?,?&gt; p_getEnvironment() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>        return environment;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>    public Hashtable&lt;?,?&gt; getEnvironment() throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>        return (Hashtable&lt;?,?&gt;) environment.clone();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>    @SuppressWarnings(&quot;unchecked&quot;)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>    public Object addToEnvironment(String propName, Object propVal)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>        if (propName.equals(LOOKUP_ATTR)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>            lookupCT = getLookupCT((String) propVal);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>        } else if (propName.equals(Context.AUTHORITATIVE)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>            authoritative = &quot;true&quot;.equalsIgnoreCase((String) propVal);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>        } else if (propName.equals(RECURSION)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>            recursion = &quot;true&quot;.equalsIgnoreCase((String) propVal);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>        } else if (propName.equals(INIT_TIMEOUT)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>            int val = Integer.parseInt((String) propVal);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>            if (timeout != val) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>                timeout = val;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>                resolver = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>        } else if (propName.equals(RETRIES)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>            int val = Integer.parseInt((String) propVal);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>            if (retries != val) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>                retries = val;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>                resolver = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>        if (!envShared) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>            return environment.put(propName, propVal);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>        } else if (environment.get(propName) != propVal) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>            // copy on write</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>            environment = (Hashtable&lt;Object,Object&gt;) environment.clone();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>            envShared = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>            return environment.put(propName, propVal);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>            return propVal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>    @SuppressWarnings(&quot;unchecked&quot;)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>    public Object removeFromEnvironment(String propName)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>        if (propName.equals(LOOKUP_ATTR)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>            lookupCT = getLookupCT(null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>        } else if (propName.equals(Context.AUTHORITATIVE)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>            authoritative = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>        } else if (propName.equals(RECURSION)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>            recursion = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>        } else if (propName.equals(INIT_TIMEOUT)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>            if (timeout != DEFAULT_INIT_TIMEOUT) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>                timeout = DEFAULT_INIT_TIMEOUT;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>                resolver = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>        } else if (propName.equals(RETRIES)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>            if (retries != DEFAULT_RETRIES) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>                retries = DEFAULT_RETRIES;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>                resolver = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>        if (!envShared) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>            return environment.remove(propName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>        } else if (environment.get(propName) != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>            // copy-on-write</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>            environment = (Hashtable&lt;Object,Object&gt;) environment.clone();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>            envShared = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>            return environment.remove(propName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>     * Update PROVIDER_URL property.  Call this only when environment</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>     * is not being shared.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>    void setProviderUrl(String url) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>        // assert !envShared;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>        environment.put(Context.PROVIDER_URL, url);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>     * Read environment properties and set parameters.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>    private void initFromEnvironment()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>            throws InvalidAttributeIdentifierException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>        lookupCT = getLookupCT((String) environment.get(LOOKUP_ATTR));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>        authoritative = &quot;true&quot;.equalsIgnoreCase((String)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>                                       environment.get(Context.AUTHORITATIVE));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>        String val = (String) environment.get(RECURSION);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>        recursion = ((val == null) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>                     &quot;true&quot;.equalsIgnoreCase(val));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>        val = (String) environment.get(INIT_TIMEOUT);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>        timeout = (val == null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>            ? DEFAULT_INIT_TIMEOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>            : Integer.parseInt(val);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>        val = (String) environment.get(RETRIES);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>        retries = (val == null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>            ? DEFAULT_RETRIES</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>            : Integer.parseInt(val);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>    private CT getLookupCT(String attrId)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>            throws InvalidAttributeIdentifierException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>        return (attrId == null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>            ? new CT(ResourceRecord.CLASS_INTERNET, ResourceRecord.TYPE_TXT)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre>            : fromAttrId(attrId);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>    //---------- Naming operations</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>    public Object c_lookup(Name name, Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>        cont.setSuccess();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>        if (name.isEmpty()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>            DnsContext ctx = new DnsContext(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>            ctx.resolver = new Resolver(servers, timeout, retries);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>                                                // clone for parallelism</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>            return ctx;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>            DnsName fqdn = fullyQualify(name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>            ResourceRecords rrs =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>                getResolver().query(fqdn, lookupCT.rrclass, lookupCT.rrtype,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>                                    recursion, authoritative);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>            Attributes attrs = rrsToAttrs(rrs, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>            DnsContext ctx = new DnsContext(this, fqdn);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>            return DirectoryManager.getObjectInstance(ctx, name, this,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>                                                      environment, attrs);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>        } catch (NamingException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>            cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>            throw cont.fillInException(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>            cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>            NamingException ne = new NamingException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>                    &quot;Problem generating object using object factory&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>            ne.setRootCause(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>            throw cont.fillInException(ne);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>    public Object c_lookupLink(Name name, Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>        return c_lookup(name, cont);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>    public NamingEnumeration&lt;NameClassPair&gt; c_list(Name name, Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre>        cont.setSuccess();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>            DnsName fqdn = fullyQualify(name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>            NameNode nnode = getNameNode(fqdn);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>            DnsContext ctx = new DnsContext(this, fqdn);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>            return new NameClassPairEnumeration(ctx, nnode.getChildren());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>        } catch (NamingException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>            cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>            throw cont.fillInException(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>    public NamingEnumeration&lt;Binding&gt; c_listBindings(Name name, Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>        cont.setSuccess();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>            DnsName fqdn = fullyQualify(name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>            NameNode nnode = getNameNode(fqdn);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>            DnsContext ctx = new DnsContext(this, fqdn);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>            return new BindingEnumeration(ctx, nnode.getChildren());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>        } catch (NamingException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>            cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>            throw cont.fillInException(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>    public void c_bind(Name name, Object obj, Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>        cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>        throw cont.fillInException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>                new OperationNotSupportedException());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>    public void c_rebind(Name name, Object obj, Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>        cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>        throw cont.fillInException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>                new OperationNotSupportedException());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>    public void c_unbind(Name name, Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>        cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>        throw cont.fillInException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>                new OperationNotSupportedException());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>    public void c_rename(Name oldname, Name newname, Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>        cont.setError(this, oldname);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>        throw cont.fillInException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>                new OperationNotSupportedException());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>    public Context c_createSubcontext(Name name, Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>        cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>        throw cont.fillInException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>                new OperationNotSupportedException());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>    public void c_destroySubcontext(Name name, Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>        cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>        throw cont.fillInException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>                new OperationNotSupportedException());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>    public NameParser c_getNameParser(Name name, Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>        cont.setSuccess();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>        return nameParser;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>    //---------- Directory operations</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>    public void c_bind(Name name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>                       Object obj,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>                       Attributes attrs,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>                       Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>        cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>        throw cont.fillInException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>                new OperationNotSupportedException());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>    public void c_rebind(Name name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>                         Object obj,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>                         Attributes attrs,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>                         Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>        cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>        throw cont.fillInException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>                new OperationNotSupportedException());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>    public DirContext c_createSubcontext(Name name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>                                         Attributes attrs,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>                                         Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>        cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>        throw cont.fillInException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>                new OperationNotSupportedException());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>    public Attributes c_getAttributes(Name name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>                                      String[] attrIds,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>                                      Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>        cont.setSuccess();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>            DnsName fqdn = fullyQualify(name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>            CT[] cts = attrIdsToClassesAndTypes(attrIds);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>            CT ct = getClassAndTypeToQuery(cts);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>            ResourceRecords rrs =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>                getResolver().query(fqdn, ct.rrclass, ct.rrtype,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>                                    recursion, authoritative);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>            return rrsToAttrs(rrs, cts);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>        } catch (NamingException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>            cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>            throw cont.fillInException(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>    public void c_modifyAttributes(Name name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>                                   int mod_op,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>                                   Attributes attrs,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>                                   Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>        cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>        throw cont.fillInException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>                new OperationNotSupportedException());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>    public void c_modifyAttributes(Name name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>                                   ModificationItem[] mods,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>                                   Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>        cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>        throw cont.fillInException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>                new OperationNotSupportedException());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>    public NamingEnumeration&lt;SearchResult&gt; c_search(Name name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>                                      Attributes matchingAttributes,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>                                      String[] attributesToReturn,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>                                      Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>        throw new OperationNotSupportedException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>    public NamingEnumeration&lt;SearchResult&gt; c_search(Name name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>                                      String filter,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>                                      SearchControls cons,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>                                      Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>        throw new OperationNotSupportedException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>    public NamingEnumeration&lt;SearchResult&gt; c_search(Name name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>                                      String filterExpr,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>                                      Object[] filterArgs,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>                                      SearchControls cons,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>                                      Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>        throw new OperationNotSupportedException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>    public DirContext c_getSchema(Name name, Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>        cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>        throw cont.fillInException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>                new OperationNotSupportedException());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>    public DirContext c_getSchemaClassDefinition(Name name, Continuation cont)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>        cont.setError(this, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>        throw cont.fillInException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>                new OperationNotSupportedException());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>    //---------- Name-related operations</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>    public String getNameInNamespace() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>        return domain.toString();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>    public Name composeName(Name name, Name prefix) throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>        Name result;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>        // Any name that's not a CompositeName is assumed to be a DNS</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>        // compound name.  Convert each to a DnsName for syntax checking.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>        if (!(prefix instanceof DnsName || prefix instanceof CompositeName)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>            prefix = (new DnsName()).addAll(prefix);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>        if (!(name instanceof DnsName || name instanceof CompositeName)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>            name = (new DnsName()).addAll(name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>        // Each of prefix and name is now either a DnsName or a CompositeName.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>        // If we have two DnsNames, simply join them together.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>        if ((prefix instanceof DnsName) &amp;&amp; (name instanceof DnsName)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>            result = (DnsName) (prefix.clone());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>            result.addAll(name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>            return new CompositeName().add(result.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>        // Wrap compound names in composite names.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>        Name prefixC = (prefix instanceof CompositeName)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>            ? prefix</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>            : new CompositeName().add(prefix.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>        Name nameC = (name instanceof CompositeName)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>            ? name</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>            : new CompositeName().add(name.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>        int prefixLast = prefixC.size() - 1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>        // Let toolkit do the work at namespace boundaries.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>        if (nameC.isEmpty() || nameC.get(0).equals(&quot;&quot;) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>                prefixC.isEmpty() || prefixC.get(prefixLast).equals(&quot;&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>            return super.composeName(nameC, prefixC);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre>        result = (prefix == prefixC)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>            ? (CompositeName) prefixC.clone()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>            : prefixC;                  // prefixC is already a clone</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>        result.addAll(nameC);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>        if (parentIsDns) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>            DnsName dnsComp = (prefix instanceof DnsName)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>                           ? (DnsName) prefix.clone()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>                           : new DnsName(prefixC.get(prefixLast));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>            dnsComp.addAll((name instanceof DnsName)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>                           ? name</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>                           : new DnsName(nameC.get(0)));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>            result.remove(prefixLast + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>            result.remove(prefixLast);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>            result.add(prefixLast, dnsComp.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>        return result;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>    //---------- Helper methods</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>     * Resolver is not created until needed, to allow time for updates</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>     * to the environment.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre>    private synchronized Resolver getResolver() throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>        if (resolver == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre>            resolver = new Resolver(servers, timeout, retries);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>        return resolver;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>     * Returns the fully-qualified domain name of a name given</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>     * relative to this context.  Result includes a root label (an</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>     * empty component at position 0).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>    DnsName fullyQualify(Name name) throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>        if (name.isEmpty()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>            return domain;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>        DnsName dnsName = (name instanceof CompositeName)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>            ? new DnsName(name.get(0))                  // parse name</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>            : (DnsName) (new DnsName()).addAll(name);   // clone &amp; check syntax</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre>        if (dnsName.hasRootLabel()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>            // Be overly generous and allow root label if we're in root domain.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>            if (domain.size() == 1) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>                return dnsName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>                throw new InvalidNameException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>                       &quot;DNS name &quot; + dnsName + &quot; not relative to &quot; + domain);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>        return (DnsName) dnsName.addAll(0, domain);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>     * Converts resource records to an attribute set.  Only resource</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>     * records in the answer section are used, and only those that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre>     * match the classes and types in cts (see classAndTypeMatch()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>     * for matching rules).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>    private static Attributes rrsToAttrs(ResourceRecords rrs, CT[] cts) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>        BasicAttributes attrs = new BasicAttributes(true);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; rrs.answer.size(); i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>            ResourceRecord rr = rrs.answer.elementAt(i);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>            int rrtype  = rr.getType();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>            int rrclass = rr.getRrclass();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>            if (!classAndTypeMatch(rrclass, rrtype, cts)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre>                continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre>            String attrId = toAttrId(rrclass, rrtype);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>            Attribute attr = attrs.get(attrId);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre>            if (attr == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre>                attr = new BasicAttribute(attrId);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>                attrs.put(attr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>            attr.add(rr.getRdata());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>        return attrs;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre>     * Returns true if rrclass and rrtype match some element of cts.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>     * A match occurs if corresponding classes and types are equal,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>     * or if the array value is ANY.  If cts is null, then any class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre>     * and type match.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>    private static boolean classAndTypeMatch(int rrclass, int rrtype,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre>                                             CT[] cts) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>        if (cts == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>            return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; cts.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>            CT ct = cts[i];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre>            boolean classMatch = (ct.rrclass == ANY) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>                                 (ct.rrclass == rrclass);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre>            boolean typeMatch  = (ct.rrtype == ANY) ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>                                 (ct.rrtype == rrtype);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>            if (classMatch &amp;&amp; typeMatch) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>                return true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>        return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>     * Returns the attribute ID for a resource record given its class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre>     * and type.  If the record is in the internet class, the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>     * corresponding attribute ID is the record's type name (or the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>     * integer type value if the name is not known).  If the record is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>     * not in the internet class, the class name (or integer class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre>     * value) is prepended to the attribute ID, separated by a space.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre>     * A class or type value of ANY represents an indeterminate class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>     * or type, and is represented within the attribute ID by &quot;*&quot;.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre>     * For example, the attribute ID &quot;IN *&quot; represents</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>     * any type in the internet class, and &quot;* NS&quot; represents an NS</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre>     * record of any class.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>    private static String toAttrId(int rrclass, int rrtype) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre>        String attrId = ResourceRecord.getTypeName(rrtype);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>        if (rrclass != ResourceRecord.CLASS_INTERNET) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>            attrId = ResourceRecord.getRrclassName(rrclass) + &quot; &quot; + attrId;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>        return attrId;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>     * Returns the class and type values corresponding to an attribute</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>     * ID.  An indeterminate class or type is represented by ANY.  See</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre>     * toAttrId() for the format of attribute IDs.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre>     * @throws InvalidAttributeIdentifierException</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>     *          if class or type is unknown</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre>    private static CT fromAttrId(String attrId)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre>            throws InvalidAttributeIdentifierException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre>        if (attrId.equals(&quot;&quot;)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre>            throw new InvalidAttributeIdentifierException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre>                    &quot;Attribute ID cannot be empty&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre>        int rrclass;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>        int rrtype;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre>        int space = attrId.indexOf(' ');</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre>        // class</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre>        if (space &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>            rrclass = ResourceRecord.CLASS_INTERNET;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre>            String className = attrId.substring(0, space);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>            rrclass = ResourceRecord.getRrclass(className);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre>            if (rrclass &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre>                throw new InvalidAttributeIdentifierException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>                        &quot;Unknown resource record class '&quot; + className + '\'');</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>        // type</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre>        String typeName = attrId.substring(space + 1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre>        rrtype = ResourceRecord.getType(typeName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>        if (rrtype &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre>            throw new InvalidAttributeIdentifierException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre>                    &quot;Unknown resource record type '&quot; + typeName + '\'');</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre>        return new CT(rrclass, rrtype);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="719" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="720" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="721" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="722" href="#"></a></td>
+<td><pre>     * Returns an array of the classes and types corresponding to a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="723" href="#"></a></td>
+<td><pre>     * set of attribute IDs.  See toAttrId() for the format of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="724" href="#"></a></td>
+<td><pre>     * attribute IDs, and classAndTypeMatch() for the format of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="725" href="#"></a></td>
+<td><pre>     * array returned.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="726" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="727" href="#"></a></td>
+<td><pre>    private static CT[] attrIdsToClassesAndTypes(String[] attrIds)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="728" href="#"></a></td>
+<td><pre>            throws InvalidAttributeIdentifierException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="729" href="#"></a></td>
+<td><pre>        if (attrIds == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="730" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="731" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="732" href="#"></a></td>
+<td><pre>        CT[] cts = new CT[attrIds.length];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="733" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="734" href="#"></a></td>
+<td><pre>        for (int i = 0; i &lt; attrIds.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="735" href="#"></a></td>
+<td><pre>            cts[i] = fromAttrId(attrIds[i]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="736" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="737" href="#"></a></td>
+<td><pre>        return cts;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="738" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="739" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="740" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="741" href="#"></a></td>
+<td><pre>     * Returns the most restrictive resource record class and type</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="742" href="#"></a></td>
+<td><pre>     * that may be used to query for records matching cts.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="743" href="#"></a></td>
+<td><pre>     * See classAndTypeMatch() for matching rules.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="744" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="745" href="#"></a></td>
+<td><pre>    private static CT getClassAndTypeToQuery(CT[] cts) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="746" href="#"></a></td>
+<td><pre>        int rrclass;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="747" href="#"></a></td>
+<td><pre>        int rrtype;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="748" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="749" href="#"></a></td>
+<td><pre>        if (cts == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="750" href="#"></a></td>
+<td><pre>            // Query all records.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="751" href="#"></a></td>
+<td><pre>            rrclass = ANY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="752" href="#"></a></td>
+<td><pre>            rrtype  = ANY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="753" href="#"></a></td>
+<td><pre>        } else if (cts.length == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="754" href="#"></a></td>
+<td><pre>            // No records are requested, but we need to ask for something.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="755" href="#"></a></td>
+<td><pre>            rrclass = ResourceRecord.CLASS_INTERNET;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="756" href="#"></a></td>
+<td><pre>            rrtype  = ANY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="757" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="758" href="#"></a></td>
+<td><pre>            rrclass = cts[0].rrclass;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="759" href="#"></a></td>
+<td><pre>            rrtype  = cts[0].rrtype;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="760" href="#"></a></td>
+<td><pre>            for (int i = 1; i &lt; cts.length; i++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="761" href="#"></a></td>
+<td><pre>                if (rrclass != cts[i].rrclass) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="762" href="#"></a></td>
+<td><pre>                    rrclass = ANY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="763" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="764" href="#"></a></td>
+<td><pre>                if (rrtype != cts[i].rrtype) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="765" href="#"></a></td>
+<td><pre>                    rrtype = ANY;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="766" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="767" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="768" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="769" href="#"></a></td>
+<td><pre>        return new CT(rrclass, rrtype);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="770" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="771" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="772" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="773" href="#"></a></td>
+<td><pre>    //---------- Support for list operations</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="774" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="775" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="776" href="#"></a></td>
+<td><pre>     * Synchronization notes:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="777" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="778" href="#"></a></td>
+<td><pre>     * Any access to zoneTree that walks the tree, whether it modifies</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="779" href="#"></a></td>
+<td><pre>     * the tree or not, is synchronized on zoneTree.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="780" href="#"></a></td>
+<td><pre>     * [%%% Note:  a read/write lock would allow increased concurrency.]</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="781" href="#"></a></td>
+<td><pre>     * The depth of a ZoneNode can thereafter be accessed without</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="782" href="#"></a></td>
+<td><pre>     * further synchronization.  Access to other fields and methods</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="783" href="#"></a></td>
+<td><pre>     * should be synchronized on the node itself.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="784" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="785" href="#"></a></td>
+<td><pre>     * A zone's contents is a NameNode tree that, once created, is never</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="786" href="#"></a></td>
+<td><pre>     * modified.  The only synchronization needed is to ensure that it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="787" href="#"></a></td>
+<td><pre>     * gets flushed into shared memory after being created, which is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="788" href="#"></a></td>
+<td><pre>     * accomplished by ZoneNode.populate().  The contents are accessed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="789" href="#"></a></td>
+<td><pre>     * via a soft reference, so a ZoneNode may be seen to be populated</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="790" href="#"></a></td>
+<td><pre>     * one moment and unpopulated the next.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="791" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="792" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="793" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="794" href="#"></a></td>
+<td><pre>     * Returns the node in the zone tree corresponding to a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="795" href="#"></a></td>
+<td><pre>     * fully-qualified domain name.  If the desired portion of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="796" href="#"></a></td>
+<td><pre>     * tree has not yet been populated or has been outdated, a zone</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="797" href="#"></a></td>
+<td><pre>     * transfer is done to populate the tree.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="798" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="799" href="#"></a></td>
+<td><pre>    private NameNode getNameNode(DnsName fqdn) throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="800" href="#"></a></td>
+<td><pre>        dprint(&quot;getNameNode(&quot; + fqdn + &quot;)&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="801" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="802" href="#"></a></td>
+<td><pre>        // Find deepest related zone in zone tree.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="803" href="#"></a></td>
+<td><pre>        ZoneNode znode;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="804" href="#"></a></td>
+<td><pre>        DnsName zone;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="805" href="#"></a></td>
+<td><pre>        synchronized (zoneTree) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="806" href="#"></a></td>
+<td><pre>            znode = zoneTree.getDeepestPopulated(fqdn);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="807" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="808" href="#"></a></td>
+<td><pre>        dprint(&quot;Deepest related zone in zone tree: &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="809" href="#"></a></td>
+<td><pre>               ((znode != null) ? znode.getLabel() : &quot;[none]&quot;));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="810" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="811" href="#"></a></td>
+<td><pre>        NameNode topOfZone;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="812" href="#"></a></td>
+<td><pre>        NameNode nnode;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="813" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="814" href="#"></a></td>
+<td><pre>        if (znode != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="815" href="#"></a></td>
+<td><pre>            synchronized (znode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="816" href="#"></a></td>
+<td><pre>                topOfZone = znode.getContents();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="817" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="818" href="#"></a></td>
+<td><pre>            // If fqdn is in znode's zone, is not at a zone cut, and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="819" href="#"></a></td>
+<td><pre>            // is current, we're done.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="820" href="#"></a></td>
+<td><pre>            if (topOfZone != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="821" href="#"></a></td>
+<td><pre>                nnode = topOfZone.get(fqdn, znode.depth() + 1); // +1 for root</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="822" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="823" href="#"></a></td>
+<td><pre>                if ((nnode != null) &amp;&amp; !nnode.isZoneCut()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="824" href="#"></a></td>
+<td><pre>                    dprint(&quot;Found node &quot; + fqdn + &quot; in zone tree&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="825" href="#"></a></td>
+<td><pre>                    zone = (DnsName)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="826" href="#"></a></td>
+<td><pre>                        fqdn.getPrefix(znode.depth() + 1);      // +1 for root</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="827" href="#"></a></td>
+<td><pre>                    boolean current = isZoneCurrent(znode, zone);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="828" href="#"></a></td>
+<td><pre>                    boolean restart = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="829" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="830" href="#"></a></td>
+<td><pre>                    synchronized (znode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="831" href="#"></a></td>
+<td><pre>                        if (topOfZone != znode.getContents()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="832" href="#"></a></td>
+<td><pre>                            // Zone was modified while we were examining it.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="833" href="#"></a></td>
+<td><pre>                            // All bets are off.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="834" href="#"></a></td>
+<td><pre>                            restart = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="835" href="#"></a></td>
+<td><pre>                        } else if (!current) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="836" href="#"></a></td>
+<td><pre>                            znode.depopulate();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="837" href="#"></a></td>
+<td><pre>                        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="838" href="#"></a></td>
+<td><pre>                            return nnode;                       // cache hit!</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="839" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="840" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="841" href="#"></a></td>
+<td><pre>                    dprint(&quot;Zone not current; discarding node&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="842" href="#"></a></td>
+<td><pre>                    if (restart) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="843" href="#"></a></td>
+<td><pre>                        return getNameNode(fqdn);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="844" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="845" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="846" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="847" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="848" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="849" href="#"></a></td>
+<td><pre>        // Cache miss...  do it the expensive way.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="850" href="#"></a></td>
+<td><pre>        dprint(&quot;Adding node &quot; + fqdn + &quot; to zone tree&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="851" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="852" href="#"></a></td>
+<td><pre>        // Find fqdn's zone and add it to the tree.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="853" href="#"></a></td>
+<td><pre>        zone = getResolver().findZoneName(fqdn, ResourceRecord.CLASS_INTERNET,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="854" href="#"></a></td>
+<td><pre>                                          recursion);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="855" href="#"></a></td>
+<td><pre>        dprint(&quot;Node's zone is &quot; + zone);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="856" href="#"></a></td>
+<td><pre>        synchronized (zoneTree) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="857" href="#"></a></td>
+<td><pre>            znode = (ZoneNode) zoneTree.add(zone, 1);   // &quot;1&quot; to skip root</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="858" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="859" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="860" href="#"></a></td>
+<td><pre>        // If znode is now populated we know -- because the first half of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="861" href="#"></a></td>
+<td><pre>        // getNodeName() didn't find it -- that it was populated by another</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="862" href="#"></a></td>
+<td><pre>        // thread during this method call.  Assume then that it's current.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="863" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="864" href="#"></a></td>
+<td><pre>        synchronized (znode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="865" href="#"></a></td>
+<td><pre>            topOfZone = znode.isPopulated()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="866" href="#"></a></td>
+<td><pre>                ? znode.getContents()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="867" href="#"></a></td>
+<td><pre>                : populateZone(znode, zone);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="868" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="869" href="#"></a></td>
+<td><pre>        // Desired node should now be in znode's populated zone.  Find it.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="870" href="#"></a></td>
+<td><pre>        nnode = topOfZone.get(fqdn, zone.size());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="871" href="#"></a></td>
+<td><pre>        if (nnode == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="872" href="#"></a></td>
+<td><pre>            throw new ConfigurationException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="873" href="#"></a></td>
+<td><pre>                    &quot;DNS error: node not found in its own zone&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="874" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="875" href="#"></a></td>
+<td><pre>        dprint(&quot;Found node in newly-populated zone&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="876" href="#"></a></td>
+<td><pre>        return nnode;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="877" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="878" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="879" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="880" href="#"></a></td>
+<td><pre>     * Does a zone transfer to [re]populate a zone in the zone tree.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="881" href="#"></a></td>
+<td><pre>     * Returns the zone's new contents.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="882" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="883" href="#"></a></td>
+<td><pre>    private NameNode populateZone(ZoneNode znode, DnsName zone)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="884" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="885" href="#"></a></td>
+<td><pre>        dprint(&quot;Populating zone &quot; + zone);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="886" href="#"></a></td>
+<td><pre>        // assert Thread.holdsLock(znode);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="887" href="#"></a></td>
+<td><pre>        ResourceRecords rrs =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="888" href="#"></a></td>
+<td><pre>            getResolver().queryZone(zone,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="889" href="#"></a></td>
+<td><pre>                                    ResourceRecord.CLASS_INTERNET, recursion);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="890" href="#"></a></td>
+<td><pre>        dprint(&quot;zone xfer complete: &quot; + rrs.answer.size() + &quot; records&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="891" href="#"></a></td>
+<td><pre>        return znode.populate(zone, rrs);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="892" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="893" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="894" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="895" href="#"></a></td>
+<td><pre>     * Determine if a ZoneNode's data is current.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="896" href="#"></a></td>
+<td><pre>     * We base this on a comparison between the cached serial</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="897" href="#"></a></td>
+<td><pre>     * number and the latest SOA record.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="898" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="899" href="#"></a></td>
+<td><pre>     * If there is no SOA record, znode is not (or is no longer) a zone:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="900" href="#"></a></td>
+<td><pre>     * depopulate znode and return false.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="901" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="902" href="#"></a></td>
+<td><pre>     * Since this method may perform a network operation, it is best</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="903" href="#"></a></td>
+<td><pre>     * to call it with znode unlocked.  Caller must then note that the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="904" href="#"></a></td>
+<td><pre>     * result may be outdated by the time this method returns.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="905" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="906" href="#"></a></td>
+<td><pre>    private boolean isZoneCurrent(ZoneNode znode, DnsName zone)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="907" href="#"></a></td>
+<td><pre>            throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="908" href="#"></a></td>
+<td><pre>        // former version:  return !znode.isExpired();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="909" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="910" href="#"></a></td>
+<td><pre>        if (!znode.isPopulated()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="911" href="#"></a></td>
+<td><pre>            return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="912" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="913" href="#"></a></td>
+<td><pre>        ResourceRecord soa =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="914" href="#"></a></td>
+<td><pre>            getResolver().findSoa(zone, ResourceRecord.CLASS_INTERNET,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="915" href="#"></a></td>
+<td><pre>                                  recursion);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="916" href="#"></a></td>
+<td><pre>        synchronized (znode) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="917" href="#"></a></td>
+<td><pre>            if (soa == null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="918" href="#"></a></td>
+<td><pre>                znode.depopulate();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="919" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="920" href="#"></a></td>
+<td><pre>            return (znode.isPopulated() &amp;&amp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="921" href="#"></a></td>
+<td><pre>                    znode.compareSerialNumberTo(soa) &gt;= 0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="922" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="923" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="924" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="925" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="926" href="#"></a></td>
+<td><pre>    //---------- Debugging</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="927" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="928" href="#"></a></td>
+<td><pre>    private static final boolean debug = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="929" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="930" href="#"></a></td>
+<td><pre>    private static final void dprint(String msg) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="931" href="#"></a></td>
+<td><pre>        if (debug) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="932" href="#"></a></td>
+<td><pre>            System.err.println(&quot;** &quot; + msg);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="933" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="934" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="935" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="936" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="937" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="938" href="#"></a></td>
+<td><pre>//----------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="939" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="940" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="941" href="#"></a></td>
+<td><pre> * A pairing of a resource record class and a resource record type.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="942" href="#"></a></td>
+<td><pre> * A value of ANY in either field represents an indeterminate value.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="943" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="944" href="#"></a></td>
+<td><pre>class CT {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="945" href="#"></a></td>
+<td><pre>    int rrclass;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="946" href="#"></a></td>
+<td><pre>    int rrtype;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="947" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="948" href="#"></a></td>
+<td><pre>    CT(int rrclass, int rrtype) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="949" href="#"></a></td>
+<td><pre>        this.rrclass = rrclass;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="950" href="#"></a></td>
+<td><pre>        this.rrtype = rrtype;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="951" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="952" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="953" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="954" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="955" href="#"></a></td>
+<td><pre>//----------</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="956" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="957" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="958" href="#"></a></td>
+<td><pre> * Common base class for NameClassPairEnumeration and BindingEnumeration.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="959" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="960" href="#"></a></td>
+<td><pre>abstract class BaseNameClassPairEnumeration&lt;T&gt; implements NamingEnumeration&lt;T&gt; {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="961" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="962" href="#"></a></td>
+<td><pre>    protected Enumeration&lt;NameNode&gt; nodes;    // nodes to be enumerated, or null if none</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="963" href="#"></a></td>
+<td><pre>    protected DnsContext ctx;       // context being enumerated</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="964" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="965" href="#"></a></td>
+<td><pre>    BaseNameClassPairEnumeration(DnsContext ctx, Hashtable&lt;String,NameNode&gt; nodes) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="966" href="#"></a></td>
+<td><pre>        this.ctx = ctx;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="967" href="#"></a></td>
+<td><pre>        this.nodes = (nodes != null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="968" href="#"></a></td>
+<td><pre>            ? nodes.elements()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="969" href="#"></a></td>
+<td><pre>            : null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="970" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="971" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="972" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="973" href="#"></a></td>
+<td><pre>     * ctx will be set to null when no longer needed by the enumeration.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="974" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="975" href="#"></a></td>
+<td><pre>    public final void close() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="976" href="#"></a></td>
+<td><pre>        nodes = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="977" href="#"></a></td>
+<td><pre>        ctx = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="978" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="979" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="980" href="#"></a></td>
+<td><pre>    public final boolean hasMore() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="981" href="#"></a></td>
+<td><pre>        boolean more = ((nodes != null) &amp;&amp; nodes.hasMoreElements());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="982" href="#"></a></td>
+<td><pre>        if (!more) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="983" href="#"></a></td>
+<td><pre>            close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="984" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="985" href="#"></a></td>
+<td><pre>        return more;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="986" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="987" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="988" href="#"></a></td>
+<td><pre>    public final boolean hasMoreElements() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="989" href="#"></a></td>
+<td><pre>        return hasMore();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="990" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="991" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="992" href="#"></a></td>
+<td><pre>    abstract public T next() throws NamingException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="993" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="994" href="#"></a></td>
+<td><pre>    public final T nextElement() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="995" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="996" href="#"></a></td>
+<td><pre>            return next();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="997" href="#"></a></td>
+<td><pre>        } catch (NamingException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="998" href="#"></a></td>
+<td><pre>            java.util.NoSuchElementException nsee =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="999" href="#"></a></td>
+<td><pre>                    new java.util.NoSuchElementException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1000" href="#"></a></td>
+<td><pre>            nsee.initCause(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1001" href="#"></a></td>
+<td><pre>            throw nsee;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1002" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1003" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1004" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1005" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1006" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1007" href="#"></a></td>
+<td><pre> * An enumeration of name/classname pairs.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1008" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1009" href="#"></a></td>
+<td><pre> * Nodes that have children or that are zone cuts are returned with</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1010" href="#"></a></td>
+<td><pre> * classname DirContext.  Other nodes are returned with classname</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1011" href="#"></a></td>
+<td><pre> * Object even though they are DirContexts as well, since this might</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1012" href="#"></a></td>
+<td><pre> * make the namespace easier to browse.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1013" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1014" href="#"></a></td>
+<td><pre>final class NameClassPairEnumeration</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1015" href="#"></a></td>
+<td><pre>        extends BaseNameClassPairEnumeration&lt;NameClassPair&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1016" href="#"></a></td>
+<td><pre>        implements NamingEnumeration&lt;NameClassPair&gt; {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1017" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1018" href="#"></a></td>
+<td><pre>    NameClassPairEnumeration(DnsContext ctx, Hashtable&lt;String,NameNode&gt; nodes) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1019" href="#"></a></td>
+<td><pre>        super(ctx, nodes);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1020" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1021" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1022" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1023" href="#"></a></td>
+<td><pre>    public NameClassPair next() throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1024" href="#"></a></td>
+<td><pre>        if (!hasMore()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1025" href="#"></a></td>
+<td><pre>            throw new java.util.NoSuchElementException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1026" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1027" href="#"></a></td>
+<td><pre>        NameNode nnode = nodes.nextElement();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1028" href="#"></a></td>
+<td><pre>        String className = (nnode.isZoneCut() ||</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1029" href="#"></a></td>
+<td><pre>                            (nnode.getChildren() != null))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1030" href="#"></a></td>
+<td><pre>            ? &quot;javax.naming.directory.DirContext&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1031" href="#"></a></td>
+<td><pre>            : &quot;java.lang.Object&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1032" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1033" href="#"></a></td>
+<td><pre>        String label = nnode.getLabel();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1034" href="#"></a></td>
+<td><pre>        Name compName = (new DnsName()).add(label);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1035" href="#"></a></td>
+<td><pre>        Name cname = (new CompositeName()).add(compName.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1036" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1037" href="#"></a></td>
+<td><pre>        NameClassPair ncp = new NameClassPair(cname.toString(), className);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1038" href="#"></a></td>
+<td><pre>        ncp.setNameInNamespace(ctx.fullyQualify(cname).toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1039" href="#"></a></td>
+<td><pre>        return ncp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1040" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1041" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1042" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1043" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1044" href="#"></a></td>
+<td><pre> * An enumeration of Bindings.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1045" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1046" href="#"></a></td>
+<td><pre>final class BindingEnumeration extends BaseNameClassPairEnumeration&lt;Binding&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1047" href="#"></a></td>
+<td><pre>                         implements NamingEnumeration&lt;Binding&gt; {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1048" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1049" href="#"></a></td>
+<td><pre>    BindingEnumeration(DnsContext ctx, Hashtable&lt;String,NameNode&gt; nodes) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1050" href="#"></a></td>
+<td><pre>        super(ctx, nodes);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1051" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1052" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1053" href="#"></a></td>
+<td><pre>    // Finalizer not needed since it's safe to leave ctx unclosed.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1054" href="#"></a></td>
+<td><pre>//  protected void finalize() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1055" href="#"></a></td>
+<td><pre>//      close();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1056" href="#"></a></td>
+<td><pre>//  }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1057" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1058" href="#"></a></td>
+<td><pre>    @Override</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1059" href="#"></a></td>
+<td><pre>    public Binding next() throws NamingException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1060" href="#"></a></td>
+<td><pre>        if (!hasMore()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1061" href="#"></a></td>
+<td><pre>            throw (new java.util.NoSuchElementException());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1062" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1063" href="#"></a></td>
+<td><pre>        NameNode nnode = nodes.nextElement();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1064" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1065" href="#"></a></td>
+<td><pre>        String label = nnode.getLabel();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1066" href="#"></a></td>
+<td><pre>        Name compName = (new DnsName()).add(label);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1067" href="#"></a></td>
+<td><pre>        String compNameStr = compName.toString();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1068" href="#"></a></td>
+<td><pre>        Name cname = (new CompositeName()).add(compNameStr);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1069" href="#"></a></td>
+<td><pre>        String cnameStr = cname.toString();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1070" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1071" href="#"></a></td>
+<td><pre>        DnsName fqdn = ctx.fullyQualify(compName);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1072" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1073" href="#"></a></td>
+<td><pre>        // Clone ctx to create the child context.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1074" href="#"></a></td>
+<td><pre>        DnsContext child = new DnsContext(ctx, fqdn);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1075" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1076" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1077" href="#"></a></td>
+<td><pre>            Object obj = DirectoryManager.getObjectInstance(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1078" href="#"></a></td>
+<td><pre>                    child, cname, ctx, child.environment, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1079" href="#"></a></td>
+<td><pre>            Binding binding = new Binding(cnameStr, obj);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1080" href="#"></a></td>
+<td><pre>            binding.setNameInNamespace(ctx.fullyQualify(cname).toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1081" href="#"></a></td>
+<td><pre>            return binding;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1082" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1083" href="#"></a></td>
+<td><pre>            NamingException ne = new NamingException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1084" href="#"></a></td>
+<td><pre>                    &quot;Problem generating object using object factory&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1085" href="#"></a></td>
+<td><pre>            ne.setRootCause(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1086" href="#"></a></td>
+<td><pre>            throw ne;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1087" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1088" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="1089" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

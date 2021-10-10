@@ -3,859 +3,3415 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2003, 2013, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package com.sun.jmx.remote.internal;
-
-import java.security.AccessController;
-import java.security.PrivilegedAction;
-import java.security.PrivilegedActionException;
-import java.security.PrivilegedExceptionAction;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-import java.util.HashMap;
-import java.util.Map;
-
-import javax.management.InstanceNotFoundException;
-import javax.management.MBeanServer;
-import javax.management.MBeanServerDelegate;
-import javax.management.MBeanServerNotification;
-import javax.management.Notification;
-import javax.management.NotificationBroadcaster;
-import javax.management.NotificationFilter;
-import javax.management.NotificationFilterSupport;
-import javax.management.NotificationListener;
-import javax.management.ObjectName;
-import javax.management.QueryEval;
-import javax.management.QueryExp;
-
-import javax.management.remote.NotificationResult;
-import javax.management.remote.TargetedNotification;
-
-import com.sun.jmx.remote.util.EnvHelp;
-import com.sun.jmx.remote.util.ClassLogger;
-
-/** A circular buffer of notifications received from an MBean server. */
-/*
-  There is one instance of ArrayNotificationBuffer for every
-  MBeanServer object that has an attached ConnectorServer.  Then, for
-  every ConnectorServer attached to a given MBeanServer, there is an
-  instance of the inner class ShareBuffer.  So for example with two
-  ConnectorServers it looks like this:
-
-  ConnectorServer1 -&gt; ShareBuffer1 -\
-                                     }-&gt; ArrayNotificationBuffer
-  ConnectorServer2 -&gt; ShareBuffer2 -/              |
-                                                   |
-                                                   v
-                                              MBeanServer
-
-  The ArrayNotificationBuffer has a circular buffer of
-  NamedNotification objects.  Each ConnectorServer defines a
-  notification buffer size, and this size is recorded by the
-  corresponding ShareBuffer.  The buffer size of the
-  ArrayNotificationBuffer is the maximum of all of its ShareBuffers.
-  When a ShareBuffer is added or removed, the ArrayNotificationBuffer
-  size is adjusted accordingly.
-
-  An ArrayNotificationBuffer also has a BufferListener (which is a
-  NotificationListener) registered on every NotificationBroadcaster
-  MBean in the MBeanServer to which it is attached.  The cost of this
-  potentially large set of listeners is the principal motivation for
-  sharing the ArrayNotificationBuffer between ConnectorServers, and
-  also the reason that we are careful to discard the
-  ArrayNotificationBuffer (and its BufferListeners) when there are no
-  longer any ConnectorServers using it.
-
-  The synchronization of this class is inherently complex.  In an attempt
-  to limit the complexity, we use just two locks:
-
-  - globalLock controls access to the mapping between an MBeanServer
-    and its ArrayNotificationBuffer and to the set of ShareBuffers for
-    each ArrayNotificationBuffer.
-
-  - the instance lock of each ArrayNotificationBuffer controls access
-    to the array of notifications, including its size, and to the
-    dispose flag of the ArrayNotificationBuffer.  The wait/notify
-    mechanism is used to indicate changes to the array.
-
-  If both locks are held at the same time, the globalLock must be
-  taken first.
-
-  Since adding or removing a BufferListener to an MBean can involve
-  calling user code, we are careful not to hold any locks while it is
-  done.
- */
-public class ArrayNotificationBuffer implements NotificationBuffer {
-    private boolean disposed = false;
-
-    // FACTORY STUFF, INCLUDING SHARING
-
-    private static final Object globalLock = new Object();
-    private static final
-        HashMap&lt;MBeanServer,ArrayNotificationBuffer&gt; mbsToBuffer =
-        new HashMap&lt;MBeanServer,ArrayNotificationBuffer&gt;(1);
-    private final Collection&lt;ShareBuffer&gt; sharers = new HashSet&lt;ShareBuffer&gt;(1);
-
-    public static NotificationBuffer getNotificationBuffer(
-            MBeanServer mbs, Map&lt;String, ?&gt; env) {
-
-        if (env == null)
-            env = Collections.emptyMap();
-
-        //Find out queue size
-        int queueSize = EnvHelp.getNotifBufferSize(env);
-
-        ArrayNotificationBuffer buf;
-        boolean create;
-        NotificationBuffer sharer;
-        synchronized (globalLock) {
-            buf = mbsToBuffer.get(mbs);
-            create = (buf == null);
-            if (create) {
-                buf = new ArrayNotificationBuffer(mbs, queueSize);
-                mbsToBuffer.put(mbs, buf);
-            }
-            sharer = buf.new ShareBuffer(queueSize);
-        }
-        /* We avoid holding any locks while calling createListeners.
-         * This prevents possible deadlocks involving user code, but
-         * does mean that a second ConnectorServer created and started
-         * in this window will return before all the listeners are ready,
-         * which could lead to surprising behaviour.  The alternative
-         * would be to block the second ConnectorServer until the first
-         * one has finished adding all the listeners, but that would then
-         * be subject to deadlock.
-         */
-        if (create)
-            buf.createListeners();
-        return sharer;
-    }
-
-    /* Ensure that this buffer is no longer the one that will be returned by
-     * getNotificationBuffer.  This method is idempotent - calling it more
-     * than once has no effect beyond that of calling it once.
-     */
-    static void removeNotificationBuffer(MBeanServer mbs) {
-        synchronized (globalLock) {
-            mbsToBuffer.remove(mbs);
-        }
-    }
-
-    void addSharer(ShareBuffer sharer) {
-        synchronized (globalLock) {
-            synchronized (this) {
-                if (sharer.getSize() &gt; queueSize)
-                    resize(sharer.getSize());
-            }
-            sharers.add(sharer);
-        }
-    }
-
-    private void removeSharer(ShareBuffer sharer) {
-        boolean empty;
-        synchronized (globalLock) {
-            sharers.remove(sharer);
-            empty = sharers.isEmpty();
-            if (empty)
-                removeNotificationBuffer(mBeanServer);
-            else {
-                int max = 0;
-                for (ShareBuffer buf : sharers) {
-                    int bufsize = buf.getSize();
-                    if (bufsize &gt; max)
-                        max = bufsize;
-                }
-                if (max &lt; queueSize)
-                    resize(max);
-            }
-        }
-        if (empty) {
-            synchronized (this) {
-                disposed = true;
-                // Notify potential waiting fetchNotification call
-                notifyAll();
-            }
-            destroyListeners();
-        }
-    }
-
-    private synchronized void resize(int newSize) {
-        if (newSize == queueSize)
-            return;
-        while (queue.size() &gt; newSize)
-            dropNotification();
-        queue.resize(newSize);
-        queueSize = newSize;
-    }
-
-    private class ShareBuffer implements NotificationBuffer {
-        ShareBuffer(int size) {
-            this.size = size;
-            addSharer(this);
-        }
-
-        public NotificationResult
-            fetchNotifications(NotificationBufferFilter filter,
-                               long startSequenceNumber,
-                               long timeout,
-                               int maxNotifications)
-                throws InterruptedException {
-            NotificationBuffer buf = ArrayNotificationBuffer.this;
-            return buf.fetchNotifications(filter, startSequenceNumber,
-                                          timeout, maxNotifications);
-        }
-
-        public void dispose() {
-            ArrayNotificationBuffer.this.removeSharer(this);
-        }
-
-        int getSize() {
-            return size;
-        }
-
-        private final int size;
-    }
-
-
-    // ARRAYNOTIFICATIONBUFFER IMPLEMENTATION
-
-    private ArrayNotificationBuffer(MBeanServer mbs, int queueSize) {
-        if (logger.traceOn())
-            logger.trace(&quot;Constructor&quot;, &quot;queueSize=&quot; + queueSize);
-
-        if (mbs == null || queueSize &lt; 1)
-            throw new IllegalArgumentException(&quot;Bad args&quot;);
-
-        this.mBeanServer = mbs;
-        this.queueSize = queueSize;
-        this.queue = new ArrayQueue&lt;NamedNotification&gt;(queueSize);
-        this.earliestSequenceNumber = System.currentTimeMillis();
-        this.nextSequenceNumber = this.earliestSequenceNumber;
-
-        logger.trace(&quot;Constructor&quot;, &quot;ends&quot;);
-    }
-
-    private synchronized boolean isDisposed() {
-        return disposed;
-    }
-
-    // We no longer support calling this method from outside.
-    // The JDK doesn't contain any such calls and users are not
-    // supposed to be accessing this class.
-    public void dispose() {
-        throw new UnsupportedOperationException();
-    }
-
-    /**
-     * &lt;p&gt;Fetch notifications that match the given listeners.&lt;/p&gt;
-     *
-     * &lt;p&gt;The operation only considers notifications with a sequence
-     * number at least &lt;code&gt;startSequenceNumber&lt;/code&gt;.  It will take
-     * no longer than &lt;code&gt;timeout&lt;/code&gt;, and will return no more
-     * than &lt;code&gt;maxNotifications&lt;/code&gt; different notifications.&lt;/p&gt;
-     *
-     * &lt;p&gt;If there are no notifications matching the criteria, the
-     * operation will block until one arrives, subject to the
-     * timeout.&lt;/p&gt;
-     *
-     * @param filter an object that will add notifications to a
-     * {@code List&lt;TargetedNotification&gt;} if they match the current
-     * listeners with their filters.
-     * @param startSequenceNumber the first sequence number to
-     * consider.
-     * @param timeout the maximum time to wait.  May be 0 to indicate
-     * not to wait if there are no notifications.
-     * @param maxNotifications the maximum number of notifications to
-     * return.  May be 0 to indicate a wait for eligible notifications
-     * that will return a usable &lt;code&gt;nextSequenceNumber&lt;/code&gt;.  The
-     * {@link TargetedNotification} array in the returned {@link
-     * NotificationResult} may contain more than this number of
-     * elements but will not contain more than this number of
-     * different notifications.
-     */
-    public NotificationResult
-        fetchNotifications(NotificationBufferFilter filter,
-                           long startSequenceNumber,
-                           long timeout,
-                           int maxNotifications)
-            throws InterruptedException {
-
-        logger.trace(&quot;fetchNotifications&quot;, &quot;starts&quot;);
-
-        if (startSequenceNumber &lt; 0 || isDisposed()) {
-            synchronized(this) {
-                return new NotificationResult(earliestSequenceNumber(),
-                                              nextSequenceNumber(),
-                                              new TargetedNotification[0]);
-            }
-        }
-
-        // Check arg validity
-        if (filter == null
-            || startSequenceNumber &lt; 0 || timeout &lt; 0
-            || maxNotifications &lt; 0) {
-            logger.trace(&quot;fetchNotifications&quot;, &quot;Bad args&quot;);
-            throw new IllegalArgumentException(&quot;Bad args to fetch&quot;);
-        }
-
-        if (logger.debugOn()) {
-            logger.trace(&quot;fetchNotifications&quot;,
-                  &quot;filter=&quot; + filter + &quot;; startSeq=&quot; +
-                  startSequenceNumber + &quot;; timeout=&quot; + timeout +
-                  &quot;; max=&quot; + maxNotifications);
-        }
-
-        if (startSequenceNumber &gt; nextSequenceNumber()) {
-            final String msg = &quot;Start sequence number too big: &quot; +
-                startSequenceNumber + &quot; &gt; &quot; + nextSequenceNumber();
-            logger.trace(&quot;fetchNotifications&quot;, msg);
-            throw new IllegalArgumentException(msg);
-        }
-
-        /* Determine the end time corresponding to the timeout value.
-           Caller may legitimately supply Long.MAX_VALUE to indicate no
-           timeout.  In that case the addition will overflow and produce
-           a negative end time.  Set end time to Long.MAX_VALUE in that
-           case.  We assume System.currentTimeMillis() is positive.  */
-        long endTime = System.currentTimeMillis() + timeout;
-        if (endTime &lt; 0) // overflow
-            endTime = Long.MAX_VALUE;
-
-        if (logger.debugOn())
-            logger.debug(&quot;fetchNotifications&quot;, &quot;endTime=&quot; + endTime);
-
-        /* We set earliestSeq the first time through the loop.  If we
-           set it here, notifications could be dropped before we
-           started examining them, so earliestSeq might not correspond
-           to the earliest notification we examined.  */
-        long earliestSeq = -1;
-        long nextSeq = startSequenceNumber;
-        List&lt;TargetedNotification&gt; notifs =
-            new ArrayList&lt;TargetedNotification&gt;();
-
-        /* On exit from this loop, notifs, earliestSeq, and nextSeq must
-           all be correct values for the returned NotificationResult.  */
-        while (true) {
-            logger.debug(&quot;fetchNotifications&quot;, &quot;main loop starts&quot;);
-
-            NamedNotification candidate;
-
-            /* Get the next available notification regardless of filters,
-               or wait for one to arrive if there is none.  */
-            synchronized (this) {
-
-                /* First time through.  The current earliestSequenceNumber
-                   is the first one we could have examined.  */
-                if (earliestSeq &lt; 0) {
-                    earliestSeq = earliestSequenceNumber();
-                    if (logger.debugOn()) {
-                        logger.debug(&quot;fetchNotifications&quot;,
-                              &quot;earliestSeq=&quot; + earliestSeq);
-                    }
-                    if (nextSeq &lt; earliestSeq) {
-                        nextSeq = earliestSeq;
-                        logger.debug(&quot;fetchNotifications&quot;,
-                                     &quot;nextSeq=earliestSeq&quot;);
-                    }
-                } else
-                    earliestSeq = earliestSequenceNumber();
-
-                /* If many notifications have been dropped since the
-                   last time through, nextSeq could now be earlier
-                   than the current earliest.  If so, notifications
-                   may have been lost and we return now so the caller
-                   can see this next time it calls.  */
-                if (nextSeq &lt; earliestSeq) {
-                    logger.trace(&quot;fetchNotifications&quot;,
-                          &quot;nextSeq=&quot; + nextSeq + &quot; &lt; &quot; + &quot;earliestSeq=&quot; +
-                          earliestSeq + &quot; so may have lost notifs&quot;);
-                    break;
-                }
-
-                if (nextSeq &lt; nextSequenceNumber()) {
-                    candidate = notificationAt(nextSeq);
-                    // Skip security check if NotificationBufferFilter is not overloaded
-                    if (!(filter instanceof ServerNotifForwarder.NotifForwarderBufferFilter)) {
-                        try {
-                            ServerNotifForwarder.checkMBeanPermission(this.mBeanServer,
-                                                      candidate.getObjectName(),&quot;addNotificationListener&quot;);
-                        } catch (InstanceNotFoundException | SecurityException e) {
-                            if (logger.debugOn()) {
-                                logger.debug(&quot;fetchNotifications&quot;, &quot;candidate: &quot; + candidate + &quot; skipped. exception &quot; + e);
-                            }
-                            ++nextSeq;
-                            continue;
-                        }
-                    }
-
-                    if (logger.debugOn()) {
-                        logger.debug(&quot;fetchNotifications&quot;, &quot;candidate: &quot; +
-                                     candidate);
-                        logger.debug(&quot;fetchNotifications&quot;, &quot;nextSeq now &quot; +
-                                     nextSeq);
-                    }
-                } else {
-                    /* nextSeq is the largest sequence number.  If we
-                       already got notifications, return them now.
-                       Otherwise wait for some to arrive, with
-                       timeout.  */
-                    if (notifs.size() &gt; 0) {
-                        logger.debug(&quot;fetchNotifications&quot;,
-                              &quot;no more notifs but have some so don't wait&quot;);
-                        break;
-                    }
-                    long toWait = endTime - System.currentTimeMillis();
-                    if (toWait &lt;= 0) {
-                        logger.debug(&quot;fetchNotifications&quot;, &quot;timeout&quot;);
-                        break;
-                    }
-
-                    /* dispose called */
-                    if (isDisposed()) {
-                        if (logger.debugOn())
-                            logger.debug(&quot;fetchNotifications&quot;,
-                                         &quot;dispose callled, no wait&quot;);
-                        return new NotificationResult(earliestSequenceNumber(),
-                                                  nextSequenceNumber(),
-                                                  new TargetedNotification[0]);
-                    }
-
-                    if (logger.debugOn())
-                        logger.debug(&quot;fetchNotifications&quot;,
-                                     &quot;wait(&quot; + toWait + &quot;)&quot;);
-                    wait(toWait);
-
-                    continue;
-                }
-            }
-
-            /* We have a candidate notification.  See if it matches
-               our filters.  We do this outside the synchronized block
-               so we don't hold up everyone accessing the buffer
-               (including notification senders) while we evaluate
-               potentially slow filters.  */
-            ObjectName name = candidate.getObjectName();
-            Notification notif = candidate.getNotification();
-            List&lt;TargetedNotification&gt; matchedNotifs =
-                new ArrayList&lt;TargetedNotification&gt;();
-            logger.debug(&quot;fetchNotifications&quot;,
-                         &quot;applying filter to candidate&quot;);
-            filter.apply(matchedNotifs, name, notif);
-
-            if (matchedNotifs.size() &gt; 0) {
-                /* We only check the max size now, so that our
-                   returned nextSeq is as large as possible.  This
-                   prevents the caller from thinking it missed
-                   interesting notifications when in fact we knew they
-                   weren't.  */
-                if (maxNotifications &lt;= 0) {
-                    logger.debug(&quot;fetchNotifications&quot;,
-                                 &quot;reached maxNotifications&quot;);
-                    break;
-                }
-                --maxNotifications;
-                if (logger.debugOn())
-                    logger.debug(&quot;fetchNotifications&quot;, &quot;add: &quot; +
-                                 matchedNotifs);
-                notifs.addAll(matchedNotifs);
-            }
-
-            ++nextSeq;
-        } // end while
-
-        /* Construct and return the result.  */
-        int nnotifs = notifs.size();
-        TargetedNotification[] resultNotifs =
-            new TargetedNotification[nnotifs];
-        notifs.toArray(resultNotifs);
-        NotificationResult nr =
-            new NotificationResult(earliestSeq, nextSeq, resultNotifs);
-        if (logger.debugOn())
-            logger.debug(&quot;fetchNotifications&quot;, nr.toString());
-        logger.trace(&quot;fetchNotifications&quot;, &quot;ends&quot;);
-
-        return nr;
-    }
-
-    synchronized long earliestSequenceNumber() {
-        return earliestSequenceNumber;
-    }
-
-    synchronized long nextSequenceNumber() {
-        return nextSequenceNumber;
-    }
-
-    synchronized void addNotification(NamedNotification notif) {
-        if (logger.traceOn())
-            logger.trace(&quot;addNotification&quot;, notif.toString());
-
-        while (queue.size() &gt;= queueSize) {
-            dropNotification();
-            if (logger.debugOn()) {
-                logger.debug(&quot;addNotification&quot;,
-                      &quot;dropped oldest notif, earliestSeq=&quot; +
-                      earliestSequenceNumber);
-            }
-        }
-        queue.add(notif);
-        nextSequenceNumber++;
-        if (logger.debugOn())
-            logger.debug(&quot;addNotification&quot;, &quot;nextSeq=&quot; + nextSequenceNumber);
-        notifyAll();
-    }
-
-    private void dropNotification() {
-        queue.remove(0);
-        earliestSequenceNumber++;
-    }
-
-    synchronized NamedNotification notificationAt(long seqNo) {
-        long index = seqNo - earliestSequenceNumber;
-        if (index &lt; 0 || index &gt; Integer.MAX_VALUE) {
-            final String msg = &quot;Bad sequence number: &quot; + seqNo + &quot; (earliest &quot;
-                + earliestSequenceNumber + &quot;)&quot;;
-            logger.trace(&quot;notificationAt&quot;, msg);
-            throw new IllegalArgumentException(msg);
-        }
-        return queue.get((int) index);
-    }
-
-    private static class NamedNotification {
-        NamedNotification(ObjectName sender, Notification notif) {
-            this.sender = sender;
-            this.notification = notif;
-        }
-
-        ObjectName getObjectName() {
-            return sender;
-        }
-
-        Notification getNotification() {
-            return notification;
-        }
-
-        public String toString() {
-            return &quot;NamedNotification(&quot; + sender + &quot;, &quot; + notification + &quot;)&quot;;
-        }
-
-        private final ObjectName sender;
-        private final Notification notification;
-    }
-
-    /*
-     * Add our listener to every NotificationBroadcaster MBean
-     * currently in the MBean server and to every
-     * NotificationBroadcaster later created.
-     *
-     * It would be really nice if we could just do
-     * mbs.addNotificationListener(new ObjectName(&quot;*:*&quot;), ...);
-     * Definitely something for the next version of JMX.
-     *
-     * There is a nasty race condition that we must handle.  We
-     * first register for MBean-creation notifications so we can add
-     * listeners to new MBeans, then we query the existing MBeans to
-     * add listeners to them.  The problem is that a new MBean could
-     * arrive after we register for creations but before the query has
-     * completed.  Then we could see the MBean both in the query and
-     * in an MBean-creation notification, and we would end up
-     * registering our listener twice.
-     *
-     * To solve this problem, we arrange for new MBeans that arrive
-     * while the query is being done to be added to the Set createdDuringQuery
-     * and we do not add a listener immediately.  When the query is done,
-     * we atomically turn off the addition of new names to createdDuringQuery
-     * and add all the names that were there to the result of the query.
-     * Since we are dealing with Sets, the result is the same whether or not
-     * the newly-created MBean was included in the query result.
-     *
-     * It is important not to hold any locks during the operation of adding
-     * listeners to MBeans.  An MBean's addNotificationListener can be
-     * arbitrary user code, and this could deadlock with any locks we hold
-     * (see bug 6239400).  The corollary is that we must not do any operations
-     * in this method or the methods it calls that require locks.
-     */
-    private void createListeners() {
-        logger.debug(&quot;createListeners&quot;, &quot;starts&quot;);
-
-        synchronized (this) {
-            createdDuringQuery = new HashSet&lt;ObjectName&gt;();
-        }
-
-        try {
-            addNotificationListener(MBeanServerDelegate.DELEGATE_NAME,
-                                    creationListener, creationFilter, null);
-            logger.debug(&quot;createListeners&quot;, &quot;added creationListener&quot;);
-        } catch (Exception e) {
-            final String msg = &quot;Can't add listener to MBean server delegate: &quot;;
-            RuntimeException re = new IllegalArgumentException(msg + e);
-            EnvHelp.initCause(re, e);
-            logger.fine(&quot;createListeners&quot;, msg + e);
-            logger.debug(&quot;createListeners&quot;, e);
-            throw re;
-        }
-
-        /* Spec doesn't say whether Set returned by QueryNames can be modified
-           so we clone it. */
-        Set&lt;ObjectName&gt; names = queryNames(null, broadcasterQuery);
-        names = new HashSet&lt;ObjectName&gt;(names);
-
-        synchronized (this) {
-            names.addAll(createdDuringQuery);
-            createdDuringQuery = null;
-        }
-
-        for (ObjectName name : names)
-            addBufferListener(name);
-        logger.debug(&quot;createListeners&quot;, &quot;ends&quot;);
-    }
-
-    private void addBufferListener(ObjectName name) {
-        checkNoLocks();
-        if (logger.debugOn())
-            logger.debug(&quot;addBufferListener&quot;, name.toString());
-        try {
-            addNotificationListener(name, bufferListener, null, name);
-        } catch (Exception e) {
-            logger.trace(&quot;addBufferListener&quot;, e);
-            /* This can happen if the MBean was unregistered just
-               after the query.  Or user NotificationBroadcaster might
-               throw unexpected exception.  */
-        }
-    }
-
-    private void removeBufferListener(ObjectName name) {
-        checkNoLocks();
-        if (logger.debugOn())
-            logger.debug(&quot;removeBufferListener&quot;, name.toString());
-        try {
-            removeNotificationListener(name, bufferListener);
-        } catch (Exception e) {
-            logger.trace(&quot;removeBufferListener&quot;, e);
-        }
-    }
-
-    private void addNotificationListener(final ObjectName name,
-                                         final NotificationListener listener,
-                                         final NotificationFilter filter,
-                                         final Object handback)
-            throws Exception {
-        try {
-            AccessController.doPrivileged(new PrivilegedExceptionAction&lt;Void&gt;() {
-                public Void run() throws InstanceNotFoundException {
-                    mBeanServer.addNotificationListener(name,
-                                                        listener,
-                                                        filter,
-                                                        handback);
-                    return null;
-                }
-            });
-        } catch (Exception e) {
-            throw extractException(e);
-        }
-    }
-
-    private void removeNotificationListener(final ObjectName name,
-                                            final NotificationListener listener)
-            throws Exception {
-        try {
-            AccessController.doPrivileged(new PrivilegedExceptionAction&lt;Void&gt;() {
-                public Void run() throws Exception {
-                    mBeanServer.removeNotificationListener(name, listener);
-                    return null;
-                }
-            });
-        } catch (Exception e) {
-            throw extractException(e);
-        }
-    }
-
-    private Set&lt;ObjectName&gt; queryNames(final ObjectName name,
-                                       final QueryExp query) {
-        PrivilegedAction&lt;Set&lt;ObjectName&gt;&gt; act =
-            new PrivilegedAction&lt;Set&lt;ObjectName&gt;&gt;() {
-                public Set&lt;ObjectName&gt; run() {
-                    return mBeanServer.queryNames(name, query);
-                }
-            };
-        try {
-            return AccessController.doPrivileged(act);
-        } catch (RuntimeException e) {
-            logger.fine(&quot;queryNames&quot;, &quot;Failed to query names: &quot; + e);
-            logger.debug(&quot;queryNames&quot;, e);
-            throw e;
-        }
-    }
-
-    private static boolean isInstanceOf(final MBeanServer mbs,
-                                        final ObjectName name,
-                                        final String className) {
-        PrivilegedExceptionAction&lt;Boolean&gt; act =
-            new PrivilegedExceptionAction&lt;Boolean&gt;() {
-                public Boolean run() throws InstanceNotFoundException {
-                    return mbs.isInstanceOf(name, className);
-                }
-            };
-        try {
-            return AccessController.doPrivileged(act);
-        } catch (Exception e) {
-            logger.fine(&quot;isInstanceOf&quot;, &quot;failed: &quot; + e);
-            logger.debug(&quot;isInstanceOf&quot;, e);
-            return false;
-        }
-    }
-
-    /* This method must not be synchronized.  See the comment on the
-     * createListeners method.
-     *
-     * The notification could arrive after our buffer has been destroyed
-     * or even during its destruction.  So we always add our listener
-     * (without synchronization), then we check if the buffer has been
-     * destroyed and if so remove the listener we just added.
-     */
-    private void createdNotification(MBeanServerNotification n) {
-        final String shouldEqual =
-            MBeanServerNotification.REGISTRATION_NOTIFICATION;
-        if (!n.getType().equals(shouldEqual)) {
-            logger.warning(&quot;createNotification&quot;, &quot;bad type: &quot; + n.getType());
-            return;
-        }
-
-        ObjectName name = n.getMBeanName();
-        if (logger.debugOn())
-            logger.debug(&quot;createdNotification&quot;, &quot;for: &quot; + name);
-
-        synchronized (this) {
-            if (createdDuringQuery != null) {
-                createdDuringQuery.add(name);
-                return;
-            }
-        }
-
-        if (isInstanceOf(mBeanServer, name, broadcasterClass)) {
-            addBufferListener(name);
-            if (isDisposed())
-                removeBufferListener(name);
-        }
-    }
-
-    private class BufferListener implements NotificationListener {
-        public void handleNotification(Notification notif, Object handback) {
-            if (logger.debugOn()) {
-                logger.debug(&quot;BufferListener.handleNotification&quot;,
-                      &quot;notif=&quot; + notif + &quot;; handback=&quot; + handback);
-            }
-            ObjectName name = (ObjectName) handback;
-            addNotification(new NamedNotification(name, notif));
-        }
-    }
-
-    private final NotificationListener bufferListener = new BufferListener();
-
-    private static class BroadcasterQuery
-            extends QueryEval implements QueryExp {
-        private static final long serialVersionUID = 7378487660587592048L;
-
-        public boolean apply(final ObjectName name) {
-            final MBeanServer mbs = QueryEval.getMBeanServer();
-            return isInstanceOf(mbs, name, broadcasterClass);
-        }
-    }
-    private static final QueryExp broadcasterQuery = new BroadcasterQuery();
-
-    private static final NotificationFilter creationFilter;
-    static {
-        NotificationFilterSupport nfs = new NotificationFilterSupport();
-        nfs.enableType(MBeanServerNotification.REGISTRATION_NOTIFICATION);
-        creationFilter = nfs;
-    }
-
-    private final NotificationListener creationListener =
-        new NotificationListener() {
-            public void handleNotification(Notification notif,
-                                           Object handback) {
-                logger.debug(&quot;creationListener&quot;, &quot;handleNotification called&quot;);
-                createdNotification((MBeanServerNotification) notif);
-            }
-        };
-
-    private void destroyListeners() {
-        checkNoLocks();
-        logger.debug(&quot;destroyListeners&quot;, &quot;starts&quot;);
-        try {
-            removeNotificationListener(MBeanServerDelegate.DELEGATE_NAME,
-                                       creationListener);
-        } catch (Exception e) {
-            logger.warning(&quot;remove listener from MBeanServer delegate&quot;, e);
-        }
-        Set&lt;ObjectName&gt; names = queryNames(null, broadcasterQuery);
-        for (final ObjectName name : names) {
-            if (logger.debugOn())
-                logger.debug(&quot;destroyListeners&quot;,
-                             &quot;remove listener from &quot; + name);
-            removeBufferListener(name);
-        }
-        logger.debug(&quot;destroyListeners&quot;, &quot;ends&quot;);
-    }
-
-    private void checkNoLocks() {
-        if (Thread.holdsLock(this) || Thread.holdsLock(globalLock))
-            logger.warning(&quot;checkNoLocks&quot;, &quot;lock protocol violation&quot;);
-    }
-
-    /**
-     * Iterate until we extract the real exception
-     * from a stack of PrivilegedActionExceptions.
-     */
-    private static Exception extractException(Exception e) {
-        while (e instanceof PrivilegedActionException) {
-            e = ((PrivilegedActionException)e).getException();
-        }
-        return e;
-    }
-
-    private static final ClassLogger logger =
-        new ClassLogger(&quot;javax.management.remote.misc&quot;,
-                        &quot;ArrayNotificationBuffer&quot;);
-
-    private final MBeanServer mBeanServer;
-    private final ArrayQueue&lt;NamedNotification&gt; queue;
-    private int queueSize;
-    private long earliestSequenceNumber;
-    private long nextSequenceNumber;
-    private Set&lt;ObjectName&gt; createdDuringQuery;
-
-    static final String broadcasterClass =
-        NotificationBroadcaster.class.getName();
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2003, 2013, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package com.sun.jmx.remote.internal;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import java.security.AccessController;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import java.security.PrivilegedAction;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.security.PrivilegedActionException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.security.PrivilegedExceptionAction;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.util.ArrayList;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre>import java.util.Collection;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>import java.util.Collections;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre>import java.util.HashSet;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre>import java.util.List;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre>import java.util.Set;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre>import java.util.HashMap;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre>import java.util.Map;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre>import javax.management.InstanceNotFoundException;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre>import javax.management.MBeanServer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre>import javax.management.MBeanServerDelegate;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre>import javax.management.MBeanServerNotification;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre>import javax.management.Notification;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre>import javax.management.NotificationBroadcaster;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre>import javax.management.NotificationFilter;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre>import javax.management.NotificationFilterSupport;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre>import javax.management.NotificationListener;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre>import javax.management.ObjectName;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre>import javax.management.QueryEval;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre>import javax.management.QueryExp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre>import javax.management.remote.NotificationResult;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre>import javax.management.remote.TargetedNotification;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre>import com.sun.jmx.remote.util.EnvHelp;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre>import com.sun.jmx.remote.util.ClassLogger;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre>/** A circular buffer of notifications received from an MBean server. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre>  There is one instance of ArrayNotificationBuffer for every</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>  MBeanServer object that has an attached ConnectorServer.  Then, for</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre>  every ConnectorServer attached to a given MBeanServer, there is an</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>  instance of the inner class ShareBuffer.  So for example with two</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>  ConnectorServers it looks like this:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>  ConnectorServer1 -&gt; ShareBuffer1 -\</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre>                                     }-&gt; ArrayNotificationBuffer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>  ConnectorServer2 -&gt; ShareBuffer2 -/              |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>                                                   |</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>                                                   v</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>                                              MBeanServer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>  The ArrayNotificationBuffer has a circular buffer of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>  NamedNotification objects.  Each ConnectorServer defines a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>  notification buffer size, and this size is recorded by the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>  corresponding ShareBuffer.  The buffer size of the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>  ArrayNotificationBuffer is the maximum of all of its ShareBuffers.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>  When a ShareBuffer is added or removed, the ArrayNotificationBuffer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>  size is adjusted accordingly.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>  An ArrayNotificationBuffer also has a BufferListener (which is a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>  NotificationListener) registered on every NotificationBroadcaster</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>  MBean in the MBeanServer to which it is attached.  The cost of this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>  potentially large set of listeners is the principal motivation for</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>  sharing the ArrayNotificationBuffer between ConnectorServers, and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>  also the reason that we are careful to discard the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>  ArrayNotificationBuffer (and its BufferListeners) when there are no</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>  longer any ConnectorServers using it.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre>  The synchronization of this class is inherently complex.  In an attempt</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>  to limit the complexity, we use just two locks:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>  - globalLock controls access to the mapping between an MBeanServer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>    and its ArrayNotificationBuffer and to the set of ShareBuffers for</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>    each ArrayNotificationBuffer.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>  - the instance lock of each ArrayNotificationBuffer controls access</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>    to the array of notifications, including its size, and to the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>    dispose flag of the ArrayNotificationBuffer.  The wait/notify</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>    mechanism is used to indicate changes to the array.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>  If both locks are held at the same time, the globalLock must be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>  taken first.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>  Since adding or removing a BufferListener to an MBean can involve</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>  calling user code, we are careful not to hold any locks while it is</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>  done.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>public class ArrayNotificationBuffer implements NotificationBuffer {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>    private boolean disposed = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>    // FACTORY STUFF, INCLUDING SHARING</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre>    private static final Object globalLock = new Object();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>    private static final</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>        HashMap&lt;MBeanServer,ArrayNotificationBuffer&gt; mbsToBuffer =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>        new HashMap&lt;MBeanServer,ArrayNotificationBuffer&gt;(1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>    private final Collection&lt;ShareBuffer&gt; sharers = new HashSet&lt;ShareBuffer&gt;(1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre>    public static NotificationBuffer getNotificationBuffer(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>            MBeanServer mbs, Map&lt;String, ?&gt; env) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre>        if (env == null)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>            env = Collections.emptyMap();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre>        //Find out queue size</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>        int queueSize = EnvHelp.getNotifBufferSize(env);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>        ArrayNotificationBuffer buf;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre>        boolean create;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>        NotificationBuffer sharer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>        synchronized (globalLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre>            buf = mbsToBuffer.get(mbs);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>            create = (buf == null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>            if (create) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre>                buf = new ArrayNotificationBuffer(mbs, queueSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>                mbsToBuffer.put(mbs, buf);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>            sharer = buf.new ShareBuffer(queueSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>        /* We avoid holding any locks while calling createListeners.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>         * This prevents possible deadlocks involving user code, but</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre>         * does mean that a second ConnectorServer created and started</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>         * in this window will return before all the listeners are ready,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>         * which could lead to surprising behaviour.  The alternative</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>         * would be to block the second ConnectorServer until the first</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>         * one has finished adding all the listeners, but that would then</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>         * be subject to deadlock.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>        if (create)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>            buf.createListeners();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>        return sharer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>    /* Ensure that this buffer is no longer the one that will be returned by</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre>     * getNotificationBuffer.  This method is idempotent - calling it more</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>     * than once has no effect beyond that of calling it once.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>    static void removeNotificationBuffer(MBeanServer mbs) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre>        synchronized (globalLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>            mbsToBuffer.remove(mbs);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>    void addSharer(ShareBuffer sharer) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre>        synchronized (globalLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>            synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre>                if (sharer.getSize() &gt; queueSize)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>                    resize(sharer.getSize());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>            sharers.add(sharer);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre>    private void removeSharer(ShareBuffer sharer) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>        boolean empty;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>        synchronized (globalLock) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>            sharers.remove(sharer);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>            empty = sharers.isEmpty();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>            if (empty)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>                removeNotificationBuffer(mBeanServer);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>            else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>                int max = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>                for (ShareBuffer buf : sharers) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>                    int bufsize = buf.getSize();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>                    if (bufsize &gt; max)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre>                        max = bufsize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>                if (max &lt; queueSize)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>                    resize(max);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>        if (empty) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre>            synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>                disposed = true;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>                // Notify potential waiting fetchNotification call</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre>                notifyAll();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>            destroyListeners();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>    private synchronized void resize(int newSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>        if (newSize == queueSize)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>        while (queue.size() &gt; newSize)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>            dropNotification();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>        queue.resize(newSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>        queueSize = newSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>    private class ShareBuffer implements NotificationBuffer {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre>        ShareBuffer(int size) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>            this.size = size;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>            addSharer(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>        public NotificationResult</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre>            fetchNotifications(NotificationBufferFilter filter,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>                               long startSequenceNumber,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>                               long timeout,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>                               int maxNotifications)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>                throws InterruptedException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>            NotificationBuffer buf = ArrayNotificationBuffer.this;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre>            return buf.fetchNotifications(filter, startSequenceNumber,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>                                          timeout, maxNotifications);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>        public void dispose() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>            ArrayNotificationBuffer.this.removeSharer(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>        int getSize() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>            return size;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre>        private final int size;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>    // ARRAYNOTIFICATIONBUFFER IMPLEMENTATION</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>    private ArrayNotificationBuffer(MBeanServer mbs, int queueSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre>        if (logger.traceOn())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>            logger.trace(&quot;Constructor&quot;, &quot;queueSize=&quot; + queueSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>        if (mbs == null || queueSize &lt; 1)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>            throw new IllegalArgumentException(&quot;Bad args&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>        this.mBeanServer = mbs;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre>        this.queueSize = queueSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>        this.queue = new ArrayQueue&lt;NamedNotification&gt;(queueSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>        this.earliestSequenceNumber = System.currentTimeMillis();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>        this.nextSequenceNumber = this.earliestSequenceNumber;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>        logger.trace(&quot;Constructor&quot;, &quot;ends&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>    private synchronized boolean isDisposed() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>        return disposed;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre>    // We no longer support calling this method from outside.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>    // The JDK doesn't contain any such calls and users are not</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>    // supposed to be accessing this class.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>    public void dispose() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre>        throw new UnsupportedOperationException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>     * &lt;p&gt;Fetch notifications that match the given listeners.&lt;/p&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>     * &lt;p&gt;The operation only considers notifications with a sequence</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>     * number at least &lt;code&gt;startSequenceNumber&lt;/code&gt;.  It will take</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>     * no longer than &lt;code&gt;timeout&lt;/code&gt;, and will return no more</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>     * than &lt;code&gt;maxNotifications&lt;/code&gt; different notifications.&lt;/p&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>     * &lt;p&gt;If there are no notifications matching the criteria, the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>     * operation will block until one arrives, subject to the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre>     * timeout.&lt;/p&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>     * @param filter an object that will add notifications to a</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>     * {@code List&lt;TargetedNotification&gt;} if they match the current</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>     * listeners with their filters.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>     * @param startSequenceNumber the first sequence number to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>     * consider.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>     * @param timeout the maximum time to wait.  May be 0 to indicate</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>     * not to wait if there are no notifications.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre>     * @param maxNotifications the maximum number of notifications to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>     * return.  May be 0 to indicate a wait for eligible notifications</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>     * that will return a usable &lt;code&gt;nextSequenceNumber&lt;/code&gt;.  The</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>     * {@link TargetedNotification} array in the returned {@link</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>     * NotificationResult} may contain more than this number of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>     * elements but will not contain more than this number of</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>     * different notifications.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>    public NotificationResult</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>        fetchNotifications(NotificationBufferFilter filter,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>                           long startSequenceNumber,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>                           long timeout,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>                           int maxNotifications)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>            throws InterruptedException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre>        logger.trace(&quot;fetchNotifications&quot;, &quot;starts&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>        if (startSequenceNumber &lt; 0 || isDisposed()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>            synchronized(this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>                return new NotificationResult(earliestSequenceNumber(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>                                              nextSequenceNumber(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>                                              new TargetedNotification[0]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>        // Check arg validity</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>        if (filter == null</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre>            || startSequenceNumber &lt; 0 || timeout &lt; 0</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>            || maxNotifications &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>            logger.trace(&quot;fetchNotifications&quot;, &quot;Bad args&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>            throw new IllegalArgumentException(&quot;Bad args to fetch&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>        if (logger.debugOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre>            logger.trace(&quot;fetchNotifications&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>                  &quot;filter=&quot; + filter + &quot;; startSeq=&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>                  startSequenceNumber + &quot;; timeout=&quot; + timeout +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>                  &quot;; max=&quot; + maxNotifications);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>        if (startSequenceNumber &gt; nextSequenceNumber()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>            final String msg = &quot;Start sequence number too big: &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>                startSequenceNumber + &quot; &gt; &quot; + nextSequenceNumber();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre>            logger.trace(&quot;fetchNotifications&quot;, msg);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>            throw new IllegalArgumentException(msg);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>        /* Determine the end time corresponding to the timeout value.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre>           Caller may legitimately supply Long.MAX_VALUE to indicate no</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>           timeout.  In that case the addition will overflow and produce</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>           a negative end time.  Set end time to Long.MAX_VALUE in that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>           case.  We assume System.currentTimeMillis() is positive.  */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>        long endTime = System.currentTimeMillis() + timeout;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>        if (endTime &lt; 0) // overflow</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>            endTime = Long.MAX_VALUE;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>        if (logger.debugOn())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre>            logger.debug(&quot;fetchNotifications&quot;, &quot;endTime=&quot; + endTime);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>        /* We set earliestSeq the first time through the loop.  If we</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre>           set it here, notifications could be dropped before we</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>           started examining them, so earliestSeq might not correspond</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>           to the earliest notification we examined.  */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>        long earliestSeq = -1;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>        long nextSeq = startSequenceNumber;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>        List&lt;TargetedNotification&gt; notifs =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre>            new ArrayList&lt;TargetedNotification&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>        /* On exit from this loop, notifs, earliestSeq, and nextSeq must</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre>           all be correct values for the returned NotificationResult.  */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>        while (true) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>            logger.debug(&quot;fetchNotifications&quot;, &quot;main loop starts&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>            NamedNotification candidate;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>            /* Get the next available notification regardless of filters,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre>               or wait for one to arrive if there is none.  */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>            synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>                /* First time through.  The current earliestSequenceNumber</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>                   is the first one we could have examined.  */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>                if (earliestSeq &lt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>                    earliestSeq = earliestSequenceNumber();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>                    if (logger.debugOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre>                        logger.debug(&quot;fetchNotifications&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>                              &quot;earliestSeq=&quot; + earliestSeq);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>                    if (nextSeq &lt; earliestSeq) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>                        nextSeq = earliestSeq;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>                        logger.debug(&quot;fetchNotifications&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>                                     &quot;nextSeq=earliestSeq&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre>                } else</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>                    earliestSeq = earliestSequenceNumber();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>                /* If many notifications have been dropped since the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>                   last time through, nextSeq could now be earlier</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>                   than the current earliest.  If so, notifications</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>                   may have been lost and we return now so the caller</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>                   can see this next time it calls.  */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre>                if (nextSeq &lt; earliestSeq) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>                    logger.trace(&quot;fetchNotifications&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>                          &quot;nextSeq=&quot; + nextSeq + &quot; &lt; &quot; + &quot;earliestSeq=&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>                          earliestSeq + &quot; so may have lost notifs&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre>                if (nextSeq &lt; nextSequenceNumber()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>                    candidate = notificationAt(nextSeq);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre>                    // Skip security check if NotificationBufferFilter is not overloaded</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>                    if (!(filter instanceof ServerNotifForwarder.NotifForwarderBufferFilter)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>                        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>                            ServerNotifForwarder.checkMBeanPermission(this.mBeanServer,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>                                                      candidate.getObjectName(),&quot;addNotificationListener&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>                        } catch (InstanceNotFoundException | SecurityException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>                            if (logger.debugOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>                                logger.debug(&quot;fetchNotifications&quot;, &quot;candidate: &quot; + candidate + &quot; skipped. exception &quot; + e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>                            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre>                            ++nextSeq;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>                            continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>                        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>                    if (logger.debugOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre>                        logger.debug(&quot;fetchNotifications&quot;, &quot;candidate: &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>                                     candidate);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>                        logger.debug(&quot;fetchNotifications&quot;, &quot;nextSeq now &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>                                     nextSeq);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>                    /* nextSeq is the largest sequence number.  If we</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>                       already got notifications, return them now.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>                       Otherwise wait for some to arrive, with</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre>                       timeout.  */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>                    if (notifs.size() &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre>                        logger.debug(&quot;fetchNotifications&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>                              &quot;no more notifs but have some so don't wait&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>                        break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>                    long toWait = endTime - System.currentTimeMillis();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>                    if (toWait &lt;= 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre>                        logger.debug(&quot;fetchNotifications&quot;, &quot;timeout&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>                        break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>                    /* dispose called */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>                    if (isDisposed()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre>                        if (logger.debugOn())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>                            logger.debug(&quot;fetchNotifications&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>                                         &quot;dispose callled, no wait&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre>                        return new NotificationResult(earliestSequenceNumber(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>                                                  nextSequenceNumber(),</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre>                                                  new TargetedNotification[0]);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>                    if (logger.debugOn())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>                        logger.debug(&quot;fetchNotifications&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>                                     &quot;wait(&quot; + toWait + &quot;)&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>                    wait(toWait);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>                    continue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>            /* We have a candidate notification.  See if it matches</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>               our filters.  We do this outside the synchronized block</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>               so we don't hold up everyone accessing the buffer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>               (including notification senders) while we evaluate</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>               potentially slow filters.  */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>            ObjectName name = candidate.getObjectName();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>            Notification notif = candidate.getNotification();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>            List&lt;TargetedNotification&gt; matchedNotifs =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>                new ArrayList&lt;TargetedNotification&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>            logger.debug(&quot;fetchNotifications&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>                         &quot;applying filter to candidate&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>            filter.apply(matchedNotifs, name, notif);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>            if (matchedNotifs.size() &gt; 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>                /* We only check the max size now, so that our</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>                   returned nextSeq is as large as possible.  This</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>                   prevents the caller from thinking it missed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>                   interesting notifications when in fact we knew they</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>                   weren't.  */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>                if (maxNotifications &lt;= 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>                    logger.debug(&quot;fetchNotifications&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>                                 &quot;reached maxNotifications&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>                    break;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>                --maxNotifications;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>                if (logger.debugOn())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre>                    logger.debug(&quot;fetchNotifications&quot;, &quot;add: &quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>                                 matchedNotifs);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>                notifs.addAll(matchedNotifs);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>            ++nextSeq;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>        } // end while</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>        /* Construct and return the result.  */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>        int nnotifs = notifs.size();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>        TargetedNotification[] resultNotifs =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>            new TargetedNotification[nnotifs];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>        notifs.toArray(resultNotifs);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>        NotificationResult nr =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>            new NotificationResult(earliestSeq, nextSeq, resultNotifs);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>        if (logger.debugOn())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>            logger.debug(&quot;fetchNotifications&quot;, nr.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>        logger.trace(&quot;fetchNotifications&quot;, &quot;ends&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>        return nr;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>    synchronized long earliestSequenceNumber() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre>        return earliestSequenceNumber;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>    synchronized long nextSequenceNumber() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>        return nextSequenceNumber;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>    synchronized void addNotification(NamedNotification notif) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre>        if (logger.traceOn())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>            logger.trace(&quot;addNotification&quot;, notif.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>        while (queue.size() &gt;= queueSize) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre>            dropNotification();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre>            if (logger.debugOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>                logger.debug(&quot;addNotification&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>                      &quot;dropped oldest notif, earliestSeq=&quot; +</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>                      earliestSequenceNumber);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>        queue.add(notif);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre>        nextSequenceNumber++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>        if (logger.debugOn())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>            logger.debug(&quot;addNotification&quot;, &quot;nextSeq=&quot; + nextSequenceNumber);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>        notifyAll();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>    private void dropNotification() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>        queue.remove(0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>        earliestSequenceNumber++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>    synchronized NamedNotification notificationAt(long seqNo) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>        long index = seqNo - earliestSequenceNumber;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre>        if (index &lt; 0 || index &gt; Integer.MAX_VALUE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>            final String msg = &quot;Bad sequence number: &quot; + seqNo + &quot; (earliest &quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>                + earliestSequenceNumber + &quot;)&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>            logger.trace(&quot;notificationAt&quot;, msg);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>            throw new IllegalArgumentException(msg);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>        return queue.get((int) index);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>    private static class NamedNotification {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>        NamedNotification(ObjectName sender, Notification notif) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>            this.sender = sender;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>            this.notification = notif;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>        ObjectName getObjectName() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>            return sender;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>        Notification getNotification() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>            return notification;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>        public String toString() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>            return &quot;NamedNotification(&quot; + sender + &quot;, &quot; + notification + &quot;)&quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre>        private final ObjectName sender;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>        private final Notification notification;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>     * Add our listener to every NotificationBroadcaster MBean</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>     * currently in the MBean server and to every</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre>     * NotificationBroadcaster later created.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre>     * It would be really nice if we could just do</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre>     * mbs.addNotificationListener(new ObjectName(&quot;*:*&quot;), ...);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>     * Definitely something for the next version of JMX.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre>     * There is a nasty race condition that we must handle.  We</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>     * first register for MBean-creation notifications so we can add</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>     * listeners to new MBeans, then we query the existing MBeans to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>     * add listeners to them.  The problem is that a new MBean could</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>     * arrive after we register for creations but before the query has</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>     * completed.  Then we could see the MBean both in the query and</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre>     * in an MBean-creation notification, and we would end up</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>     * registering our listener twice.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>     * To solve this problem, we arrange for new MBeans that arrive</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>     * while the query is being done to be added to the Set createdDuringQuery</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre>     * and we do not add a listener immediately.  When the query is done,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>     * we atomically turn off the addition of new names to createdDuringQuery</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre>     * and add all the names that were there to the result of the query.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre>     * Since we are dealing with Sets, the result is the same whether or not</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>     * the newly-created MBean was included in the query result.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>     * It is important not to hold any locks during the operation of adding</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>     * listeners to MBeans.  An MBean's addNotificationListener can be</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>     * arbitrary user code, and this could deadlock with any locks we hold</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>     * (see bug 6239400).  The corollary is that we must not do any operations</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>     * in this method or the methods it calls that require locks.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>    private void createListeners() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>        logger.debug(&quot;createListeners&quot;, &quot;starts&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>        synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre>            createdDuringQuery = new HashSet&lt;ObjectName&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>            addNotificationListener(MBeanServerDelegate.DELEGATE_NAME,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>                                    creationListener, creationFilter, null);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre>            logger.debug(&quot;createListeners&quot;, &quot;added creationListener&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>            final String msg = &quot;Can't add listener to MBean server delegate: &quot;;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>            RuntimeException re = new IllegalArgumentException(msg + e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>            EnvHelp.initCause(re, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>            logger.fine(&quot;createListeners&quot;, msg + e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>            logger.debug(&quot;createListeners&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="617" href="#"></a></td>
+<td><pre>            throw re;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="618" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="619" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="620" href="#"></a></td>
+<td><pre>        /* Spec doesn't say whether Set returned by QueryNames can be modified</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="621" href="#"></a></td>
+<td><pre>           so we clone it. */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="622" href="#"></a></td>
+<td><pre>        Set&lt;ObjectName&gt; names = queryNames(null, broadcasterQuery);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="623" href="#"></a></td>
+<td><pre>        names = new HashSet&lt;ObjectName&gt;(names);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="624" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="625" href="#"></a></td>
+<td><pre>        synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="626" href="#"></a></td>
+<td><pre>            names.addAll(createdDuringQuery);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="627" href="#"></a></td>
+<td><pre>            createdDuringQuery = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="628" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="629" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="630" href="#"></a></td>
+<td><pre>        for (ObjectName name : names)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="631" href="#"></a></td>
+<td><pre>            addBufferListener(name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="632" href="#"></a></td>
+<td><pre>        logger.debug(&quot;createListeners&quot;, &quot;ends&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="633" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="634" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="635" href="#"></a></td>
+<td><pre>    private void addBufferListener(ObjectName name) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="636" href="#"></a></td>
+<td><pre>        checkNoLocks();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="637" href="#"></a></td>
+<td><pre>        if (logger.debugOn())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="638" href="#"></a></td>
+<td><pre>            logger.debug(&quot;addBufferListener&quot;, name.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="639" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="640" href="#"></a></td>
+<td><pre>            addNotificationListener(name, bufferListener, null, name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="641" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="642" href="#"></a></td>
+<td><pre>            logger.trace(&quot;addBufferListener&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="643" href="#"></a></td>
+<td><pre>            /* This can happen if the MBean was unregistered just</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="644" href="#"></a></td>
+<td><pre>               after the query.  Or user NotificationBroadcaster might</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="645" href="#"></a></td>
+<td><pre>               throw unexpected exception.  */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="646" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="647" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="648" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="649" href="#"></a></td>
+<td><pre>    private void removeBufferListener(ObjectName name) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="650" href="#"></a></td>
+<td><pre>        checkNoLocks();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="651" href="#"></a></td>
+<td><pre>        if (logger.debugOn())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="652" href="#"></a></td>
+<td><pre>            logger.debug(&quot;removeBufferListener&quot;, name.toString());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="653" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="654" href="#"></a></td>
+<td><pre>            removeNotificationListener(name, bufferListener);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="655" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="656" href="#"></a></td>
+<td><pre>            logger.trace(&quot;removeBufferListener&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="657" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="658" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="659" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="660" href="#"></a></td>
+<td><pre>    private void addNotificationListener(final ObjectName name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="661" href="#"></a></td>
+<td><pre>                                         final NotificationListener listener,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="662" href="#"></a></td>
+<td><pre>                                         final NotificationFilter filter,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="663" href="#"></a></td>
+<td><pre>                                         final Object handback)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="664" href="#"></a></td>
+<td><pre>            throws Exception {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="665" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="666" href="#"></a></td>
+<td><pre>            AccessController.doPrivileged(new PrivilegedExceptionAction&lt;Void&gt;() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="667" href="#"></a></td>
+<td><pre>                public Void run() throws InstanceNotFoundException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="668" href="#"></a></td>
+<td><pre>                    mBeanServer.addNotificationListener(name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="669" href="#"></a></td>
+<td><pre>                                                        listener,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="670" href="#"></a></td>
+<td><pre>                                                        filter,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="671" href="#"></a></td>
+<td><pre>                                                        handback);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="672" href="#"></a></td>
+<td><pre>                    return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="673" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="674" href="#"></a></td>
+<td><pre>            });</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="675" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="676" href="#"></a></td>
+<td><pre>            throw extractException(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="677" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="678" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="679" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="680" href="#"></a></td>
+<td><pre>    private void removeNotificationListener(final ObjectName name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="681" href="#"></a></td>
+<td><pre>                                            final NotificationListener listener)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="682" href="#"></a></td>
+<td><pre>            throws Exception {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="683" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="684" href="#"></a></td>
+<td><pre>            AccessController.doPrivileged(new PrivilegedExceptionAction&lt;Void&gt;() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="685" href="#"></a></td>
+<td><pre>                public Void run() throws Exception {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="686" href="#"></a></td>
+<td><pre>                    mBeanServer.removeNotificationListener(name, listener);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="687" href="#"></a></td>
+<td><pre>                    return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="688" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="689" href="#"></a></td>
+<td><pre>            });</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="690" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="691" href="#"></a></td>
+<td><pre>            throw extractException(e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="692" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="693" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="694" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="695" href="#"></a></td>
+<td><pre>    private Set&lt;ObjectName&gt; queryNames(final ObjectName name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="696" href="#"></a></td>
+<td><pre>                                       final QueryExp query) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="697" href="#"></a></td>
+<td><pre>        PrivilegedAction&lt;Set&lt;ObjectName&gt;&gt; act =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="698" href="#"></a></td>
+<td><pre>            new PrivilegedAction&lt;Set&lt;ObjectName&gt;&gt;() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="699" href="#"></a></td>
+<td><pre>                public Set&lt;ObjectName&gt; run() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="700" href="#"></a></td>
+<td><pre>                    return mBeanServer.queryNames(name, query);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="701" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="702" href="#"></a></td>
+<td><pre>            };</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="703" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="704" href="#"></a></td>
+<td><pre>            return AccessController.doPrivileged(act);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="705" href="#"></a></td>
+<td><pre>        } catch (RuntimeException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="706" href="#"></a></td>
+<td><pre>            logger.fine(&quot;queryNames&quot;, &quot;Failed to query names: &quot; + e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="707" href="#"></a></td>
+<td><pre>            logger.debug(&quot;queryNames&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="708" href="#"></a></td>
+<td><pre>            throw e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="709" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="710" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="711" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="712" href="#"></a></td>
+<td><pre>    private static boolean isInstanceOf(final MBeanServer mbs,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="713" href="#"></a></td>
+<td><pre>                                        final ObjectName name,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="714" href="#"></a></td>
+<td><pre>                                        final String className) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="715" href="#"></a></td>
+<td><pre>        PrivilegedExceptionAction&lt;Boolean&gt; act =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="716" href="#"></a></td>
+<td><pre>            new PrivilegedExceptionAction&lt;Boolean&gt;() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="717" href="#"></a></td>
+<td><pre>                public Boolean run() throws InstanceNotFoundException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="718" href="#"></a></td>
+<td><pre>                    return mbs.isInstanceOf(name, className);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="719" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="720" href="#"></a></td>
+<td><pre>            };</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="721" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="722" href="#"></a></td>
+<td><pre>            return AccessController.doPrivileged(act);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="723" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="724" href="#"></a></td>
+<td><pre>            logger.fine(&quot;isInstanceOf&quot;, &quot;failed: &quot; + e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="725" href="#"></a></td>
+<td><pre>            logger.debug(&quot;isInstanceOf&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="726" href="#"></a></td>
+<td><pre>            return false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="727" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="728" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="729" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="730" href="#"></a></td>
+<td><pre>    /* This method must not be synchronized.  See the comment on the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="731" href="#"></a></td>
+<td><pre>     * createListeners method.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="732" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="733" href="#"></a></td>
+<td><pre>     * The notification could arrive after our buffer has been destroyed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="734" href="#"></a></td>
+<td><pre>     * or even during its destruction.  So we always add our listener</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="735" href="#"></a></td>
+<td><pre>     * (without synchronization), then we check if the buffer has been</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="736" href="#"></a></td>
+<td><pre>     * destroyed and if so remove the listener we just added.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="737" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="738" href="#"></a></td>
+<td><pre>    private void createdNotification(MBeanServerNotification n) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="739" href="#"></a></td>
+<td><pre>        final String shouldEqual =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="740" href="#"></a></td>
+<td><pre>            MBeanServerNotification.REGISTRATION_NOTIFICATION;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="741" href="#"></a></td>
+<td><pre>        if (!n.getType().equals(shouldEqual)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="742" href="#"></a></td>
+<td><pre>            logger.warning(&quot;createNotification&quot;, &quot;bad type: &quot; + n.getType());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="743" href="#"></a></td>
+<td><pre>            return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="744" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="745" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="746" href="#"></a></td>
+<td><pre>        ObjectName name = n.getMBeanName();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="747" href="#"></a></td>
+<td><pre>        if (logger.debugOn())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="748" href="#"></a></td>
+<td><pre>            logger.debug(&quot;createdNotification&quot;, &quot;for: &quot; + name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="749" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="750" href="#"></a></td>
+<td><pre>        synchronized (this) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="751" href="#"></a></td>
+<td><pre>            if (createdDuringQuery != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="752" href="#"></a></td>
+<td><pre>                createdDuringQuery.add(name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="753" href="#"></a></td>
+<td><pre>                return;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="754" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="755" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="756" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="757" href="#"></a></td>
+<td><pre>        if (isInstanceOf(mBeanServer, name, broadcasterClass)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="758" href="#"></a></td>
+<td><pre>            addBufferListener(name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="759" href="#"></a></td>
+<td><pre>            if (isDisposed())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="760" href="#"></a></td>
+<td><pre>                removeBufferListener(name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="761" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="762" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="763" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="764" href="#"></a></td>
+<td><pre>    private class BufferListener implements NotificationListener {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="765" href="#"></a></td>
+<td><pre>        public void handleNotification(Notification notif, Object handback) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="766" href="#"></a></td>
+<td><pre>            if (logger.debugOn()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="767" href="#"></a></td>
+<td><pre>                logger.debug(&quot;BufferListener.handleNotification&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="768" href="#"></a></td>
+<td><pre>                      &quot;notif=&quot; + notif + &quot;; handback=&quot; + handback);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="769" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="770" href="#"></a></td>
+<td><pre>            ObjectName name = (ObjectName) handback;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="771" href="#"></a></td>
+<td><pre>            addNotification(new NamedNotification(name, notif));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="772" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="773" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="774" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="775" href="#"></a></td>
+<td><pre>    private final NotificationListener bufferListener = new BufferListener();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="776" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="777" href="#"></a></td>
+<td><pre>    private static class BroadcasterQuery</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="778" href="#"></a></td>
+<td><pre>            extends QueryEval implements QueryExp {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="779" href="#"></a></td>
+<td><pre>        private static final long serialVersionUID = 7378487660587592048L;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="780" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="781" href="#"></a></td>
+<td><pre>        public boolean apply(final ObjectName name) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="782" href="#"></a></td>
+<td><pre>            final MBeanServer mbs = QueryEval.getMBeanServer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="783" href="#"></a></td>
+<td><pre>            return isInstanceOf(mbs, name, broadcasterClass);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="784" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="785" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="786" href="#"></a></td>
+<td><pre>    private static final QueryExp broadcasterQuery = new BroadcasterQuery();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="787" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="788" href="#"></a></td>
+<td><pre>    private static final NotificationFilter creationFilter;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="789" href="#"></a></td>
+<td><pre>    static {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="790" href="#"></a></td>
+<td><pre>        NotificationFilterSupport nfs = new NotificationFilterSupport();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="791" href="#"></a></td>
+<td><pre>        nfs.enableType(MBeanServerNotification.REGISTRATION_NOTIFICATION);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="792" href="#"></a></td>
+<td><pre>        creationFilter = nfs;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="793" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="794" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="795" href="#"></a></td>
+<td><pre>    private final NotificationListener creationListener =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="796" href="#"></a></td>
+<td><pre>        new NotificationListener() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="797" href="#"></a></td>
+<td><pre>            public void handleNotification(Notification notif,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="798" href="#"></a></td>
+<td><pre>                                           Object handback) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="799" href="#"></a></td>
+<td><pre>                logger.debug(&quot;creationListener&quot;, &quot;handleNotification called&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="800" href="#"></a></td>
+<td><pre>                createdNotification((MBeanServerNotification) notif);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="801" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="802" href="#"></a></td>
+<td><pre>        };</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="803" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="804" href="#"></a></td>
+<td><pre>    private void destroyListeners() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="805" href="#"></a></td>
+<td><pre>        checkNoLocks();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="806" href="#"></a></td>
+<td><pre>        logger.debug(&quot;destroyListeners&quot;, &quot;starts&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="807" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="808" href="#"></a></td>
+<td><pre>            removeNotificationListener(MBeanServerDelegate.DELEGATE_NAME,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="809" href="#"></a></td>
+<td><pre>                                       creationListener);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="810" href="#"></a></td>
+<td><pre>        } catch (Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="811" href="#"></a></td>
+<td><pre>            logger.warning(&quot;remove listener from MBeanServer delegate&quot;, e);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="812" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="813" href="#"></a></td>
+<td><pre>        Set&lt;ObjectName&gt; names = queryNames(null, broadcasterQuery);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="814" href="#"></a></td>
+<td><pre>        for (final ObjectName name : names) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="815" href="#"></a></td>
+<td><pre>            if (logger.debugOn())</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="816" href="#"></a></td>
+<td><pre>                logger.debug(&quot;destroyListeners&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="817" href="#"></a></td>
+<td><pre>                             &quot;remove listener from &quot; + name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="818" href="#"></a></td>
+<td><pre>            removeBufferListener(name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="819" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="820" href="#"></a></td>
+<td><pre>        logger.debug(&quot;destroyListeners&quot;, &quot;ends&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="821" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="822" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="823" href="#"></a></td>
+<td><pre>    private void checkNoLocks() {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="824" href="#"></a></td>
+<td><pre>        if (Thread.holdsLock(this) || Thread.holdsLock(globalLock))</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="825" href="#"></a></td>
+<td><pre>            logger.warning(&quot;checkNoLocks&quot;, &quot;lock protocol violation&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="826" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="827" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="828" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="829" href="#"></a></td>
+<td><pre>     * Iterate until we extract the real exception</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="830" href="#"></a></td>
+<td><pre>     * from a stack of PrivilegedActionExceptions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="831" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="832" href="#"></a></td>
+<td><pre>    private static Exception extractException(Exception e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="833" href="#"></a></td>
+<td><pre>        while (e instanceof PrivilegedActionException) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="834" href="#"></a></td>
+<td><pre>            e = ((PrivilegedActionException)e).getException();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="835" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="836" href="#"></a></td>
+<td><pre>        return e;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="837" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="838" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="839" href="#"></a></td>
+<td><pre>    private static final ClassLogger logger =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="840" href="#"></a></td>
+<td><pre>        new ClassLogger(&quot;javax.management.remote.misc&quot;,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="841" href="#"></a></td>
+<td><pre>                        &quot;ArrayNotificationBuffer&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="842" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="843" href="#"></a></td>
+<td><pre>    private final MBeanServer mBeanServer;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="844" href="#"></a></td>
+<td><pre>    private final ArrayQueue&lt;NamedNotification&gt; queue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="845" href="#"></a></td>
+<td><pre>    private int queueSize;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="846" href="#"></a></td>
+<td><pre>    private long earliestSequenceNumber;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="847" href="#"></a></td>
+<td><pre>    private long nextSequenceNumber;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="848" href="#"></a></td>
+<td><pre>    private Set&lt;ObjectName&gt; createdDuringQuery;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="849" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="850" href="#"></a></td>
+<td><pre>    static final String broadcasterClass =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="851" href="#"></a></td>
+<td><pre>        NotificationBroadcaster.class.getName();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="852" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>

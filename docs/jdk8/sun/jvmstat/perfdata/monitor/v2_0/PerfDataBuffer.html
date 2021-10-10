@@ -3,623 +3,2471 @@
         <link rel="stylesheet" type="text/css" href="/css/styles.css"/>
     </head>
 <body>
-<pre class="code">
-/*
- * Copyright (c) 2004, 2010, Oracle and/or its affiliates. All rights reserved.
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This code is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 only, as
- * published by the Free Software Foundation.  Oracle designates this
- * particular file as subject to the &quot;Classpath&quot; exception as provided
- * by Oracle in the LICENSE file that accompanied this code.
- *
- * This code is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * version 2 for more details (a copy is included in the LICENSE file that
- * accompanied this code).
- *
- * You should have received a copy of the GNU General Public License version
- * 2 along with this work; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
- *
- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
- * or visit www.oracle.com if you need additional information or have any
- * questions.
- */
-
-package sun.jvmstat.perfdata.monitor.v2_0;
-
-import sun.jvmstat.monitor.*;
-import sun.jvmstat.perfdata.monitor.*;
-import java.util.*;
-import java.util.regex.*;
-import java.nio.*;
-
-/**
- * The concrete implementation of version 2.0 of the HotSpot PerfData
- * Instrumentation buffer. This class is responsible for parsing the
- * instrumentation memory and constructing the necessary objects to
- * represent and access the instrumentation objects contained in the
- * memory buffer.
- * &lt;p&gt;
- * The structure of the 2.0 entry is defined in struct PerfDataEnry
- * as decsribed in perfMemory.hpp. This structure looks like:
- * &lt;pre&gt;
- * typedef struct {
- *   jint entry_length;         // entry length in bytes
- *   jint name_offset;          // offset to entry name, relative to start
- *                              // of entry
- *   jint vector_length;        // length of the vector. If 0, then scalar.
- *   jbyte data_type;           // JNI field descriptor type
- *   jbyte flags;               // miscellaneous attribute flags
- *                              // 0x01 - supported
- *   jbyte data_units;          // unit of measure attribute
- *   jbyte data_variability;    // variability attribute
- *   jbyte data_offset;         // offset to data item, relative to start
- *                              // of entry.
- * } PerfDataEntry;
- * &lt;/pre&gt;
- *
- * @author Brian Doherty
- * @since 1.5
- * @see AbstractPerfDataBuffer
- */
-public class PerfDataBuffer extends PerfDataBufferImpl {
-
-    private static final boolean DEBUG = false;
-    private static final int syncWaitMs =
-            Integer.getInteger(&quot;sun.jvmstat.perdata.syncWaitMs&quot;, 5000);
-    private static final ArrayList EMPTY_LIST = new ArrayList(0);
-
-    /*
-     * These are primarily for documentary purposes and the match up
-     * with the PerfDataEntry structure in perfMemory.hpp. They are
-     * generally unused in this code, but they are kept consistent with
-     * the data structure just in case some unforseen need arrises.
-     */
-    private final static int PERFDATA_ENTRYLENGTH_OFFSET=0;
-    private final static int PERFDATA_ENTRYLENGTH_SIZE=4;   // sizeof(int)
-    private final static int PERFDATA_NAMEOFFSET_OFFSET=4;
-    private final static int PERFDATA_NAMEOFFSET_SIZE=4;    // sizeof(int)
-    private final static int PERFDATA_VECTORLENGTH_OFFSET=8;
-    private final static int PERFDATA_VECTORLENGTH_SIZE=4;  // sizeof(int)
-    private final static int PERFDATA_DATATYPE_OFFSET=12;
-    private final static int PERFDATA_DATATYPE_SIZE=1;      // sizeof(byte)
-    private final static int PERFDATA_FLAGS_OFFSET=13;
-    private final static int PERFDATA_FLAGS_SIZE=1;       // sizeof(byte)
-    private final static int PERFDATA_DATAUNITS_OFFSET=14;
-    private final static int PERFDATA_DATAUNITS_SIZE=1;     // sizeof(byte)
-    private final static int PERFDATA_DATAVAR_OFFSET=15;
-    private final static int PERFDATA_DATAVAR_SIZE=1;       // sizeof(byte)
-    private final static int PERFDATA_DATAOFFSET_OFFSET=16;
-    private final static int PERFDATA_DATAOFFSET_SIZE=4;    // sizeof(int)
-
-    PerfDataBufferPrologue prologue;
-    int nextEntry;
-    long lastNumEntries;
-    IntegerMonitor overflow;
-    ArrayList&lt;Monitor&gt; insertedMonitors;
-
-    /**
-     * Construct a PerfDataBuffer instance.
-     * &lt;p&gt;
-     * This class is dynamically loaded by
-     * {@link AbstractPerfDataBuffer#createPerfDataBuffer}, and this
-     * constructor is called to instantiate the instance.
-     *
-     * @param buffer the buffer containing the instrumentation data
-     * @param lvmid the Local Java Virtual Machine Identifier for this
-     *              instrumentation buffer.
-     */
-    public PerfDataBuffer(ByteBuffer buffer, int lvmid)
-           throws MonitorException {
-        super(buffer, lvmid);
-        prologue = new PerfDataBufferPrologue(buffer);
-        this.buffer.order(prologue.getByteOrder());
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    protected void buildMonitorMap(Map&lt;String, Monitor&gt;  map) throws MonitorException {
-        assert Thread.holdsLock(this);
-
-        // start at the beginning of the buffer
-        buffer.rewind();
-
-        // create pseudo monitors
-        buildPseudoMonitors(map);
-
-        // wait for the target JVM to indicate that it's intrumentation
-        // buffer is safely accessible
-        synchWithTarget();
-
-        // parse the currently defined entries starting at the first entry.
-        nextEntry = prologue.getEntryOffset();
-
-        // record the number of entries before parsing the structure
-        int numEntries = prologue.getNumEntries();
-
-        // start parsing
-        Monitor monitor = getNextMonitorEntry();
-        while (monitor != null) {
-            map.put(monitor.getName(), monitor);
-            monitor = getNextMonitorEntry();
-        }
-
-        /*
-         * keep track of the current number of entries in the shared
-         * memory for new entry detection purposes. It's possible for
-         * the data structure to be modified while the Map is being
-         * built and the entry count in the header might change while
-         * we are parsing it. The map will contain all the counters
-         * found, but the number recorded in numEntries might be small
-         * than what than the number we actually parsed (due to asynchronous
-         * updates). This discrepency is handled by ignoring any re-parsed
-         * entries when updating the Map in getNewMonitors().
-         */
-        lastNumEntries = numEntries;
-
-        // keep track of the monitors just added.
-        insertedMonitors = new ArrayList&lt;Monitor&gt;(map.values());
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    protected void getNewMonitors(Map&lt;String, Monitor&gt; map) throws MonitorException {
-        assert Thread.holdsLock(this);
-
-        int numEntries = prologue.getNumEntries();
-
-        if (numEntries &gt; lastNumEntries) {
-            lastNumEntries = numEntries;
-            Monitor monitor = getNextMonitorEntry();
-
-            while (monitor != null) {
-                String name = monitor.getName();
-
-                // guard against re-parsed entries
-                if (!map.containsKey(name)) {
-                    map.put(name, monitor);
-                    if (insertedMonitors != null) {
-                        insertedMonitors.add(monitor);
-                    }
-                }
-                monitor = getNextMonitorEntry();
-            }
-        }
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    protected MonitorStatus getMonitorStatus(Map&lt;String, Monitor&gt; map) throws MonitorException {
-        assert Thread.holdsLock(this);
-        assert insertedMonitors != null;
-
-        // load any new monitors
-        getNewMonitors(map);
-
-        // current implementation doesn't support deletion of reuse of entries
-        ArrayList removed = EMPTY_LIST;
-        ArrayList inserted = insertedMonitors;
-
-        insertedMonitors = new ArrayList&lt;Monitor&gt;();
-        return new MonitorStatus(inserted, removed);
-    }
-
-    /**
-     * Build the pseudo monitors used to map the prolog data into counters.
-     */
-    protected void buildPseudoMonitors(Map&lt;String, Monitor&gt; map) {
-        Monitor monitor = null;
-        String name = null;
-        IntBuffer ib = null;
-
-        name = PerfDataBufferPrologue.PERFDATA_MAJOR_NAME;
-        ib = prologue.majorVersionBuffer();
-        monitor = new PerfIntegerMonitor(name, Units.NONE,
-                                         Variability.CONSTANT, false, ib);
-        map.put(name, monitor);
-
-        name = PerfDataBufferPrologue.PERFDATA_MINOR_NAME;
-        ib = prologue.minorVersionBuffer();
-        monitor = new PerfIntegerMonitor(name, Units.NONE,
-                                         Variability.CONSTANT, false, ib);
-        map.put(name, monitor);
-
-        name = PerfDataBufferPrologue.PERFDATA_BUFFER_SIZE_NAME;
-        ib = prologue.sizeBuffer();
-        monitor = new PerfIntegerMonitor(name, Units.BYTES,
-                                         Variability.MONOTONIC, false, ib);
-        map.put(name, monitor);
-
-        name = PerfDataBufferPrologue.PERFDATA_BUFFER_USED_NAME;
-        ib = prologue.usedBuffer();
-        monitor = new PerfIntegerMonitor(name, Units.BYTES,
-                                         Variability.MONOTONIC, false, ib);
-        map.put(name, monitor);
-
-        name = PerfDataBufferPrologue.PERFDATA_OVERFLOW_NAME;
-        ib = prologue.overflowBuffer();
-        monitor = new PerfIntegerMonitor(name, Units.BYTES,
-                                         Variability.MONOTONIC, false, ib);
-        map.put(name, monitor);
-        this.overflow = (IntegerMonitor)monitor;
-
-        name = PerfDataBufferPrologue.PERFDATA_MODTIMESTAMP_NAME;
-        LongBuffer lb = prologue.modificationTimeStampBuffer();
-        monitor = new PerfLongMonitor(name, Units.TICKS,
-                                      Variability.MONOTONIC, false, lb);
-        map.put(name, monitor);
-    }
-
-    /**
-     * Method that waits until the target jvm indicates that
-     * its shared memory is safe to access.
-     */
-    protected void synchWithTarget() throws MonitorException {
-        /*
-         * synch must happen with syncWaitMs from now. Default is 5 seconds,
-         * which is reasonabally generous and should provide for extreme
-         * situations like startup delays due to allocation of large ISM heaps.
-         */
-        long timeLimit = System.currentTimeMillis() + syncWaitMs;
-
-        // loop waiting for the accessible indicater to be non-zero
-        log(&quot;synchWithTarget: &quot; + lvmid + &quot; &quot;);
-        while (!prologue.isAccessible()) {
-
-            log(&quot;.&quot;);
-
-            // give the target jvm a chance to complete initializatoin
-            try { Thread.sleep(20); } catch (InterruptedException e) { }
-
-            if (System.currentTimeMillis() &gt; timeLimit) {
-                logln(&quot;failed: &quot; + lvmid);
-                throw new MonitorException(&quot;Could not synchronize with target&quot;);
-            }
-        }
-        logln(&quot;success: &quot; + lvmid);
-    }
-
-    /**
-     * method to extract the next monitor entry from the instrumentation memory.
-     * assumes that nextEntry is the offset into the byte array
-     * at which to start the search for the next entry. method leaves
-     * next entry pointing to the next entry or to the end of data.
-     */
-    protected Monitor getNextMonitorEntry() throws MonitorException {
-        Monitor monitor = null;
-
-        // entries are always 4 byte aligned.
-        if ((nextEntry % 4) != 0) {
-            throw new MonitorStructureException(
-                    &quot;Misaligned entry index: &quot;
-                    + Integer.toHexString(nextEntry));
-        }
-
-        // protect againt a corrupted shard memory region.
-        if ((nextEntry &lt; 0)  || (nextEntry &gt; buffer.limit())) {
-            throw new MonitorStructureException(
-                    &quot;Entry index out of bounds: &quot;
-                    + Integer.toHexString(nextEntry)
-                    + &quot;, limit = &quot; + Integer.toHexString(buffer.limit()));
-        }
-
-        // check for end of the buffer
-        if (nextEntry == buffer.limit()) {
-            logln(&quot;getNextMonitorEntry():&quot;
-                  + &quot; nextEntry == buffer.limit(): returning&quot;);
-            return null;
-        }
-
-        buffer.position(nextEntry);
-
-        int entryStart = buffer.position();
-        int entryLength = buffer.getInt();
-
-        // check for valid entry length
-        if ((entryLength &lt; 0) || (entryLength &gt; buffer.limit())) {
-            throw new MonitorStructureException(
-                    &quot;Invalid entry length: entryLength = &quot; + entryLength
-                    + &quot; (0x&quot; + Integer.toHexString(entryLength) + &quot;)&quot;);
-        }
-
-        // check if last entry occurs before the eof.
-        if ((entryStart + entryLength) &gt; buffer.limit()) {
-            throw new MonitorStructureException(
-                    &quot;Entry extends beyond end of buffer: &quot;
-                    + &quot; entryStart = 0x&quot; + Integer.toHexString(entryStart)
-                    + &quot; entryLength = 0x&quot; + Integer.toHexString(entryLength)
-                    + &quot; buffer limit = 0x&quot; + Integer.toHexString(buffer.limit()));
-        }
-
-        if (entryLength == 0) {
-            // end of data
-            return null;
-        }
-
-        // we can safely read this entry
-        int nameOffset = buffer.getInt();
-        int vectorLength = buffer.getInt();
-        byte typeCodeByte = buffer.get();
-        byte flags = buffer.get();
-        byte unitsByte = buffer.get();
-        byte varByte = buffer.get();
-        int dataOffset = buffer.getInt();
-
-        dump_entry_fixed(entryStart, nameOffset, vectorLength, typeCodeByte,
-                         flags, unitsByte, varByte, dataOffset);
-
-        // convert common attributes to their object types
-        Units units = Units.toUnits(unitsByte);
-        Variability variability = Variability.toVariability(varByte);
-        TypeCode typeCode = null;
-        boolean supported = (flags &amp; 0x01) != 0;
-
-        try {
-            typeCode = TypeCode.toTypeCode(typeCodeByte);
-
-        } catch (IllegalArgumentException e) {
-            throw new MonitorStructureException(
-                    &quot;Illegal type code encountered:&quot;
-                    + &quot; entry_offset = 0x&quot; + Integer.toHexString(nextEntry)
-                    + &quot;, type_code = &quot; + Integer.toHexString(typeCodeByte));
-        }
-
-        // verify that the name_offset is contained within the entry bounds
-        if (nameOffset &gt; entryLength) {
-            throw new MonitorStructureException(
-                    &quot;Field extends beyond entry bounds&quot;
-                    + &quot; entry_offset = 0x&quot; + Integer.toHexString(nextEntry)
-                    + &quot;, name_offset = 0x&quot; + Integer.toHexString(nameOffset));
-        }
-
-        // verify that the data_offset is contained within the entry bounds
-        if (dataOffset &gt; entryLength) {
-            throw new MonitorStructureException(
-                    &quot;Field extends beyond entry bounds:&quot;
-                    + &quot; entry_offset = 0x&quot; + Integer.toHexString(nextEntry)
-                    + &quot;, data_offset = 0x&quot; + Integer.toHexString(dataOffset));
-        }
-
-        // validate the variability and units fields
-        if (variability == Variability.INVALID) {
-            throw new MonitorDataException(
-                    &quot;Invalid variability attribute:&quot;
-                    + &quot; entry_offset = 0x&quot; + Integer.toHexString(nextEntry)
-                    + &quot;, variability = 0x&quot; + Integer.toHexString(varByte));
-        }
-
-        if (units == Units.INVALID) {
-            throw new MonitorDataException(
-                    &quot;Invalid units attribute: entry_offset = 0x&quot;
-                    + Integer.toHexString(nextEntry)
-                    + &quot;, units = 0x&quot; + Integer.toHexString(unitsByte));
-        }
-
-        // the entry looks good - parse the variable length components
-
-        /*
-         * The name starts at nameOffset and continues up to the first null
-         * byte. however, we don't know the length, but we can approximate it
-         * without searching for the null by using the offset for the data
-         * field, which follows the name field.
-         */
-        assert (buffer.position() == (entryStart + nameOffset));
-        assert (dataOffset &gt; nameOffset);
-
-        // include possible pad space
-        int maxNameLength = dataOffset-nameOffset;
-
-        // maxNameLength better be less than the total entry length
-        assert (maxNameLength &lt; entryLength);
-
-        // collect the characters, but do not collect the null byte,
-        // as the String(byte[]) constructor does not ignore it!
-        byte[] nameBytes = new byte[maxNameLength];
-        int nameLength = 0;
-        byte b;
-        while (((b = buffer.get()) != 0) &amp;&amp; (nameLength &lt; maxNameLength)) {
-             nameBytes[nameLength++] = b;
-        }
-
-        assert (nameLength &lt; maxNameLength);
-
-        // we should before or at the start of the data field
-        assert (buffer.position() &lt;= (entryStart + dataOffset));
-
-        // convert the name bytes into a String
-        String name = new String(nameBytes, 0, nameLength);
-
-        /*
-         * compute the size of the data item - this includes pad
-         * characters used to align the next entry.
-         */
-        int dataSize = entryLength - dataOffset;
-
-        // set the position to the start of the data item
-        buffer.position(entryStart + dataOffset);
-
-        dump_entry_variable(name, buffer, dataSize);
-
-        if (vectorLength == 0) {
-            // create a scalar Monitor object
-            if (typeCode == TypeCode.LONG) {
-                LongBuffer lb = buffer.asLongBuffer();
-                lb.limit(1);  // limit buffer size to one long value.
-                monitor = new PerfLongMonitor(name, units, variability,
-                                              supported, lb);
-            } else {
-                /*
-                 * unexpected type code - coding error or uncoordinated
-                 * JVM change
-                 */
-                throw new MonitorTypeException(
-                        &quot;Unexpected type code encountered:&quot;
-                        + &quot; entry_offset = 0x&quot; + Integer.toHexString(nextEntry)
-                        + &quot;, name = &quot; + name
-                        + &quot;, type_code = &quot; + typeCode
-                        + &quot; (0x&quot; + Integer.toHexString(typeCodeByte) + &quot;)&quot;);
-            }
-        } else {
-            // create a vector Monitor object
-            if (typeCode == TypeCode.BYTE) {
-                if (units != Units.STRING) {
-                    // only byte arrays of type STRING are currently supported
-                    throw new MonitorTypeException(
-                            &quot;Unexpected vector type encounterd:&quot;
-                            + &quot; entry_offset = &quot;
-                            + Integer.toHexString(nextEntry)
-                            + &quot;, name = &quot; + name
-                            + &quot;, type_code = &quot; + typeCode + &quot; (0x&quot;
-                            + Integer.toHexString(typeCodeByte) + &quot;)&quot;
-                            + &quot;, units = &quot; + units + &quot; (0x&quot;
-                            + Integer.toHexString(unitsByte) + &quot;)&quot;);
-                }
-
-                ByteBuffer bb = buffer.slice();
-                bb.limit(vectorLength); // limit buffer length to # of chars
-
-                if (variability == Variability.CONSTANT) {
-                    monitor = new PerfStringConstantMonitor(name, supported,
-                                                            bb);
-                } else if (variability == Variability.VARIABLE) {
-                    monitor = new PerfStringVariableMonitor(name, supported,
-                                                            bb, vectorLength-1);
-                } else if (variability == Variability.MONOTONIC) {
-                    // Monotonically increasing byte arrays are not supported
-                    throw new MonitorDataException(
-                            &quot;Unexpected variability attribute:&quot;
-                            + &quot; entry_offset = 0x&quot;
-                            + Integer.toHexString(nextEntry)
-                            + &quot; name = &quot; + name
-                            + &quot;, variability = &quot; + variability + &quot; (0x&quot;
-                            + Integer.toHexString(varByte) + &quot;)&quot;);
-                } else {
-                    // variability was validated above, so this unexpected
-                    assert false;
-                }
-            } else {
-                // coding error or uncoordinated JVM change
-                throw new MonitorTypeException(
-                        &quot;Unexpected type code encountered:&quot;
-                        + &quot; entry_offset = 0x&quot;
-                        + Integer.toHexString(nextEntry)
-                        + &quot;, name = &quot; + name
-                        + &quot;, type_code = &quot; + typeCode + &quot; (0x&quot;
-                        + Integer.toHexString(typeCodeByte) + &quot;)&quot;);
-            }
-        }
-
-        // setup index to next entry for next iteration of the loop.
-        nextEntry = entryStart + entryLength;
-        return monitor;
-    }
-
-    /**
-     * Method to dump debugging information
-     */
-    private void dumpAll(Map&lt;String, Monitor&gt; map, int lvmid) {
-        if (DEBUG) {
-            Set&lt;String&gt; keys = map.keySet();
-
-            System.err.println(&quot;Dump for &quot; + lvmid);
-            int j = 0;
-            for (Iterator i = keys.iterator(); i.hasNext(); j++) {
-                Monitor monitor = map.get(i.next());
-                System.err.println(j + &quot;\t&quot; + monitor.getName()
-                                   + &quot;=&quot; + monitor.getValue());
-            }
-            System.err.println(&quot;nextEntry = &quot; + nextEntry);
-            System.err.println(&quot;Buffer info:&quot;);
-            System.err.println(&quot;buffer = &quot; + buffer);
-        }
-    }
-
-    /**
-     * Method to dump the fixed portion of an entry.
-     */
-    private void dump_entry_fixed(int entry_start, int nameOffset,
-                                  int vectorLength, byte typeCodeByte,
-                                  byte flags, byte unitsByte, byte varByte,
-                                  int dataOffset) {
-        if (DEBUG) {
-            System.err.println(&quot;Entry at offset: 0x&quot;
-                               + Integer.toHexString(entry_start));
-            System.err.println(&quot;\tname_offset = 0x&quot;
-                               + Integer.toHexString(nameOffset));
-            System.err.println(&quot;\tvector_length = 0x&quot;
-                               + Integer.toHexString(vectorLength));
-            System.err.println(&quot;\tdata_type = 0x&quot;
-                               + Integer.toHexString(typeCodeByte));
-            System.err.println(&quot;\tflags = 0x&quot;
-                               + Integer.toHexString(flags));
-            System.err.println(&quot;\tdata_units = 0x&quot;
-                               + Integer.toHexString(unitsByte));
-            System.err.println(&quot;\tdata_variability = 0x&quot;
-                               + Integer.toHexString(varByte));
-            System.err.println(&quot;\tdata_offset = 0x&quot;
-                               + Integer.toHexString(dataOffset));
-        }
-    }
-
-    private void dump_entry_variable(String name, ByteBuffer bb, int size) {
-        if (DEBUG) {
-            char[] toHex = new char[] { '0', '1', '2', '3',
-                                        '4', '5', '6', '7',
-                                        '8', '9', 'a', 'b',
-                                        'c', 'd', 'e', 'f' };
-
-            ByteBuffer data = bb.slice();
-            data.limit(size);
-
-            System.err.println(&quot;\tname = &quot; + name);
-            System.err.println(&quot;\tdata = &quot;);
-
-            int count=0;
-            while (data.hasRemaining()) {
-                byte b = data.get();
-                byte high = (byte)((b &gt;&gt; 8) &amp; 0x0f);
-                byte low = (byte)(b &amp; 0x0f);
-
-                if (count % 16 == 0) {
-                    System.err.print(&quot;\t\t&quot; + Integer.toHexString(count / 16)
-                                     + &quot;: &quot;);
-                }
-
-                System.err.print(String.valueOf(toHex[high])
-                                 + String.valueOf(toHex[low]));
-
-                count++;
-                if (count % 16 == 0) {
-                    System.err.println();
-                } else {
-                    System.err.print(&quot; &quot;);
-                }
-            }
-            if (count % 16 != 0) {
-                System.err.println();
-            }
-        }
-    }
-
-    private void logln(String s) {
-        if (DEBUG) {
-            System.err.println(s);
-        }
-    }
-
-    private void log(String s) {
-        if (DEBUG) {
-            System.err.print(s);
-        }
-    }
-}
-</pre>
+<table>
+<tr>
+<td><a class="linenum-cell" data-linenum="1" href="#"></a></td>
+<td><pre>/*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="2" href="#"></a></td>
+<td><pre> * Copyright (c) 2004, 2010, Oracle and/or its affiliates. All rights reserved.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="3" href="#"></a></td>
+<td><pre> * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="4" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="5" href="#"></a></td>
+<td><pre> * This code is free software; you can redistribute it and/or modify it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="6" href="#"></a></td>
+<td><pre> * under the terms of the GNU General Public License version 2 only, as</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="7" href="#"></a></td>
+<td><pre> * published by the Free Software Foundation.  Oracle designates this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="8" href="#"></a></td>
+<td><pre> * particular file as subject to the &quot;Classpath&quot; exception as provided</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="9" href="#"></a></td>
+<td><pre> * by Oracle in the LICENSE file that accompanied this code.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="10" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="11" href="#"></a></td>
+<td><pre> * This code is distributed in the hope that it will be useful, but WITHOUT</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="12" href="#"></a></td>
+<td><pre> * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="13" href="#"></a></td>
+<td><pre> * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="14" href="#"></a></td>
+<td><pre> * version 2 for more details (a copy is included in the LICENSE file that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="15" href="#"></a></td>
+<td><pre> * accompanied this code).</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="16" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="17" href="#"></a></td>
+<td><pre> * You should have received a copy of the GNU General Public License version</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="18" href="#"></a></td>
+<td><pre> * 2 along with this work; if not, write to the Free Software Foundation,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="19" href="#"></a></td>
+<td><pre> * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="20" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="21" href="#"></a></td>
+<td><pre> * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="22" href="#"></a></td>
+<td><pre> * or visit www.oracle.com if you need additional information or have any</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="23" href="#"></a></td>
+<td><pre> * questions.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="24" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="25" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="26" href="#"></a></td>
+<td><pre>package sun.jvmstat.perfdata.monitor.v2_0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="27" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="28" href="#"></a></td>
+<td><pre>import sun.jvmstat.monitor.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="29" href="#"></a></td>
+<td><pre>import sun.jvmstat.perfdata.monitor.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="30" href="#"></a></td>
+<td><pre>import java.util.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="31" href="#"></a></td>
+<td><pre>import java.util.regex.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="32" href="#"></a></td>
+<td><pre>import java.nio.*;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="33" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="34" href="#"></a></td>
+<td><pre>/**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="35" href="#"></a></td>
+<td><pre> * The concrete implementation of version 2.0 of the HotSpot PerfData</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="36" href="#"></a></td>
+<td><pre> * Instrumentation buffer. This class is responsible for parsing the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="37" href="#"></a></td>
+<td><pre> * instrumentation memory and constructing the necessary objects to</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="38" href="#"></a></td>
+<td><pre> * represent and access the instrumentation objects contained in the</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="39" href="#"></a></td>
+<td><pre> * memory buffer.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="40" href="#"></a></td>
+<td><pre> * &lt;p&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="41" href="#"></a></td>
+<td><pre> * The structure of the 2.0 entry is defined in struct PerfDataEnry</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="42" href="#"></a></td>
+<td><pre> * as decsribed in perfMemory.hpp. This structure looks like:</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="43" href="#"></a></td>
+<td><pre> * &lt;pre&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="44" href="#"></a></td>
+<td><pre> * typedef struct {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="45" href="#"></a></td>
+<td><pre> *   jint entry_length;         // entry length in bytes</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="46" href="#"></a></td>
+<td><pre> *   jint name_offset;          // offset to entry name, relative to start</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="47" href="#"></a></td>
+<td><pre> *                              // of entry</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="48" href="#"></a></td>
+<td><pre> *   jint vector_length;        // length of the vector. If 0, then scalar.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="49" href="#"></a></td>
+<td><pre> *   jbyte data_type;           // JNI field descriptor type</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="50" href="#"></a></td>
+<td><pre> *   jbyte flags;               // miscellaneous attribute flags</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="51" href="#"></a></td>
+<td><pre> *                              // 0x01 - supported</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="52" href="#"></a></td>
+<td><pre> *   jbyte data_units;          // unit of measure attribute</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="53" href="#"></a></td>
+<td><pre> *   jbyte data_variability;    // variability attribute</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="54" href="#"></a></td>
+<td><pre> *   jbyte data_offset;         // offset to data item, relative to start</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="55" href="#"></a></td>
+<td><pre> *                              // of entry.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="56" href="#"></a></td>
+<td><pre> * } PerfDataEntry;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="57" href="#"></a></td>
+<td><pre> * &lt;/pre&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="58" href="#"></a></td>
+<td><pre> *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="59" href="#"></a></td>
+<td><pre> * @author Brian Doherty</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="60" href="#"></a></td>
+<td><pre> * @since 1.5</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="61" href="#"></a></td>
+<td><pre> * @see AbstractPerfDataBuffer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="62" href="#"></a></td>
+<td><pre> */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="63" href="#"></a></td>
+<td><pre>public class PerfDataBuffer extends PerfDataBufferImpl {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="64" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="65" href="#"></a></td>
+<td><pre>    private static final boolean DEBUG = false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="66" href="#"></a></td>
+<td><pre>    private static final int syncWaitMs =</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="67" href="#"></a></td>
+<td><pre>            Integer.getInteger(&quot;sun.jvmstat.perdata.syncWaitMs&quot;, 5000);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="68" href="#"></a></td>
+<td><pre>    private static final ArrayList EMPTY_LIST = new ArrayList(0);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="69" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="70" href="#"></a></td>
+<td><pre>    /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="71" href="#"></a></td>
+<td><pre>     * These are primarily for documentary purposes and the match up</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="72" href="#"></a></td>
+<td><pre>     * with the PerfDataEntry structure in perfMemory.hpp. They are</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="73" href="#"></a></td>
+<td><pre>     * generally unused in this code, but they are kept consistent with</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="74" href="#"></a></td>
+<td><pre>     * the data structure just in case some unforseen need arrises.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="75" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="76" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_ENTRYLENGTH_OFFSET=0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="77" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_ENTRYLENGTH_SIZE=4;   // sizeof(int)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="78" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_NAMEOFFSET_OFFSET=4;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="79" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_NAMEOFFSET_SIZE=4;    // sizeof(int)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="80" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_VECTORLENGTH_OFFSET=8;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="81" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_VECTORLENGTH_SIZE=4;  // sizeof(int)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="82" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_DATATYPE_OFFSET=12;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="83" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_DATATYPE_SIZE=1;      // sizeof(byte)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="84" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_FLAGS_OFFSET=13;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="85" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_FLAGS_SIZE=1;       // sizeof(byte)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="86" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_DATAUNITS_OFFSET=14;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="87" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_DATAUNITS_SIZE=1;     // sizeof(byte)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="88" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_DATAVAR_OFFSET=15;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="89" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_DATAVAR_SIZE=1;       // sizeof(byte)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="90" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_DATAOFFSET_OFFSET=16;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="91" href="#"></a></td>
+<td><pre>    private final static int PERFDATA_DATAOFFSET_SIZE=4;    // sizeof(int)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="92" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="93" href="#"></a></td>
+<td><pre>    PerfDataBufferPrologue prologue;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="94" href="#"></a></td>
+<td><pre>    int nextEntry;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="95" href="#"></a></td>
+<td><pre>    long lastNumEntries;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="96" href="#"></a></td>
+<td><pre>    IntegerMonitor overflow;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="97" href="#"></a></td>
+<td><pre>    ArrayList&lt;Monitor&gt; insertedMonitors;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="98" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="99" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="100" href="#"></a></td>
+<td><pre>     * Construct a PerfDataBuffer instance.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="101" href="#"></a></td>
+<td><pre>     * &lt;p&gt;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="102" href="#"></a></td>
+<td><pre>     * This class is dynamically loaded by</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="103" href="#"></a></td>
+<td><pre>     * {@link AbstractPerfDataBuffer#createPerfDataBuffer}, and this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="104" href="#"></a></td>
+<td><pre>     * constructor is called to instantiate the instance.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="105" href="#"></a></td>
+<td><pre>     *</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="106" href="#"></a></td>
+<td><pre>     * @param buffer the buffer containing the instrumentation data</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="107" href="#"></a></td>
+<td><pre>     * @param lvmid the Local Java Virtual Machine Identifier for this</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="108" href="#"></a></td>
+<td><pre>     *              instrumentation buffer.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="109" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="110" href="#"></a></td>
+<td><pre>    public PerfDataBuffer(ByteBuffer buffer, int lvmid)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="111" href="#"></a></td>
+<td><pre>           throws MonitorException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="112" href="#"></a></td>
+<td><pre>        super(buffer, lvmid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="113" href="#"></a></td>
+<td><pre>        prologue = new PerfDataBufferPrologue(buffer);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="114" href="#"></a></td>
+<td><pre>        this.buffer.order(prologue.getByteOrder());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="115" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="116" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="117" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="118" href="#"></a></td>
+<td><pre>     * {@inheritDoc}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="119" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="120" href="#"></a></td>
+<td><pre>    protected void buildMonitorMap(Map&lt;String, Monitor&gt;  map) throws MonitorException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="121" href="#"></a></td>
+<td><pre>        assert Thread.holdsLock(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="122" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="123" href="#"></a></td>
+<td><pre>        // start at the beginning of the buffer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="124" href="#"></a></td>
+<td><pre>        buffer.rewind();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="125" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="126" href="#"></a></td>
+<td><pre>        // create pseudo monitors</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="127" href="#"></a></td>
+<td><pre>        buildPseudoMonitors(map);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="128" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="129" href="#"></a></td>
+<td><pre>        // wait for the target JVM to indicate that it's intrumentation</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="130" href="#"></a></td>
+<td><pre>        // buffer is safely accessible</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="131" href="#"></a></td>
+<td><pre>        synchWithTarget();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="132" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="133" href="#"></a></td>
+<td><pre>        // parse the currently defined entries starting at the first entry.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="134" href="#"></a></td>
+<td><pre>        nextEntry = prologue.getEntryOffset();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="135" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="136" href="#"></a></td>
+<td><pre>        // record the number of entries before parsing the structure</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="137" href="#"></a></td>
+<td><pre>        int numEntries = prologue.getNumEntries();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="138" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="139" href="#"></a></td>
+<td><pre>        // start parsing</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="140" href="#"></a></td>
+<td><pre>        Monitor monitor = getNextMonitorEntry();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="141" href="#"></a></td>
+<td><pre>        while (monitor != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="142" href="#"></a></td>
+<td><pre>            map.put(monitor.getName(), monitor);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="143" href="#"></a></td>
+<td><pre>            monitor = getNextMonitorEntry();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="144" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="145" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="146" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="147" href="#"></a></td>
+<td><pre>         * keep track of the current number of entries in the shared</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="148" href="#"></a></td>
+<td><pre>         * memory for new entry detection purposes. It's possible for</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="149" href="#"></a></td>
+<td><pre>         * the data structure to be modified while the Map is being</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="150" href="#"></a></td>
+<td><pre>         * built and the entry count in the header might change while</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="151" href="#"></a></td>
+<td><pre>         * we are parsing it. The map will contain all the counters</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="152" href="#"></a></td>
+<td><pre>         * found, but the number recorded in numEntries might be small</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="153" href="#"></a></td>
+<td><pre>         * than what than the number we actually parsed (due to asynchronous</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="154" href="#"></a></td>
+<td><pre>         * updates). This discrepency is handled by ignoring any re-parsed</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="155" href="#"></a></td>
+<td><pre>         * entries when updating the Map in getNewMonitors().</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="156" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="157" href="#"></a></td>
+<td><pre>        lastNumEntries = numEntries;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="158" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="159" href="#"></a></td>
+<td><pre>        // keep track of the monitors just added.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="160" href="#"></a></td>
+<td><pre>        insertedMonitors = new ArrayList&lt;Monitor&gt;(map.values());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="161" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="162" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="163" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="164" href="#"></a></td>
+<td><pre>     * {@inheritDoc}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="165" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="166" href="#"></a></td>
+<td><pre>    protected void getNewMonitors(Map&lt;String, Monitor&gt; map) throws MonitorException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="167" href="#"></a></td>
+<td><pre>        assert Thread.holdsLock(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="168" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="169" href="#"></a></td>
+<td><pre>        int numEntries = prologue.getNumEntries();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="170" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="171" href="#"></a></td>
+<td><pre>        if (numEntries &gt; lastNumEntries) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="172" href="#"></a></td>
+<td><pre>            lastNumEntries = numEntries;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="173" href="#"></a></td>
+<td><pre>            Monitor monitor = getNextMonitorEntry();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="174" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="175" href="#"></a></td>
+<td><pre>            while (monitor != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="176" href="#"></a></td>
+<td><pre>                String name = monitor.getName();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="177" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="178" href="#"></a></td>
+<td><pre>                // guard against re-parsed entries</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="179" href="#"></a></td>
+<td><pre>                if (!map.containsKey(name)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="180" href="#"></a></td>
+<td><pre>                    map.put(name, monitor);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="181" href="#"></a></td>
+<td><pre>                    if (insertedMonitors != null) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="182" href="#"></a></td>
+<td><pre>                        insertedMonitors.add(monitor);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="183" href="#"></a></td>
+<td><pre>                    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="184" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="185" href="#"></a></td>
+<td><pre>                monitor = getNextMonitorEntry();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="186" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="187" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="188" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="189" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="190" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="191" href="#"></a></td>
+<td><pre>     * {@inheritDoc}</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="192" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="193" href="#"></a></td>
+<td><pre>    protected MonitorStatus getMonitorStatus(Map&lt;String, Monitor&gt; map) throws MonitorException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="194" href="#"></a></td>
+<td><pre>        assert Thread.holdsLock(this);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="195" href="#"></a></td>
+<td><pre>        assert insertedMonitors != null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="196" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="197" href="#"></a></td>
+<td><pre>        // load any new monitors</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="198" href="#"></a></td>
+<td><pre>        getNewMonitors(map);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="199" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="200" href="#"></a></td>
+<td><pre>        // current implementation doesn't support deletion of reuse of entries</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="201" href="#"></a></td>
+<td><pre>        ArrayList removed = EMPTY_LIST;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="202" href="#"></a></td>
+<td><pre>        ArrayList inserted = insertedMonitors;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="203" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="204" href="#"></a></td>
+<td><pre>        insertedMonitors = new ArrayList&lt;Monitor&gt;();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="205" href="#"></a></td>
+<td><pre>        return new MonitorStatus(inserted, removed);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="206" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="207" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="208" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="209" href="#"></a></td>
+<td><pre>     * Build the pseudo monitors used to map the prolog data into counters.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="210" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="211" href="#"></a></td>
+<td><pre>    protected void buildPseudoMonitors(Map&lt;String, Monitor&gt; map) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="212" href="#"></a></td>
+<td><pre>        Monitor monitor = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="213" href="#"></a></td>
+<td><pre>        String name = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="214" href="#"></a></td>
+<td><pre>        IntBuffer ib = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="215" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="216" href="#"></a></td>
+<td><pre>        name = PerfDataBufferPrologue.PERFDATA_MAJOR_NAME;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="217" href="#"></a></td>
+<td><pre>        ib = prologue.majorVersionBuffer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="218" href="#"></a></td>
+<td><pre>        monitor = new PerfIntegerMonitor(name, Units.NONE,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="219" href="#"></a></td>
+<td><pre>                                         Variability.CONSTANT, false, ib);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="220" href="#"></a></td>
+<td><pre>        map.put(name, monitor);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="221" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="222" href="#"></a></td>
+<td><pre>        name = PerfDataBufferPrologue.PERFDATA_MINOR_NAME;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="223" href="#"></a></td>
+<td><pre>        ib = prologue.minorVersionBuffer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="224" href="#"></a></td>
+<td><pre>        monitor = new PerfIntegerMonitor(name, Units.NONE,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="225" href="#"></a></td>
+<td><pre>                                         Variability.CONSTANT, false, ib);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="226" href="#"></a></td>
+<td><pre>        map.put(name, monitor);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="227" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="228" href="#"></a></td>
+<td><pre>        name = PerfDataBufferPrologue.PERFDATA_BUFFER_SIZE_NAME;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="229" href="#"></a></td>
+<td><pre>        ib = prologue.sizeBuffer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="230" href="#"></a></td>
+<td><pre>        monitor = new PerfIntegerMonitor(name, Units.BYTES,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="231" href="#"></a></td>
+<td><pre>                                         Variability.MONOTONIC, false, ib);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="232" href="#"></a></td>
+<td><pre>        map.put(name, monitor);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="233" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="234" href="#"></a></td>
+<td><pre>        name = PerfDataBufferPrologue.PERFDATA_BUFFER_USED_NAME;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="235" href="#"></a></td>
+<td><pre>        ib = prologue.usedBuffer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="236" href="#"></a></td>
+<td><pre>        monitor = new PerfIntegerMonitor(name, Units.BYTES,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="237" href="#"></a></td>
+<td><pre>                                         Variability.MONOTONIC, false, ib);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="238" href="#"></a></td>
+<td><pre>        map.put(name, monitor);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="239" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="240" href="#"></a></td>
+<td><pre>        name = PerfDataBufferPrologue.PERFDATA_OVERFLOW_NAME;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="241" href="#"></a></td>
+<td><pre>        ib = prologue.overflowBuffer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="242" href="#"></a></td>
+<td><pre>        monitor = new PerfIntegerMonitor(name, Units.BYTES,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="243" href="#"></a></td>
+<td><pre>                                         Variability.MONOTONIC, false, ib);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="244" href="#"></a></td>
+<td><pre>        map.put(name, monitor);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="245" href="#"></a></td>
+<td><pre>        this.overflow = (IntegerMonitor)monitor;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="246" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="247" href="#"></a></td>
+<td><pre>        name = PerfDataBufferPrologue.PERFDATA_MODTIMESTAMP_NAME;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="248" href="#"></a></td>
+<td><pre>        LongBuffer lb = prologue.modificationTimeStampBuffer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="249" href="#"></a></td>
+<td><pre>        monitor = new PerfLongMonitor(name, Units.TICKS,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="250" href="#"></a></td>
+<td><pre>                                      Variability.MONOTONIC, false, lb);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="251" href="#"></a></td>
+<td><pre>        map.put(name, monitor);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="252" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="253" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="254" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="255" href="#"></a></td>
+<td><pre>     * Method that waits until the target jvm indicates that</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="256" href="#"></a></td>
+<td><pre>     * its shared memory is safe to access.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="257" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="258" href="#"></a></td>
+<td><pre>    protected void synchWithTarget() throws MonitorException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="259" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="260" href="#"></a></td>
+<td><pre>         * synch must happen with syncWaitMs from now. Default is 5 seconds,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="261" href="#"></a></td>
+<td><pre>         * which is reasonabally generous and should provide for extreme</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="262" href="#"></a></td>
+<td><pre>         * situations like startup delays due to allocation of large ISM heaps.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="263" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="264" href="#"></a></td>
+<td><pre>        long timeLimit = System.currentTimeMillis() + syncWaitMs;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="265" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="266" href="#"></a></td>
+<td><pre>        // loop waiting for the accessible indicater to be non-zero</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="267" href="#"></a></td>
+<td><pre>        log(&quot;synchWithTarget: &quot; + lvmid + &quot; &quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="268" href="#"></a></td>
+<td><pre>        while (!prologue.isAccessible()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="269" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="270" href="#"></a></td>
+<td><pre>            log(&quot;.&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="271" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="272" href="#"></a></td>
+<td><pre>            // give the target jvm a chance to complete initializatoin</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="273" href="#"></a></td>
+<td><pre>            try { Thread.sleep(20); } catch (InterruptedException e) { }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="274" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="275" href="#"></a></td>
+<td><pre>            if (System.currentTimeMillis() &gt; timeLimit) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="276" href="#"></a></td>
+<td><pre>                logln(&quot;failed: &quot; + lvmid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="277" href="#"></a></td>
+<td><pre>                throw new MonitorException(&quot;Could not synchronize with target&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="278" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="279" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="280" href="#"></a></td>
+<td><pre>        logln(&quot;success: &quot; + lvmid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="281" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="282" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="283" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="284" href="#"></a></td>
+<td><pre>     * method to extract the next monitor entry from the instrumentation memory.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="285" href="#"></a></td>
+<td><pre>     * assumes that nextEntry is the offset into the byte array</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="286" href="#"></a></td>
+<td><pre>     * at which to start the search for the next entry. method leaves</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="287" href="#"></a></td>
+<td><pre>     * next entry pointing to the next entry or to the end of data.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="288" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="289" href="#"></a></td>
+<td><pre>    protected Monitor getNextMonitorEntry() throws MonitorException {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="290" href="#"></a></td>
+<td><pre>        Monitor monitor = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="291" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="292" href="#"></a></td>
+<td><pre>        // entries are always 4 byte aligned.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="293" href="#"></a></td>
+<td><pre>        if ((nextEntry % 4) != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="294" href="#"></a></td>
+<td><pre>            throw new MonitorStructureException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="295" href="#"></a></td>
+<td><pre>                    &quot;Misaligned entry index: &quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="296" href="#"></a></td>
+<td><pre>                    + Integer.toHexString(nextEntry));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="297" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="298" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="299" href="#"></a></td>
+<td><pre>        // protect againt a corrupted shard memory region.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="300" href="#"></a></td>
+<td><pre>        if ((nextEntry &lt; 0)  || (nextEntry &gt; buffer.limit())) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="301" href="#"></a></td>
+<td><pre>            throw new MonitorStructureException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="302" href="#"></a></td>
+<td><pre>                    &quot;Entry index out of bounds: &quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="303" href="#"></a></td>
+<td><pre>                    + Integer.toHexString(nextEntry)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="304" href="#"></a></td>
+<td><pre>                    + &quot;, limit = &quot; + Integer.toHexString(buffer.limit()));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="305" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="306" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="307" href="#"></a></td>
+<td><pre>        // check for end of the buffer</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="308" href="#"></a></td>
+<td><pre>        if (nextEntry == buffer.limit()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="309" href="#"></a></td>
+<td><pre>            logln(&quot;getNextMonitorEntry():&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="310" href="#"></a></td>
+<td><pre>                  + &quot; nextEntry == buffer.limit(): returning&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="311" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="312" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="313" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="314" href="#"></a></td>
+<td><pre>        buffer.position(nextEntry);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="315" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="316" href="#"></a></td>
+<td><pre>        int entryStart = buffer.position();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="317" href="#"></a></td>
+<td><pre>        int entryLength = buffer.getInt();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="318" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="319" href="#"></a></td>
+<td><pre>        // check for valid entry length</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="320" href="#"></a></td>
+<td><pre>        if ((entryLength &lt; 0) || (entryLength &gt; buffer.limit())) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="321" href="#"></a></td>
+<td><pre>            throw new MonitorStructureException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="322" href="#"></a></td>
+<td><pre>                    &quot;Invalid entry length: entryLength = &quot; + entryLength</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="323" href="#"></a></td>
+<td><pre>                    + &quot; (0x&quot; + Integer.toHexString(entryLength) + &quot;)&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="324" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="325" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="326" href="#"></a></td>
+<td><pre>        // check if last entry occurs before the eof.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="327" href="#"></a></td>
+<td><pre>        if ((entryStart + entryLength) &gt; buffer.limit()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="328" href="#"></a></td>
+<td><pre>            throw new MonitorStructureException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="329" href="#"></a></td>
+<td><pre>                    &quot;Entry extends beyond end of buffer: &quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="330" href="#"></a></td>
+<td><pre>                    + &quot; entryStart = 0x&quot; + Integer.toHexString(entryStart)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="331" href="#"></a></td>
+<td><pre>                    + &quot; entryLength = 0x&quot; + Integer.toHexString(entryLength)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="332" href="#"></a></td>
+<td><pre>                    + &quot; buffer limit = 0x&quot; + Integer.toHexString(buffer.limit()));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="333" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="334" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="335" href="#"></a></td>
+<td><pre>        if (entryLength == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="336" href="#"></a></td>
+<td><pre>            // end of data</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="337" href="#"></a></td>
+<td><pre>            return null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="338" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="339" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="340" href="#"></a></td>
+<td><pre>        // we can safely read this entry</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="341" href="#"></a></td>
+<td><pre>        int nameOffset = buffer.getInt();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="342" href="#"></a></td>
+<td><pre>        int vectorLength = buffer.getInt();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="343" href="#"></a></td>
+<td><pre>        byte typeCodeByte = buffer.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="344" href="#"></a></td>
+<td><pre>        byte flags = buffer.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="345" href="#"></a></td>
+<td><pre>        byte unitsByte = buffer.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="346" href="#"></a></td>
+<td><pre>        byte varByte = buffer.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="347" href="#"></a></td>
+<td><pre>        int dataOffset = buffer.getInt();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="348" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="349" href="#"></a></td>
+<td><pre>        dump_entry_fixed(entryStart, nameOffset, vectorLength, typeCodeByte,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="350" href="#"></a></td>
+<td><pre>                         flags, unitsByte, varByte, dataOffset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="351" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="352" href="#"></a></td>
+<td><pre>        // convert common attributes to their object types</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="353" href="#"></a></td>
+<td><pre>        Units units = Units.toUnits(unitsByte);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="354" href="#"></a></td>
+<td><pre>        Variability variability = Variability.toVariability(varByte);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="355" href="#"></a></td>
+<td><pre>        TypeCode typeCode = null;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="356" href="#"></a></td>
+<td><pre>        boolean supported = (flags &amp; 0x01) != 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="357" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="358" href="#"></a></td>
+<td><pre>        try {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="359" href="#"></a></td>
+<td><pre>            typeCode = TypeCode.toTypeCode(typeCodeByte);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="360" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="361" href="#"></a></td>
+<td><pre>        } catch (IllegalArgumentException e) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="362" href="#"></a></td>
+<td><pre>            throw new MonitorStructureException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="363" href="#"></a></td>
+<td><pre>                    &quot;Illegal type code encountered:&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="364" href="#"></a></td>
+<td><pre>                    + &quot; entry_offset = 0x&quot; + Integer.toHexString(nextEntry)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="365" href="#"></a></td>
+<td><pre>                    + &quot;, type_code = &quot; + Integer.toHexString(typeCodeByte));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="366" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="367" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="368" href="#"></a></td>
+<td><pre>        // verify that the name_offset is contained within the entry bounds</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="369" href="#"></a></td>
+<td><pre>        if (nameOffset &gt; entryLength) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="370" href="#"></a></td>
+<td><pre>            throw new MonitorStructureException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="371" href="#"></a></td>
+<td><pre>                    &quot;Field extends beyond entry bounds&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="372" href="#"></a></td>
+<td><pre>                    + &quot; entry_offset = 0x&quot; + Integer.toHexString(nextEntry)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="373" href="#"></a></td>
+<td><pre>                    + &quot;, name_offset = 0x&quot; + Integer.toHexString(nameOffset));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="374" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="375" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="376" href="#"></a></td>
+<td><pre>        // verify that the data_offset is contained within the entry bounds</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="377" href="#"></a></td>
+<td><pre>        if (dataOffset &gt; entryLength) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="378" href="#"></a></td>
+<td><pre>            throw new MonitorStructureException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="379" href="#"></a></td>
+<td><pre>                    &quot;Field extends beyond entry bounds:&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="380" href="#"></a></td>
+<td><pre>                    + &quot; entry_offset = 0x&quot; + Integer.toHexString(nextEntry)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="381" href="#"></a></td>
+<td><pre>                    + &quot;, data_offset = 0x&quot; + Integer.toHexString(dataOffset));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="382" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="383" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="384" href="#"></a></td>
+<td><pre>        // validate the variability and units fields</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="385" href="#"></a></td>
+<td><pre>        if (variability == Variability.INVALID) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="386" href="#"></a></td>
+<td><pre>            throw new MonitorDataException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="387" href="#"></a></td>
+<td><pre>                    &quot;Invalid variability attribute:&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="388" href="#"></a></td>
+<td><pre>                    + &quot; entry_offset = 0x&quot; + Integer.toHexString(nextEntry)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="389" href="#"></a></td>
+<td><pre>                    + &quot;, variability = 0x&quot; + Integer.toHexString(varByte));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="390" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="391" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="392" href="#"></a></td>
+<td><pre>        if (units == Units.INVALID) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="393" href="#"></a></td>
+<td><pre>            throw new MonitorDataException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="394" href="#"></a></td>
+<td><pre>                    &quot;Invalid units attribute: entry_offset = 0x&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="395" href="#"></a></td>
+<td><pre>                    + Integer.toHexString(nextEntry)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="396" href="#"></a></td>
+<td><pre>                    + &quot;, units = 0x&quot; + Integer.toHexString(unitsByte));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="397" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="398" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="399" href="#"></a></td>
+<td><pre>        // the entry looks good - parse the variable length components</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="400" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="401" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="402" href="#"></a></td>
+<td><pre>         * The name starts at nameOffset and continues up to the first null</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="403" href="#"></a></td>
+<td><pre>         * byte. however, we don't know the length, but we can approximate it</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="404" href="#"></a></td>
+<td><pre>         * without searching for the null by using the offset for the data</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="405" href="#"></a></td>
+<td><pre>         * field, which follows the name field.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="406" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="407" href="#"></a></td>
+<td><pre>        assert (buffer.position() == (entryStart + nameOffset));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="408" href="#"></a></td>
+<td><pre>        assert (dataOffset &gt; nameOffset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="409" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="410" href="#"></a></td>
+<td><pre>        // include possible pad space</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="411" href="#"></a></td>
+<td><pre>        int maxNameLength = dataOffset-nameOffset;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="412" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="413" href="#"></a></td>
+<td><pre>        // maxNameLength better be less than the total entry length</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="414" href="#"></a></td>
+<td><pre>        assert (maxNameLength &lt; entryLength);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="415" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="416" href="#"></a></td>
+<td><pre>        // collect the characters, but do not collect the null byte,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="417" href="#"></a></td>
+<td><pre>        // as the String(byte[]) constructor does not ignore it!</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="418" href="#"></a></td>
+<td><pre>        byte[] nameBytes = new byte[maxNameLength];</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="419" href="#"></a></td>
+<td><pre>        int nameLength = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="420" href="#"></a></td>
+<td><pre>        byte b;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="421" href="#"></a></td>
+<td><pre>        while (((b = buffer.get()) != 0) &amp;&amp; (nameLength &lt; maxNameLength)) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="422" href="#"></a></td>
+<td><pre>             nameBytes[nameLength++] = b;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="423" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="424" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="425" href="#"></a></td>
+<td><pre>        assert (nameLength &lt; maxNameLength);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="426" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="427" href="#"></a></td>
+<td><pre>        // we should before or at the start of the data field</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="428" href="#"></a></td>
+<td><pre>        assert (buffer.position() &lt;= (entryStart + dataOffset));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="429" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="430" href="#"></a></td>
+<td><pre>        // convert the name bytes into a String</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="431" href="#"></a></td>
+<td><pre>        String name = new String(nameBytes, 0, nameLength);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="432" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="433" href="#"></a></td>
+<td><pre>        /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="434" href="#"></a></td>
+<td><pre>         * compute the size of the data item - this includes pad</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="435" href="#"></a></td>
+<td><pre>         * characters used to align the next entry.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="436" href="#"></a></td>
+<td><pre>         */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="437" href="#"></a></td>
+<td><pre>        int dataSize = entryLength - dataOffset;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="438" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="439" href="#"></a></td>
+<td><pre>        // set the position to the start of the data item</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="440" href="#"></a></td>
+<td><pre>        buffer.position(entryStart + dataOffset);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="441" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="442" href="#"></a></td>
+<td><pre>        dump_entry_variable(name, buffer, dataSize);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="443" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="444" href="#"></a></td>
+<td><pre>        if (vectorLength == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="445" href="#"></a></td>
+<td><pre>            // create a scalar Monitor object</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="446" href="#"></a></td>
+<td><pre>            if (typeCode == TypeCode.LONG) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="447" href="#"></a></td>
+<td><pre>                LongBuffer lb = buffer.asLongBuffer();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="448" href="#"></a></td>
+<td><pre>                lb.limit(1);  // limit buffer size to one long value.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="449" href="#"></a></td>
+<td><pre>                monitor = new PerfLongMonitor(name, units, variability,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="450" href="#"></a></td>
+<td><pre>                                              supported, lb);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="451" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="452" href="#"></a></td>
+<td><pre>                /*</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="453" href="#"></a></td>
+<td><pre>                 * unexpected type code - coding error or uncoordinated</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="454" href="#"></a></td>
+<td><pre>                 * JVM change</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="455" href="#"></a></td>
+<td><pre>                 */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="456" href="#"></a></td>
+<td><pre>                throw new MonitorTypeException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="457" href="#"></a></td>
+<td><pre>                        &quot;Unexpected type code encountered:&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="458" href="#"></a></td>
+<td><pre>                        + &quot; entry_offset = 0x&quot; + Integer.toHexString(nextEntry)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="459" href="#"></a></td>
+<td><pre>                        + &quot;, name = &quot; + name</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="460" href="#"></a></td>
+<td><pre>                        + &quot;, type_code = &quot; + typeCode</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="461" href="#"></a></td>
+<td><pre>                        + &quot; (0x&quot; + Integer.toHexString(typeCodeByte) + &quot;)&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="462" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="463" href="#"></a></td>
+<td><pre>        } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="464" href="#"></a></td>
+<td><pre>            // create a vector Monitor object</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="465" href="#"></a></td>
+<td><pre>            if (typeCode == TypeCode.BYTE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="466" href="#"></a></td>
+<td><pre>                if (units != Units.STRING) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="467" href="#"></a></td>
+<td><pre>                    // only byte arrays of type STRING are currently supported</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="468" href="#"></a></td>
+<td><pre>                    throw new MonitorTypeException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="469" href="#"></a></td>
+<td><pre>                            &quot;Unexpected vector type encounterd:&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="470" href="#"></a></td>
+<td><pre>                            + &quot; entry_offset = &quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="471" href="#"></a></td>
+<td><pre>                            + Integer.toHexString(nextEntry)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="472" href="#"></a></td>
+<td><pre>                            + &quot;, name = &quot; + name</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="473" href="#"></a></td>
+<td><pre>                            + &quot;, type_code = &quot; + typeCode + &quot; (0x&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="474" href="#"></a></td>
+<td><pre>                            + Integer.toHexString(typeCodeByte) + &quot;)&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="475" href="#"></a></td>
+<td><pre>                            + &quot;, units = &quot; + units + &quot; (0x&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="476" href="#"></a></td>
+<td><pre>                            + Integer.toHexString(unitsByte) + &quot;)&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="477" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="478" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="479" href="#"></a></td>
+<td><pre>                ByteBuffer bb = buffer.slice();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="480" href="#"></a></td>
+<td><pre>                bb.limit(vectorLength); // limit buffer length to # of chars</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="481" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="482" href="#"></a></td>
+<td><pre>                if (variability == Variability.CONSTANT) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="483" href="#"></a></td>
+<td><pre>                    monitor = new PerfStringConstantMonitor(name, supported,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="484" href="#"></a></td>
+<td><pre>                                                            bb);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="485" href="#"></a></td>
+<td><pre>                } else if (variability == Variability.VARIABLE) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="486" href="#"></a></td>
+<td><pre>                    monitor = new PerfStringVariableMonitor(name, supported,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="487" href="#"></a></td>
+<td><pre>                                                            bb, vectorLength-1);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="488" href="#"></a></td>
+<td><pre>                } else if (variability == Variability.MONOTONIC) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="489" href="#"></a></td>
+<td><pre>                    // Monotonically increasing byte arrays are not supported</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="490" href="#"></a></td>
+<td><pre>                    throw new MonitorDataException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="491" href="#"></a></td>
+<td><pre>                            &quot;Unexpected variability attribute:&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="492" href="#"></a></td>
+<td><pre>                            + &quot; entry_offset = 0x&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="493" href="#"></a></td>
+<td><pre>                            + Integer.toHexString(nextEntry)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="494" href="#"></a></td>
+<td><pre>                            + &quot; name = &quot; + name</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="495" href="#"></a></td>
+<td><pre>                            + &quot;, variability = &quot; + variability + &quot; (0x&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="496" href="#"></a></td>
+<td><pre>                            + Integer.toHexString(varByte) + &quot;)&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="497" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="498" href="#"></a></td>
+<td><pre>                    // variability was validated above, so this unexpected</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="499" href="#"></a></td>
+<td><pre>                    assert false;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="500" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="501" href="#"></a></td>
+<td><pre>            } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="502" href="#"></a></td>
+<td><pre>                // coding error or uncoordinated JVM change</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="503" href="#"></a></td>
+<td><pre>                throw new MonitorTypeException(</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="504" href="#"></a></td>
+<td><pre>                        &quot;Unexpected type code encountered:&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="505" href="#"></a></td>
+<td><pre>                        + &quot; entry_offset = 0x&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="506" href="#"></a></td>
+<td><pre>                        + Integer.toHexString(nextEntry)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="507" href="#"></a></td>
+<td><pre>                        + &quot;, name = &quot; + name</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="508" href="#"></a></td>
+<td><pre>                        + &quot;, type_code = &quot; + typeCode + &quot; (0x&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="509" href="#"></a></td>
+<td><pre>                        + Integer.toHexString(typeCodeByte) + &quot;)&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="510" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="511" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="512" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="513" href="#"></a></td>
+<td><pre>        // setup index to next entry for next iteration of the loop.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="514" href="#"></a></td>
+<td><pre>        nextEntry = entryStart + entryLength;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="515" href="#"></a></td>
+<td><pre>        return monitor;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="516" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="517" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="518" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="519" href="#"></a></td>
+<td><pre>     * Method to dump debugging information</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="520" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="521" href="#"></a></td>
+<td><pre>    private void dumpAll(Map&lt;String, Monitor&gt; map, int lvmid) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="522" href="#"></a></td>
+<td><pre>        if (DEBUG) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="523" href="#"></a></td>
+<td><pre>            Set&lt;String&gt; keys = map.keySet();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="524" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="525" href="#"></a></td>
+<td><pre>            System.err.println(&quot;Dump for &quot; + lvmid);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="526" href="#"></a></td>
+<td><pre>            int j = 0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="527" href="#"></a></td>
+<td><pre>            for (Iterator i = keys.iterator(); i.hasNext(); j++) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="528" href="#"></a></td>
+<td><pre>                Monitor monitor = map.get(i.next());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="529" href="#"></a></td>
+<td><pre>                System.err.println(j + &quot;\t&quot; + monitor.getName()</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="530" href="#"></a></td>
+<td><pre>                                   + &quot;=&quot; + monitor.getValue());</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="531" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="532" href="#"></a></td>
+<td><pre>            System.err.println(&quot;nextEntry = &quot; + nextEntry);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="533" href="#"></a></td>
+<td><pre>            System.err.println(&quot;Buffer info:&quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="534" href="#"></a></td>
+<td><pre>            System.err.println(&quot;buffer = &quot; + buffer);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="535" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="536" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="537" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="538" href="#"></a></td>
+<td><pre>    /**</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="539" href="#"></a></td>
+<td><pre>     * Method to dump the fixed portion of an entry.</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="540" href="#"></a></td>
+<td><pre>     */</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="541" href="#"></a></td>
+<td><pre>    private void dump_entry_fixed(int entry_start, int nameOffset,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="542" href="#"></a></td>
+<td><pre>                                  int vectorLength, byte typeCodeByte,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="543" href="#"></a></td>
+<td><pre>                                  byte flags, byte unitsByte, byte varByte,</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="544" href="#"></a></td>
+<td><pre>                                  int dataOffset) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="545" href="#"></a></td>
+<td><pre>        if (DEBUG) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="546" href="#"></a></td>
+<td><pre>            System.err.println(&quot;Entry at offset: 0x&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="547" href="#"></a></td>
+<td><pre>                               + Integer.toHexString(entry_start));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="548" href="#"></a></td>
+<td><pre>            System.err.println(&quot;\tname_offset = 0x&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="549" href="#"></a></td>
+<td><pre>                               + Integer.toHexString(nameOffset));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="550" href="#"></a></td>
+<td><pre>            System.err.println(&quot;\tvector_length = 0x&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="551" href="#"></a></td>
+<td><pre>                               + Integer.toHexString(vectorLength));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="552" href="#"></a></td>
+<td><pre>            System.err.println(&quot;\tdata_type = 0x&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="553" href="#"></a></td>
+<td><pre>                               + Integer.toHexString(typeCodeByte));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="554" href="#"></a></td>
+<td><pre>            System.err.println(&quot;\tflags = 0x&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="555" href="#"></a></td>
+<td><pre>                               + Integer.toHexString(flags));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="556" href="#"></a></td>
+<td><pre>            System.err.println(&quot;\tdata_units = 0x&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="557" href="#"></a></td>
+<td><pre>                               + Integer.toHexString(unitsByte));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="558" href="#"></a></td>
+<td><pre>            System.err.println(&quot;\tdata_variability = 0x&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="559" href="#"></a></td>
+<td><pre>                               + Integer.toHexString(varByte));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="560" href="#"></a></td>
+<td><pre>            System.err.println(&quot;\tdata_offset = 0x&quot;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="561" href="#"></a></td>
+<td><pre>                               + Integer.toHexString(dataOffset));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="562" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="563" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="564" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="565" href="#"></a></td>
+<td><pre>    private void dump_entry_variable(String name, ByteBuffer bb, int size) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="566" href="#"></a></td>
+<td><pre>        if (DEBUG) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="567" href="#"></a></td>
+<td><pre>            char[] toHex = new char[] { '0', '1', '2', '3',</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="568" href="#"></a></td>
+<td><pre>                                        '4', '5', '6', '7',</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="569" href="#"></a></td>
+<td><pre>                                        '8', '9', 'a', 'b',</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="570" href="#"></a></td>
+<td><pre>                                        'c', 'd', 'e', 'f' };</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="571" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="572" href="#"></a></td>
+<td><pre>            ByteBuffer data = bb.slice();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="573" href="#"></a></td>
+<td><pre>            data.limit(size);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="574" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="575" href="#"></a></td>
+<td><pre>            System.err.println(&quot;\tname = &quot; + name);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="576" href="#"></a></td>
+<td><pre>            System.err.println(&quot;\tdata = &quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="577" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="578" href="#"></a></td>
+<td><pre>            int count=0;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="579" href="#"></a></td>
+<td><pre>            while (data.hasRemaining()) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="580" href="#"></a></td>
+<td><pre>                byte b = data.get();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="581" href="#"></a></td>
+<td><pre>                byte high = (byte)((b &gt;&gt; 8) &amp; 0x0f);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="582" href="#"></a></td>
+<td><pre>                byte low = (byte)(b &amp; 0x0f);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="583" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="584" href="#"></a></td>
+<td><pre>                if (count % 16 == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="585" href="#"></a></td>
+<td><pre>                    System.err.print(&quot;\t\t&quot; + Integer.toHexString(count / 16)</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="586" href="#"></a></td>
+<td><pre>                                     + &quot;: &quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="587" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="588" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="589" href="#"></a></td>
+<td><pre>                System.err.print(String.valueOf(toHex[high])</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="590" href="#"></a></td>
+<td><pre>                                 + String.valueOf(toHex[low]));</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="591" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="592" href="#"></a></td>
+<td><pre>                count++;</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="593" href="#"></a></td>
+<td><pre>                if (count % 16 == 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="594" href="#"></a></td>
+<td><pre>                    System.err.println();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="595" href="#"></a></td>
+<td><pre>                } else {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="596" href="#"></a></td>
+<td><pre>                    System.err.print(&quot; &quot;);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="597" href="#"></a></td>
+<td><pre>                }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="598" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="599" href="#"></a></td>
+<td><pre>            if (count % 16 != 0) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="600" href="#"></a></td>
+<td><pre>                System.err.println();</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="601" href="#"></a></td>
+<td><pre>            }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="602" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="603" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="604" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="605" href="#"></a></td>
+<td><pre>    private void logln(String s) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="606" href="#"></a></td>
+<td><pre>        if (DEBUG) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="607" href="#"></a></td>
+<td><pre>            System.err.println(s);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="608" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="609" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="610" href="#"></a></td>
+<td><pre></pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="611" href="#"></a></td>
+<td><pre>    private void log(String s) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="612" href="#"></a></td>
+<td><pre>        if (DEBUG) {</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="613" href="#"></a></td>
+<td><pre>            System.err.print(s);</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="614" href="#"></a></td>
+<td><pre>        }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="615" href="#"></a></td>
+<td><pre>    }</pre></td>
+</tr>
+<tr>
+<td><a class="linenum-cell" data-linenum="616" href="#"></a></td>
+<td><pre>}</pre></td>
+</tr>
+</table>
 </body>
 </html>
