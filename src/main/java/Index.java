@@ -1,6 +1,8 @@
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.expr.Name;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 
 import java.io.IOException;
@@ -23,10 +25,10 @@ public class Index {
     }
 
     public void addClass(
-            String fullClassName,
+            String fullyQualifiedName,
             String fileUrl,
             int lineNumber) {
-        classIndex.put(fullClassName, new FilePosition(fileUrl, lineNumber));
+        classIndex.put(fullyQualifiedName, new FilePosition(fileUrl, lineNumber));
     }
 
     public record FilePosition (
@@ -48,11 +50,14 @@ class IndexVisitor extends VoidVisitorAdapter<Void> {
     }
 
     @Override
-    public void visit(MethodDeclaration md, Void arg) {
-        super.visit(md, arg);
-        System.out.println("Method Name " + md.getName()
-                + " Return Type: " + md.getTypeAsString()
-                + " Parameters: " + md.getParameters()
-                + " Range: " + md.getRange());
+    public void visit(ClassOrInterfaceDeclaration classOrInterfaceDeclaration, Void arg) {
+        super.visit(classOrInterfaceDeclaration, arg);
+        if (classOrInterfaceDeclaration.getFullyQualifiedName().isPresent()) {
+            index.addClass(
+                    classOrInterfaceDeclaration.getFullyQualifiedName().get(),
+                    fileUrl,
+                    classOrInterfaceDeclaration.getRange().get().begin.line
+            );
+        }
     }
 }

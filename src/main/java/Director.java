@@ -29,7 +29,11 @@ public record Director(
                     .filter(path -> path.toString().endsWith(".java"))
                     .collect(Collectors.toList());
             for (Path path: files) {
-                indexFile(index, path);
+                try {
+                    indexFile(index, path);
+                } catch (Exception e) {
+                    throw new RuntimeException("Error processing " + path, e);
+                }
             }
 
             for (Path path : files) {
