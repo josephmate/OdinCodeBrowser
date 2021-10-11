@@ -14,11 +14,15 @@ the result on github pages.
 2. [ ] Code is easily copy and pastable
     1. [x] Code is copy and pastable 
     2. [ ] Copied code is exactly the same as pasted code
-3. [ ] Navigate to Class on Class Usage
-    1. Source
-        1. [ ] Outer class
-        2. [ ] Inner class
-    1. Destination
+3. [ ] Navigate to Type on Type Usage
+    1. Type
+        1. [x] Interface
+        1. [x] Annotation
+        1. [x] Outer class
+        2. [x] Inner class
+        3. [ ] Class inside function
+        4. [ ] Anonymous class
+    1. Type Usage
         1. [ ] Variable type
         2. [ ] Method return type
         3. [ ] Extends type
@@ -73,10 +77,10 @@ javascript. Maybe an intermediate page with the list of options?)
         - this is good enough for now. we can improve upon it later after enough
           navigation is complete
 3. [x] Add anchor links for all the line numbers
-4. [ ] Preprocess all files extracting line numbers of all Classes. Keep them in
+4. [x] Preprocess all files extracting line numbers of all Classes. Keep them in
    a map
     - Try this on JDK8 and see if it scales. If not switch to sqlite db.
-5. [ ] Run over all files again, recording starting and end position of all
+5. [x] Run over all files again, recording starting and end position of all
    class usages.
 6. [ ] While writing the source files, check if we're at the position of a Class
    Type Reference, and add a link to the line number
