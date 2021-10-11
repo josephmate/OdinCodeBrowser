@@ -16,24 +16,39 @@ import java.util.stream.Stream;
  */
 public record Director(
     String inputDirectory,
-    String outputDirectory
+    String outputDirectory,
+    String webRootDir,
+    String sourceSubUrl
 ) {
     public void processFiles() throws IOException {
         Index index = new Index();
-        Renderer render = new Renderer(index);
+        Renderer render = new Renderer(index, webRootDir);
 
         try (Stream<Path> stream = Files.walk(Paths.get(inputDirectory))){
             List<Path> files = stream.filter(Files::isRegularFile)
                     .filter(path -> path.toString().endsWith(".java"))
                     .collect(Collectors.toList());
             for (Path path: files) {
-                index.indexFile(path);
+                indexFile(index, path);
             }
 
             for (Path path : files) {
                 processFile(render, path);
             }
         }
+    }
+
+    private void indexFile(Index index, Path path) throws IOException {
+        System.out.println("Indexing " + path);
+        final String fileUrl =
+                webRootDir + "/" + sourceSubUrl + "/"
+                + (
+                    path.toString()
+                    .substring(0, path.toString().length()-5)
+                    .replace(inputDirectory, "")
+                    + ".html"
+                );
+        index.indexFile(path, fileUrl);
     }
 
     private void processFile(Renderer render, Path path) throws IOException {
