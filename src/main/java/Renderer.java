@@ -6,8 +6,28 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 
 public record Renderer (
-    Index index
+    Index index,
+    String webRootUrl,
+    String header
 ){
+
+    public Renderer(Index index,
+             String webRootUrl) {
+        this(index, webRootUrl,
+            String.format(
+                    """
+                    <html>
+                        <head>
+                            <link rel="stylesheet" type="text/css" href="%s"/>
+                        </head>
+                    <body>
+                    <table>
+                    """,
+                    webRootUrl + "/css/styles.css"
+            )
+        );
+    }
+
     public void renderFile(
             Path inputFile,
             String outputFile
@@ -21,15 +41,6 @@ public record Renderer (
         );
     }
 
-    private static final String HEADER =
-            """
-            <html>
-                <head>
-                    <link rel="stylesheet" type="text/css" href="/OdinCodeBrowser/css/styles.css"/>
-                </head>
-            <body>
-            <table>
-            """;
     private static final String FOOTER =
             """
             </table>
@@ -37,9 +48,9 @@ public record Renderer (
             </html>
             """;
 
-    private static String codeToHtml(String code) {
+    private String codeToHtml(String code) {
         StringBuilder sb = new StringBuilder();
-        sb.append(HEADER);
+        sb.append(header);
 
         int lineNumber = 1;
         Iterable<String> lines = () -> code.lines().iterator();
