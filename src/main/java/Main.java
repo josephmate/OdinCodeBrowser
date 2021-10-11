@@ -88,7 +88,7 @@ public class Main {
      * <pre>
      * <table>
      *     <tr>
-     *         <td><a href="#" data-linenum="1"></a></td>
+     *         <td><a id="linenum1" href="#linenum1" data-linenum="1"></a></td>
      *         <td>First line</td>
      *     </tr>
      * </table>
@@ -105,10 +105,12 @@ public class Main {
         return String.format(
                 """
                 <tr>
-                <td><a class="linenum-cell" data-linenum="%s" href="#"></a></td>
+                <td><a id="linenum%d" class="linenum-cell" data-linenum="%s" href="#linenum%d"></a></td>
                 <td><pre>%s</pre></td>
                 </tr>
                 """,
+                lineNumber,
+                lineNumber,
                 lineNumber,
                 StringEscapeUtils.escapeHtml4(line)
         );

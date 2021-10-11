@@ -10,8 +10,10 @@ I hope that I can create a spiritual successor by using this tool, then hosting
 the result on github pages.
 
 # Features implemented
-1. [ ] Line numbers with links
-2. [x] Code is copy and pastable
+1. [x] Line numbers with links
+2. [ ] Code is easily copy and pastable
+    1. [x] Code is copy and pastable 
+    2. [ ] Copied code is exactly the same as pasted code
 3. [ ] Navigate to Class on Class Usage
     1. [ ] Variable type
     2. [ ] Method return type
@@ -65,7 +67,7 @@ javascript. Maybe an intermediate page with the list of options?)
           new lines! :(
         - this is good enough for now. we can improve upon it later after enough
           navigation is complete
-3. [ ] Add anchor links for all the line numbers
+3. [x] Add anchor links for all the line numbers
 4. [ ] Preprocess all files extracting line numbers of all Classes. Keep them in
    a map
     - Try this on JDK8 and see if it scales. If not switch to sqlite db.
