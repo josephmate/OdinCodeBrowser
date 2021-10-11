@@ -15,11 +15,16 @@ the result on github pages.
     1. [x] Code is copy and pastable 
     2. [ ] Copied code is exactly the same as pasted code
 3. [ ] Navigate to Class on Class Usage
-    1. [ ] Variable type
-    2. [ ] Method return type
-    3. [ ] Extends type
-    4. [ ] Implement type
-    4. [ ] Annotation (the implementation of the annotation)
+    1. Source
+        1. [ ] Outer class
+        2. [ ] Inner class
+    1. Destination
+        1. [ ] Variable type
+        2. [ ] Method return type
+        3. [ ] Extends type
+        4. [ ] Implement type
+        5. [ ] Annotation (the implementation of the annotation)
+        6. [ ] Import
 4. [ ] Navigate to Method of method call
 5. [ ] Click on variable to get list of usages and definition on a new page
 6. [ ] List implementations of an interface
