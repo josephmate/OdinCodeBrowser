@@ -29,6 +29,8 @@ the result on github pages.
         4. [ ] Implement type
         5. [ ] Annotation (the implementation of the annotation)
         6. [ ] Import
+        7. [ ] Types through wildcard imports
+        8. [ ] Types within same package (no import)
 4. [ ] Navigate to Method of method call
 5. [ ] Click on variable to get list of usages and definition on a new page
 6. [ ] List implementations of an interface
