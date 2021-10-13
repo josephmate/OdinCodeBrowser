@@ -9,6 +9,23 @@ I used grepcode at least once a week and I am sad to see it go.
 I hope that I can create a spiritual successor by using this tool, then hosting
 the result on github pages.
 
+# Alternatives
+Your Java IDE can do a much better job right now. As I was write this project, I
+used Intellij to navigate from my projects code to the code of the projects I
+depend on. The experience is so much better in the IDE and you should use that.
+
+If you don't use an IDE then github provides some support for navigating code.
+At the moment it is superior to this tool and you should use that.
+
+The two features together I hope to acheieve that that will set Odin apart from an IDE and Github:
+1. sharing links to the code (can't do this in an IDE)
+2. can link to the dependant sources as well (github can't do this)
+
+# Design Philosophy 
+1. No javascript
+2. No javascript!!!
+3. Each page is static, so it can be efficiently host hosted
+
 # Features implemented
 1. [x] Line numbers with links
 2. [ ] Code is easily copy and pastable
@@ -37,7 +54,7 @@ the result on github pages.
 5. [ ] Click on variable to the definition of that variable
 6. [ ] Click on method to get a list of implementations
 7. [ ] Click on Override takes you to nearest super class that was overridden
-8. [ ] File list in root directory /OdinCodeBrowser/jdk8
+8. [x] File list in root directory /OdinCodeBrowser/jdk8
 9. [ ] Click on class definition to get all usages
 9. [ ] Click on method definition to get all usages
 9. [ ] Click on variable definition to get all usages
