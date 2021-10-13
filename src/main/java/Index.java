@@ -1,12 +1,9 @@
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
-import com.github.javaparser.ast.body.MethodDeclaration;
-import com.github.javaparser.ast.expr.Name;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
@@ -29,6 +26,10 @@ public class Index {
             String fileUrl,
             int lineNumber) {
         classIndex.put(fullyQualifiedName, new FilePosition(fileUrl, lineNumber));
+    }
+
+    public FilePosition get(String fullyQualifiedName) {
+        return classIndex.get(fullyQualifiedName);
     }
 
     public record FilePosition (
