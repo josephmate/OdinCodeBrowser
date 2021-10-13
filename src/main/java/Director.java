@@ -3,6 +3,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
+import java.util.SortedMap;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -39,19 +41,34 @@ public record Director(
             for (Path path : files) {
                 processFile(render, path);
             }
+
+            SortedMap<String, String> fileTreeData = new TreeMap<>();
+            for (Path path : files) {
+                fileTreeData.put(
+                        path.toString().replace(inputDirectory, ""),
+                        getFileUrl(path)
+                );
+            }
+            new IndexFileRenderer().render(
+                    outputDirectory + "/index.html",
+                    fileTreeData
+            );
         }
+    }
+
+    private String getFileUrl(Path javaSourceFile) {
+        return webRootDir + "/" + sourceSubUrl + "/"
+                + (
+                javaSourceFile.toString()
+                        .substring(0, javaSourceFile.toString().length()-5)
+                        .replace(inputDirectory, "")
+                        + ".html"
+        );
     }
 
     private void indexFile(Index index, Path path) throws IOException {
         System.out.println("Indexing " + path);
-        final String fileUrl =
-                webRootDir + "/" + sourceSubUrl + "/"
-                + (
-                    path.toString()
-                    .substring(0, path.toString().length()-5)
-                    .replace(inputDirectory, "")
-                    + ".html"
-                );
+        final String fileUrl = getFileUrl(path);
         index.indexFile(path, fileUrl);
     }
 
