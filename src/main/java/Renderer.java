@@ -51,10 +51,10 @@ public record Renderer (
                 index,
                 importVisitor.imports
         );
+        renderingQueueVisitor.visit(compilationUnit, null);
 
         Path destinationPath = Paths.get(outputFile);
         destinationPath.toFile().getParentFile().mkdirs();
-
         String code = Files.readString(inputFile);
         Files.writeString(
                 destinationPath,
@@ -142,6 +142,7 @@ public record Renderer (
             for (String after : afterContentRecords) {
                 sb.append(after);
             }
+            currentCol++;
         }
     }
 }
