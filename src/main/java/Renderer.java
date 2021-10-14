@@ -1,6 +1,7 @@
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.ImportDeclaration;
+import com.github.javaparser.ast.PackageDeclaration;
 import com.github.javaparser.ast.expr.SimpleName;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
@@ -189,13 +190,34 @@ class RenderingQueue {
 class ImportVisitor extends VoidVisitorAdapter<Void> {
 
     final Map<String, String> imports = new HashMap<>();
+    private final Index index;
 
     public ImportVisitor(Index index) {
+        this.index = index;
         for (String fullyQualifiedName : index.getClassIndex().keySet()) {
             if (fullyQualifiedName.startsWith("java.lang.")) {
                 imports.put(getLastToken(fullyQualifiedName), fullyQualifiedName);
             }
         }
+    }
+
+    private boolean isInPackage(
+            String fullyQualifiedName,
+            String packageName
+    ) {
+        return fullyQualifiedName.startsWith(packageName)
+                && fullyQualifiedName.lastIndexOf('.') <= packageName.length();
+    }
+
+    @Override
+    public void visit(PackageDeclaration packageDeclaration, Void arg) {
+        String packageName = packageDeclaration.getName().asString();
+        for (String fullyQualifiedName : index.getClassIndex().keySet()) {
+            if (isInPackage(fullyQualifiedName, packageName)) {
+                imports.put(getLastToken(fullyQualifiedName), fullyQualifiedName);
+            }
+        }
+        super.visit(packageDeclaration, arg);
     }
 
     @Override
