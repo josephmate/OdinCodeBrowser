@@ -32,6 +32,10 @@ public class Index {
         return classIndex.get(fullyQualifiedName);
     }
 
+    public Map<String, FilePosition> getClassIndex() {
+        return classIndex;
+    }
+
     public record FilePosition (
         String fileName,
         int lineNumber) { }

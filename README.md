@@ -10,11 +10,11 @@ I hope that I can create a spiritual successor by using this tool, then hosting
 the result on github pages.
 
 # Alternatives
-Your Java IDE can do a much better job right now. As I was write this project, I
-used Intellij to navigate from my projects code to the code of the projects I
+Your Java IDE can do a much better job. As I was write this project, I
+use Intellij to navigate from my projects code to the code of the projects I
 depend on. The experience is so much better in the IDE and you should use that.
 
-If you don't use an IDE then github provides some support for navigating code.
+If you don't use an IDE then github provides some support for navigating code without any extra effort.
 At the moment it is superior to this tool and you should use that.
 
 The two features together I hope to acheieve that that will set Odin apart from an IDE and Github:
@@ -48,7 +48,7 @@ The two features together I hope to acheieve that that will set Odin apart from 
         6. [ ] Import
         7. [ ] Types through wildcard imports
         8. [ ] Types within same package (no import)
-        8. [ ] Types from java.lang (ex: RuntimeException)
+        8. [x] Types from java.lang (ex: RuntimeException)
         8. [ ] Types within same file
 4. [ ] Click on method to go the definition of that method
 5. [ ] Click on variable to the definition of that variable
@@ -62,6 +62,6 @@ The two features together I hope to acheieve that that will set Odin apart from 
 9. [ ] Click on method definition to get all overrides and impls
 9. [x] Nice syntax highlighting somehow without javascript!
 10. [ ] Multi repository support (ex: browsing guava but also linking to JDK8)
-
+10. [ ] Link to native code
 
 
