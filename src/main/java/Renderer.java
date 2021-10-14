@@ -213,17 +213,18 @@ class ImportVisitor extends VoidVisitorAdapter<Void> {
 
     @Override
     public void visit(PackageDeclaration packageDeclaration, Void arg) {
+        super.visit(packageDeclaration, arg);
         String packageName = packageDeclaration.getName().asString();
         for (String fullyQualifiedName : index.getClassIndex().keySet()) {
             if (isInPackage(fullyQualifiedName, packageName)) {
                 imports.put(getLastToken(fullyQualifiedName), fullyQualifiedName);
             }
         }
-        super.visit(packageDeclaration, arg);
     }
 
     @Override
     public void visit(ImportDeclaration importDeclaration, Void arg) {
+        super.visit(importDeclaration, arg);
         if (!importDeclaration.isAsterisk() && !importDeclaration.isStatic()) {
             String importName = importDeclaration.getNameAsString();
             imports.put(getLastToken(importName), importName);
@@ -235,7 +236,6 @@ class ImportVisitor extends VoidVisitorAdapter<Void> {
                 }
             }
         }
-        super.visit(importDeclaration, arg);
     }
 
     private static String getLastToken(String importName) {
@@ -284,6 +284,7 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
 
     @Override
     public void visit(ClassOrInterfaceType classOrInterfaceType, Void arg) {
+        super.visit(classOrInterfaceType, arg);
         SimpleName simpleName = classOrInterfaceType.getName();
         String className = simpleName.asString();
         if (imports.containsKey(className)) {
@@ -291,11 +292,10 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
             Index.FilePosition filePosition = index.get(fullyQualifiedName);
             addLink(simpleName, filePosition);
         }
-
-        super.visit(classOrInterfaceType, arg);
     }
 
     public void visit(MethodCallExpr methodCallExpr , Void arg) {
+        super.visit(methodCallExpr, arg);
         SimpleName simpleName = methodCallExpr.getName();
         methodCallExpr.getNameAsString();
         if (methodCallExpr.getScope().isPresent()) {
