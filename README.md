@@ -46,8 +46,8 @@ The two features together I hope to acheieve that that will set Odin apart from 
         4. [x] Implement type
         5. [ ] Annotation (the implementation of the annotation)
         6. [ ] Import
-        7. [ ] [Types through wildcard imports](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/concurrent/ScheduledThreadPoolExecutor.html#linenum785)
-        8. [x] [Types within same package (no import)](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/concurrent/ScheduledThreadPoolExecutor.html#linenum122)
+        7. [x] [Types through wildcard imports (ex: List from java.util.*)](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/concurrent/ScheduledThreadPoolExecutor.html#linenum785)
+        8. [x] [Types within same package (ex: ThreadPoolExecutor when in package java.util.concurrent)](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/concurrent/ScheduledThreadPoolExecutor.html#linenum122)
         8. [x] [Types from java.lang (ex: IllegalArgumentException)](http://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html#linenum448)
         8. [ ] Types within same file
 4. [ ] Click on method to go the definition of that method
