@@ -2,7 +2,9 @@ import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.ImportDeclaration;
 import com.github.javaparser.ast.PackageDeclaration;
+import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.SimpleName;
+import com.github.javaparser.ast.expr.StringLiteralExpr;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 import org.apache.commons.text.StringEscapeUtils;
@@ -211,17 +213,18 @@ class ImportVisitor extends VoidVisitorAdapter<Void> {
 
     @Override
     public void visit(PackageDeclaration packageDeclaration, Void arg) {
+        super.visit(packageDeclaration, arg);
         String packageName = packageDeclaration.getName().asString();
         for (String fullyQualifiedName : index.getClassIndex().keySet()) {
             if (isInPackage(fullyQualifiedName, packageName)) {
                 imports.put(getLastToken(fullyQualifiedName), fullyQualifiedName);
             }
         }
-        super.visit(packageDeclaration, arg);
     }
 
     @Override
     public void visit(ImportDeclaration importDeclaration, Void arg) {
+        super.visit(importDeclaration, arg);
         if (!importDeclaration.isAsterisk() && !importDeclaration.isStatic()) {
             String importName = importDeclaration.getNameAsString();
             imports.put(getLastToken(importName), importName);
@@ -233,7 +236,6 @@ class ImportVisitor extends VoidVisitorAdapter<Void> {
                 }
             }
         }
-        super.visit(importDeclaration, arg);
     }
 
     private static String getLastToken(String importName) {
@@ -259,33 +261,55 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
         this.imports = imports;
     }
 
+    private void addLink(SimpleName simpleName, Index.FilePosition filePosition) {
+        if (filePosition != null) {
+            int lineNum = simpleName.getRange().get().begin.line;
+            int startCol = simpleName.getRange().get().begin.column;
+            int endCol = simpleName.getRange().get().end.column;
+            renderingQueue.add(lineNum, startCol, new ContentRecord(
+                    String.format(
+                            """
+                            <a href="%s#linenum%d">""",
+                            filePosition.fileName(),
+                            filePosition.lineNumber()
+                    ),
+                    PositionType.BEFORE
+            ));
+            renderingQueue.add(lineNum, endCol, new ContentRecord(
+                    "</a>",
+                    PositionType.AFTER
+            ));
+        }
+    }
+
     @Override
     public void visit(ClassOrInterfaceType classOrInterfaceType, Void arg) {
+        super.visit(classOrInterfaceType, arg);
         SimpleName simpleName = classOrInterfaceType.getName();
         String className = simpleName.asString();
         if (imports.containsKey(className)) {
             String fullyQualifiedName = imports.get(className);
             Index.FilePosition filePosition = index.get(fullyQualifiedName);
-            if (filePosition != null) {
-                int lineNum = simpleName.getRange().get().begin.line;
-                int startCol = simpleName.getRange().get().begin.column;
-                int endCol = simpleName.getRange().get().end.column;
-                renderingQueue.add(lineNum, startCol, new ContentRecord(
-                    String.format(
-                        """
-                        <a href="%s#linenum%d">""",
-                        filePosition.fileName(),
-                        filePosition.lineNumber()
-                    ),
-                    PositionType.BEFORE
-                ));
-                renderingQueue.add(lineNum, endCol, new ContentRecord(
-                    "</a>",
-                    PositionType.AFTER
-                ));
-            }
+            addLink(simpleName, filePosition);
         }
+    }
 
-        super.visit(classOrInterfaceType, arg);
+    public void visit(MethodCallExpr methodCallExpr , Void arg) {
+        super.visit(methodCallExpr, arg);
+        SimpleName simpleName = methodCallExpr.getName();
+        methodCallExpr.getNameAsString();
+        if (methodCallExpr.getScope().isPresent()) {
+            if (methodCallExpr.getScope().get() instanceof StringLiteralExpr) {
+                Index.FilePosition filePosition = index.getMethod(
+                        "java.lang.String",
+                        simpleName.asString()
+                );
+                addLink(simpleName, filePosition);
+            } else {
+                methodCallExpr.getNameAsString();
+            }
+        } else {
+            // TODO: probably method call within the same class
+        }
     }
 }
