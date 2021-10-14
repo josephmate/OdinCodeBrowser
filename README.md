@@ -26,6 +26,11 @@ The two features together I hope to acheieve that that will set Odin apart from 
 2. No javascript!!!
 3. Each page is static, so it can be efficiently host hosted
 
+# How Do I Use This
+1. Go to the [list of all JDK classes](https://josephmate.github.io/OdinCodeBrowser/jdk8/)
+2. Find your class (ex: my favourite [HashMap](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html))
+3. Start reading code and navigating by clicking on the links
+
 # Features implemented
 1. [x] Line numbers with links
 2. [ ] Code is easily copy and pastable
