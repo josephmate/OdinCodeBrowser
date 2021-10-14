@@ -1,14 +1,12 @@
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.ImportDeclaration;
-import com.github.javaparser.ast.expr.Name;
 import com.github.javaparser.ast.expr.SimpleName;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 import org.apache.commons.text.StringEscapeUtils;
 
 import javax.annotation.Nonnull;
-import javax.annotation.Nullable;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -44,7 +42,7 @@ public record Renderer (
             String outputFile
     ) throws IOException {
         CompilationUnit compilationUnit = StaticJavaParser.parse(inputFile);
-        ImportVisitor importVisitor = new ImportVisitor();
+        ImportVisitor importVisitor = new ImportVisitor(index);
         importVisitor.visit(compilationUnit, null);
 
         RenderingQueueVisitor renderingQueueVisitor = new RenderingQueueVisitor(
@@ -190,7 +188,15 @@ class RenderingQueue {
 
 class ImportVisitor extends VoidVisitorAdapter<Void> {
 
-    Map<String, String> imports = new HashMap<>();
+    final Map<String, String> imports = new HashMap<>();
+
+    public ImportVisitor(Index index) {
+        for (String fullyQualifiedName : index.getClassIndex().keySet()) {
+            if (fullyQualifiedName.startsWith("java.lang.")) {
+                imports.put(getLastToken(fullyQualifiedName), fullyQualifiedName);
+            }
+        }
+    }
 
     @Override
     public void visit(ImportDeclaration importDeclaration, Void arg) {
