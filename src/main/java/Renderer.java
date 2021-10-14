@@ -225,6 +225,16 @@ class ImportVisitor extends VoidVisitorAdapter<Void> {
         if (!importDeclaration.isAsterisk() && !importDeclaration.isStatic()) {
             String importName = importDeclaration.getNameAsString();
             imports.put(getLastToken(importName), importName);
+        } else if (importDeclaration.isAsterisk() && !importDeclaration.isStatic()) {
+            String importName = importDeclaration.getNameAsString().substring(
+                    0,
+                    importDeclaration.getNameAsString().length()-2 // chop off the wild card
+            );
+            for (String fullyQualifiedName : index.getClassIndex().keySet()) {
+                if (isInPackage(fullyQualifiedName, importName)) {
+                    imports.put(getLastToken(fullyQualifiedName), fullyQualifiedName);
+                }
+            }
         }
         super.visit(importDeclaration, arg);
     }
