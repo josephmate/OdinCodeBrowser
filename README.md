@@ -56,10 +56,14 @@ The two features together I hope to acheieve that that will set Odin apart from 
         8. [x] [Types from java.lang (ex: IllegalArgumentException)](http://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html#linenum448)
         8. [ ] Types within same file
 4. [ ] Click on method to go the definition of that method
+    1. [ ] Only one function with the name
+    2. [ ] Functions are overloaded (different parameters)
+    3. [ ] Functions within the same file
+    4. [x] String literal method calls like ("true".equals(blah))
 5. [ ] Click on variable to the definition of that variable
 6. [ ] Click on method to get a list of implementations
-7. [ ] Click on Override takes you to nearest super class that was overridden
-8. [x] File list in root directory /OdinCodeBrowser/jdk8
+7. [ ] Click on Override takes you to nearest super class's method that was overridden
+8. [x] [File list in root directory /OdinCodeBrowser/jdk8](https://josephmate.github.io/OdinCodeBrowser/jdk8/)
 9. [ ] Click on class definition to get all usages
 9. [ ] Click on method definition to get all usages
 9. [ ] Click on variable definition to get all usages
