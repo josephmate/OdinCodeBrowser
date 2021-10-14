@@ -46,9 +46,9 @@ The two features together I hope to acheieve that that will set Odin apart from 
         4. [x] Implement type
         5. [ ] Annotation (the implementation of the annotation)
         6. [ ] Import
-        7. [ ] Types through wildcard imports
-        8. [ ] Types within same package (no import)
-        8. [x] Types from java.lang (ex: RuntimeException)
+        7. [ ] [Types through wildcard imports](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/concurrent/ScheduledThreadPoolExecutor.html#linenum785)
+        8. [x] [Types within same package (no import)](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/concurrent/ScheduledThreadPoolExecutor.html#linenum122)
+        8. [x] [Types from java.lang (ex: IllegalArgumentException)](http://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html#linenum448)
         8. [ ] Types within same file
 4. [ ] Click on method to go the definition of that method
 5. [ ] Click on variable to the definition of that variable
