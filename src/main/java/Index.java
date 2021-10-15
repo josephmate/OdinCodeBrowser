@@ -13,6 +13,7 @@ public class Index {
 
     private final Map<String, FilePosition> classIndex = new HashMap<>();
     private final Map<String, Map<String, FilePosition>> methodIndex = new HashMap<>();
+    private final Map<String, Map<String, FilePosition>> privateMethodIndex = new HashMap<>();
 
     public void indexFile(
             Path inputFile,
@@ -44,6 +45,20 @@ public class Index {
         }
         methodSubMap.put(methodName, filePosition);
     }
+    public void addPrivateMethod(
+            String fullyQualifiedName,
+            String methodName,
+            String fileUrl,
+            int lineNumber
+    ) {
+        FilePosition filePosition = new FilePosition(fileUrl, lineNumber);
+        Map<String, FilePosition> methodSubMap = privateMethodIndex.get(fullyQualifiedName);
+        if (methodSubMap == null) {
+            methodSubMap = new HashMap<>();
+            privateMethodIndex.put(fullyQualifiedName, methodSubMap);
+        }
+        methodSubMap.put(methodName, filePosition);
+    }
 
     public FilePosition get(String fullyQualifiedName) {
         return classIndex.get(fullyQualifiedName);
@@ -54,6 +69,17 @@ public class Index {
             String methodName
     ) {
         Map<String, FilePosition> methodSubMap = methodIndex.get(fullyQualifiedName);
+        if (methodSubMap == null) {
+            return null;
+        }
+        return methodSubMap.get(methodName);
+    }
+
+    public FilePosition getPrivateMethod(
+            String fullyQualifiedName,
+            String methodName
+    ) {
+        Map<String, FilePosition> methodSubMap = privateMethodIndex.get(fullyQualifiedName);
         if (methodSubMap == null) {
             return null;
         }
@@ -97,18 +123,26 @@ class IndexVisitor extends VoidVisitorAdapter<Void> {
     public void visit(MethodDeclaration methodDeclaration, Void arg) {
         super.visit(methodDeclaration, arg);
         String methodName = methodDeclaration.getName().asString();
-        if (!methodDeclaration.isPrivate()
-                && methodDeclaration.getParentNode().isPresent()
+        if (methodDeclaration.getParentNode().isPresent()
                 && methodDeclaration.getParentNode().get() instanceof ClassOrInterfaceDeclaration
         )  {
             ClassOrInterfaceDeclaration classOrInterfaceDeclaration = (ClassOrInterfaceDeclaration)methodDeclaration.getParentNode().get();
             if (classOrInterfaceDeclaration.getFullyQualifiedName().isPresent()) {
-                index.addMethod(
-                        classOrInterfaceDeclaration.getFullyQualifiedName().get(),
-                        methodName,
-                        fileUrl,
-                        methodDeclaration.getRange().get().begin.line
-                );
+                if (methodDeclaration.isPrivate()) {
+                    index.addPrivateMethod(
+                            classOrInterfaceDeclaration.getFullyQualifiedName().get(),
+                            methodName,
+                            fileUrl,
+                            methodDeclaration.getRange().get().begin.line
+                    );
+                } else {
+                    index.addMethod(
+                            classOrInterfaceDeclaration.getFullyQualifiedName().get(),
+                            methodName,
+                            fileUrl,
+                            methodDeclaration.getRange().get().begin.line
+                    );
+                }
             }
         }
     }

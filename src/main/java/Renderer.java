@@ -2,6 +2,7 @@ import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.ImportDeclaration;
 import com.github.javaparser.ast.PackageDeclaration;
+import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.expr.*;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
@@ -259,7 +260,10 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
         this.imports = imports;
     }
 
-    private void addLink(SimpleName simpleName, Index.FilePosition filePosition) {
+    private void addLink(
+            SimpleName simpleName,
+            Index.FilePosition filePosition
+    ) {
         if (filePosition != null) {
             int lineNum = simpleName.getRange().get().begin.line;
             int startCol = simpleName.getRange().get().begin.column;
@@ -280,7 +284,15 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
         }
     }
 
-    @Override
+    private String currentClassName = null;
+    public void visit(ClassOrInterfaceDeclaration classOrInterfaceDeclaration, Void arg) {
+        super.visit(classOrInterfaceDeclaration, arg);
+        if (classOrInterfaceDeclaration.getFullyQualifiedName().isPresent()) {
+            currentClassName = classOrInterfaceDeclaration.getFullyQualifiedName().get();
+        }
+    }
+
+        @Override
     public void visit(ClassOrInterfaceType classOrInterfaceType, Void arg) {
         super.visit(classOrInterfaceType, arg);
         SimpleName simpleName = classOrInterfaceType.getName();
@@ -299,17 +311,9 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
         if (methodCallExpr.getScope().isPresent()) {
             Expression scope = methodCallExpr.getScope().get();
             if (scope instanceof StringLiteralExpr) {
-                Index.FilePosition filePosition = index.getMethod(
-                        "java.lang.String",
-                        methodSimpleName.asString()
-                );
-                addLink(methodSimpleName, filePosition);
+                handleClassName("java.lang.String", methodSimpleName, false);
             } else if (scope instanceof ClassExpr) {
-                Index.FilePosition filePosition = index.getMethod(
-                        "java.lang.String",
-                        methodSimpleName.asString()
-                );
-                addLink(methodSimpleName, filePosition);
+                handleClassName("java.lang.Class", methodSimpleName, false);
             } else if (scope instanceof NameExpr) {
                 // example System.getProperty()
                 // example variable.getProperty()
@@ -317,13 +321,7 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
                 // How about try variable index first, then Class index.
                 NameExpr nameExpr = (NameExpr)scope;
                 String fullyQualifiedClassName = imports.get(nameExpr.getName().asString());
-                if (fullyQualifiedClassName != null) {
-                    Index.FilePosition filePosition = index.getMethod(
-                            fullyQualifiedClassName,
-                            methodSimpleName.asString()
-                    );
-                    addLink(methodSimpleName, filePosition);
-                }
+                handleClassName(fullyQualifiedClassName, methodSimpleName, false);
             } else if (scope instanceof MethodCallExpr) {
                 // method call chaining
                 // example indexMap.entrySet().iterator()
@@ -335,7 +333,7 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
                 methodCallExpr.getNameAsString();
             } else if (scope instanceof ThisExpr) {
                 // this.size()
-                methodCallExpr.getNameAsString();
+                handleClassName(currentClassName, methodSimpleName, true);
             } else if (scope instanceof FieldAccessExpr) {
                 // this.data.clone()
                 methodCallExpr.getNameAsString();
@@ -353,7 +351,36 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
             }
         } else {
             // method call within the same class
-            methodCallExpr.getNameAsString();
+            handleClassName(currentClassName, methodSimpleName, true);
         }
+    }
+
+    private boolean handleClassName(
+        String fullyQualifiedClassName,
+        SimpleName methodSimpleName,
+        boolean includePrivates
+    ) {
+        if (fullyQualifiedClassName != null) {
+            Index.FilePosition filePosition = null;
+            if (includePrivates) {
+                filePosition = index.getPrivateMethod(
+                        fullyQualifiedClassName,
+                        methodSimpleName.asString()
+                );
+            }
+            addLink(methodSimpleName, filePosition);
+
+            if (filePosition != null) {
+                return true;
+            }
+            filePosition = index.getMethod(
+                    fullyQualifiedClassName,
+                    methodSimpleName.asString()
+            );
+            addLink(methodSimpleName, filePosition);
+
+            return filePosition != null;
+        }
+        return false;
     }
 }
