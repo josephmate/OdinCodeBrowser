@@ -65,7 +65,7 @@ The two features together I hope to acheieve that that will set Odin apart from 
     3. [ ] Functions on this.method()
     3. [ ] Scoping rules (if names are duplicated in mulitple scopes, need to use the closest scope)
     4. [x] [String literal method calls like ("true".equals(blah))](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/BeanInfoFinder.html)
-    4. [x] [class literal method calls like (FileInputStream.class.equals(in.getClass())))](https://josephmate.github.io/OdinCodeBrowser/jdk8/java/nio/channels/Channels.html#linenum350)
+    4. [x] [class literal method calls like (boolean.class.getName())](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/PrimitiveTypeMap.html#linenum54)
 5. [ ] Click on variable to the definition of that variable
 6. [ ] Click on method to get a list of implementations
 7. [ ] Click on Override takes you to nearest super class's method that was overridden
