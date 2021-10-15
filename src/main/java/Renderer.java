@@ -294,25 +294,36 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
 
     public void visit(MethodCallExpr methodCallExpr , Void arg) {
         super.visit(methodCallExpr, arg);
-        SimpleName simpleName = methodCallExpr.getName();
+        SimpleName methodSimpleName = methodCallExpr.getName();
         methodCallExpr.getNameAsString();
         if (methodCallExpr.getScope().isPresent()) {
             Expression scope = methodCallExpr.getScope().get();
             if (scope instanceof StringLiteralExpr) {
                 Index.FilePosition filePosition = index.getMethod(
                         "java.lang.String",
-                        simpleName.asString()
+                        methodSimpleName.asString()
                 );
-                addLink(simpleName, filePosition);
+                addLink(methodSimpleName, filePosition);
             } else if (scope instanceof ClassExpr) {
                 Index.FilePosition filePosition = index.getMethod(
                         "java.lang.String",
-                        simpleName.asString()
+                        methodSimpleName.asString()
                 );
-                addLink(simpleName, filePosition);
+                addLink(methodSimpleName, filePosition);
             } else if (scope instanceof NameExpr) {
                 // example System.getProperty()
-                methodCallExpr.getNameAsString();
+                // example variable.getProperty()
+                // Need some way to distinguish between them
+                // How about try variable index first, then Class index.
+                NameExpr nameExpr = (NameExpr)scope;
+                String fullyQualifiedClassName = imports.get(nameExpr.getName().asString());
+                if (fullyQualifiedClassName != null) {
+                    Index.FilePosition filePosition = index.getMethod(
+                            fullyQualifiedClassName,
+                            methodSimpleName.asString()
+                    );
+                    addLink(methodSimpleName, filePosition);
+                }
             } else if (scope instanceof MethodCallExpr) {
                 // method call chaining
                 // example indexMap.entrySet().iterator()
