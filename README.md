@@ -56,10 +56,15 @@ The two features together I hope to acheieve that that will set Odin apart from 
         8. [x] [Types from java.lang (ex: IllegalArgumentException)](http://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html#linenum448)
         8. [ ] Types within same file
 4. [ ] Click on method to go the definition of that method
-    1. [ ] Only one function with the name
+    1. [ ] Static and only one function with the name
+    1. [ ] Object instance and only one function with the name and not in super class
+    1. [ ] Object instance and only one function with the name but in some super class
+    1. [ ] Chained method calls
     2. [ ] Functions are overloaded (different parameters)
     3. [ ] Functions within the same file
-    4. [x] String literal method calls like ("true".equals(blah))
+    3. [ ] Functions on this.method()
+    4. [x] [String literal method calls like ("true".equals(blah))](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/BeanInfoFinder.html)
+    4. [x] [class literal method calls like (FileInputStream.class.equals(in.getClass())))](https://josephmate.github.io/OdinCodeBrowser/jdk8/java/nio/channels/Channels.html#linenum350)
 5. [ ] Click on variable to the definition of that variable
 6. [ ] Click on method to get a list of implementations
 7. [ ] Click on Override takes you to nearest super class's method that was overridden

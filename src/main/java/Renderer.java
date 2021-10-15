@@ -2,9 +2,7 @@ import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.ImportDeclaration;
 import com.github.javaparser.ast.PackageDeclaration;
-import com.github.javaparser.ast.expr.MethodCallExpr;
-import com.github.javaparser.ast.expr.SimpleName;
-import com.github.javaparser.ast.expr.StringLiteralExpr;
+import com.github.javaparser.ast.expr.*;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 import org.apache.commons.text.StringEscapeUtils;
@@ -299,17 +297,52 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
         SimpleName simpleName = methodCallExpr.getName();
         methodCallExpr.getNameAsString();
         if (methodCallExpr.getScope().isPresent()) {
-            if (methodCallExpr.getScope().get() instanceof StringLiteralExpr) {
+            Expression scope = methodCallExpr.getScope().get();
+            if (scope instanceof StringLiteralExpr) {
                 Index.FilePosition filePosition = index.getMethod(
                         "java.lang.String",
                         simpleName.asString()
                 );
                 addLink(simpleName, filePosition);
-            } else {
+            } else if (scope instanceof ClassExpr) {
+                Index.FilePosition filePosition = index.getMethod(
+                        "java.lang.String",
+                        simpleName.asString()
+                );
+                addLink(simpleName, filePosition);
+            } else if (scope instanceof NameExpr) {
+                // example System.getProperty()
                 methodCallExpr.getNameAsString();
+            } else if (scope instanceof MethodCallExpr) {
+                // method call chaining
+                // example indexMap.entrySet().iterator()
+                //                     \          \___ should be Iterable
+                //                      \___ should be Map
+                methodCallExpr.getNameAsString();
+            } else if (scope instanceof EnclosedExpr) {
+                // (new FDBigInteger(r, pow5.offset)).leftShift(p2)
+                methodCallExpr.getNameAsString();
+            } else if (scope instanceof ThisExpr) {
+                // this.size()
+                methodCallExpr.getNameAsString();
+            } else if (scope instanceof FieldAccessExpr) {
+                // this.data.clone()
+                methodCallExpr.getNameAsString();
+            } else if (scope instanceof ObjectCreationExpr) {
+                // new BigInteger(magnitude).shiftLeft(offset * 32)
+                methodCallExpr.getNameAsString();
+            } else if (scope instanceof ArrayAccessExpr) {
+                // queryArgs[i].startsWith("mode=")
+                methodCallExpr.getNameAsString();
+            } else if (scope instanceof SuperExpr) {
+                // super.detach()
+                methodCallExpr.getNameAsString();
+            } else {
+                System.out.println("Unrecognized expression: " + methodCallExpr);
             }
         } else {
-            // TODO: probably method call within the same class
+            // method call within the same class
+            methodCallExpr.getNameAsString();
         }
     }
 }
