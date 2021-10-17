@@ -6,20 +6,11 @@ navigating code as in Intellij.
 
 # Motivation
 I used grepcode at least once a week and I am sad to see it go.
-I hope that I can create a spiritual successor by using this tool, then hosting
-the result on github pages.
-
-# Alternatives
-Your Java IDE can do a much better job. As I was write this project, I
-use Intellij to navigate from my projects code to the code of the projects I
-depend on. The experience is so much better in the IDE and you should use that.
-
-If you don't use an IDE then github provides some support for navigating code without any extra effort.
-At the moment it is superior to this tool and you should use that.
-
-The two features together I hope to acheieve that that will set Odin apart from an IDE and Github:
-1. sharing links to the code (can't do this in an IDE)
-2. can link to the dependant sources as well (github can't do this)
+It's navigation was almost as good as an IDE.
+You could navigate from apache commons all the way down to the JDK.
+I hope that I can create a spiritual successor by using this tool,
+that will live much longer since the source code is available,
+and the resulting static webpages are decentralized.
 
 # Design Philosophy 
 1. No javascript
@@ -30,6 +21,64 @@ The two features together I hope to acheieve that that will set Odin apart from 
 1. Go to the [list of all JDK classes](https://josephmate.github.io/OdinCodeBrowser/jdk8/)
 2. Find your class (ex: my favourite [HashMap](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html))
 3. Start reading code and navigating by clicking on the links
+
+# Alternatives
+Your Java IDE can do a much better job. As I was write this project, I
+use Intellij to navigate from my projects code to the code of the projects I
+depend on. The experience is so much better in the IDE and you should use that.
+If you are already using your IDE, keep using it!
+
+If you don't use an IDE then github provides some support for navigating code without any extra effort.
+
+The two features together that sets Odin apart from an IDE and GitHub:
+1. [x] sharing links to the code (can't do this in an IDE). Since it's webpage,
+   this means you can use it on low memory devices like your phone.
+2. [ ] can link to the dependant sources as well (github can't do this)
+
+# Comparison
+| Dimension                | Odin | IDE | Github |
+| ------------------------ | ---- | --- | ------ |
+| Shares links             | ✅   | ❌  | ✅     |
+| Minimal CPU Usage        | ✅   | ❌  | ✅     |
+| Minimal Memory Usage     | ✅   | ❌  | ✅     |
+| Minamal Storage Usage    | ✅   | ❌  | ✅     |
+| Realtime                 | ❌   | ✅  | ❌     |
+| Automatically Applied    | ❌   | ✅  | ✅     |
+| Static Pages             | ✅   |     | ❌     |
+| No javascript            | ✅   |     | ❌     |
+| Navigate to dependencies | TODO | ✅  | ❌     |
+| Comment on code          | ❌   | ✅  | ✅     |
+| Navigatation Complete    | ❌   | ✅  | ❌     |
+
+
+
+Explanation of each:
+
+* **Shares links**: In Odin and GitHub you can share links to any line in the code.
+  An IDE does not let you do that.
+* **Minimal CPU/Memory/Storage Usage**: Since Odin and GitHub are not realtime, no cpu, memory or
+  diskspace is needed by the client to efficiently calculate all the indexes.
+* **Realtime** As you make changes in an IDE, the indexes are update and
+  you can navigate to the new code changes or new dependencies.
+* **Automatically Applied**: By rebuilding in the IDE, new code is recognized.
+  By commiting and pushing your changes to GitHub, the navigation is updated.
+  For Odin, you must manually build and publish the static webpages. You
+  unforutnately need to manage this. GitHub and and IDE manage this for you with
+  no effort on your part.
+* **Static Pages**: Odin's output is hosted as static webpage that can be
+  efficiently distributed. This comparison doesn't make sense for an IDE.
+* **No javascript**: Odin doesn't use javascript while GitHub needs to.
+* **Navigate to dependencies**: IDE and seemlessly navigate to your
+  dependencies. Odin plans to navigate to dependencies when you build. It will
+  not be as convenient as an IDE. GitHub only lets you navigate within the same
+  repository.
+* **Navigation Complete**: anything you could possibly want to navigate to or
+  from in an IDE works. Odin is working on matching an IDE and might reach the
+  same level one day. GitHub navigation is also not as good.
+* **Comment on code**: GitHub is probably the best for comment and discussing
+  code. You can also do this in an IDE with plugins, but it's not as convenient
+  as GitHub. Since Odin pages are static without javascript, it's impossible to
+  have commenting.
 
 # Features implemented
 1. [x] Line numbers with links
@@ -56,16 +105,16 @@ The two features together I hope to acheieve that that will set Odin apart from 
         8. [x] [Types from java.lang (ex: IllegalArgumentException)](http://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html#linenum448)
         8. [ ] Types within same file
 4. [ ] Click on method to go the definition of that method
-    1. [x] [Static and only one function with the name (like Objects.hashCode(key))](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum296)
+    1. [x] [Static and only one function with the name (ex: Objects.hashCode(key))](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum296)
+    3. [x] [Functions within the same file (ex: putMapEntries(m, true)](http://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html#linenum784)
+    3. [x] [Functions on this (ex: this.getCanonName())](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/net/SocketPermission.html#linenum621)
     1. [ ] Object instance and only one function with the name and not in super class
     1. [ ] Object instance and only one function with the name but in some super class
     1. [ ] Chained method calls
     2. [ ] Functions are overloaded (different parameters)
-    3. [ ] Functions within the same file
-    3. [ ] Functions on this.method()
     3. [ ] Scoping rules (if names are duplicated in mulitple scopes, need to use the closest scope)
-    4. [x] [String literal method calls like ("true".equals(blah))](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/BeanInfoFinder.html)
-    4. [x] [class literal method calls like (boolean.class.getName())](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/PrimitiveTypeMap.html#linenum54)
+    4. [x] [String literal method calls (ex: "true".equals(blah))](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/BeanInfoFinder.html)
+    4. [x] [class literal method calls (ex: boolean.class.getName())](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/PrimitiveTypeMap.html#linenum54)
 5. [ ] Click on variable to the definition of that variable
 6. [ ] Click on method to get a list of implementations
 7. [ ] Click on Override takes you to nearest super class's method that was overridden
@@ -78,5 +127,6 @@ The two features together I hope to acheieve that that will set Odin apart from 
 9. [x] Nice syntax highlighting somehow without javascript!
 10. [ ] Multi repository support (ex: browsing guava but also linking to JDK8)
 10. [ ] Link to native code
+10. [ ] navigation comparison between Odin, IDE, and GitHub
 
 
