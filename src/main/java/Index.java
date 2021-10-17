@@ -110,7 +110,6 @@ class IndexVisitor extends VoidVisitorAdapter<Void> {
 
     @Override
     public void visit(ClassOrInterfaceDeclaration classOrInterfaceDeclaration, Void arg) {
-        super.visit(classOrInterfaceDeclaration, arg);
         if (classOrInterfaceDeclaration.getFullyQualifiedName().isPresent()) {
             index.addClass(
                     classOrInterfaceDeclaration.getFullyQualifiedName().get(),
@@ -118,10 +117,11 @@ class IndexVisitor extends VoidVisitorAdapter<Void> {
                     classOrInterfaceDeclaration.getRange().get().begin.line
             );
         }
+        super.visit(classOrInterfaceDeclaration, arg);
     }
+
     @Override
     public void visit(MethodDeclaration methodDeclaration, Void arg) {
-        super.visit(methodDeclaration, arg);
         String methodName = methodDeclaration.getName().asString();
         if (methodDeclaration.getParentNode().isPresent()
                 && methodDeclaration.getParentNode().get() instanceof ClassOrInterfaceDeclaration
@@ -145,5 +145,6 @@ class IndexVisitor extends VoidVisitorAdapter<Void> {
                 }
             }
         }
+        super.visit(methodDeclaration, arg);
     }
 }
