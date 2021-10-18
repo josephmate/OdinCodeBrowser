@@ -80,7 +80,7 @@ Explanation of each:
   as GitHub. Since Odin pages are static without javascript, it's impossible to
   have commenting.
 
-# Features implemented
+# Feature List
 1. [x] Line numbers with links
 2. [ ] Code is easily copy and pastable
     1. [x] Code is copy and pastable 
@@ -108,11 +108,11 @@ Explanation of each:
     1. [x] [Static and only one function with the name (ex: Objects.hashCode(key))](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum296)
     3. [x] [Functions within the same file (ex: putMapEntries(m, true)](http://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html#linenum784)
     3. [x] [Functions on this (ex: this.getCanonName())](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/net/SocketPermission.html#linenum621)
-    1. [ ] Object instance and only one function with the name and not in super class
+    1. [x] [Object instance and only one function with the name and not in super class]()
     1. [ ] Object instance and only one function with the name but in some super class
     1. [ ] Chained method calls
     2. [ ] Functions are overloaded (different parameters)
-    3. [ ] Scoping rules (if names are duplicated in mulitple scopes, need to use the closest scope)
+    3. [x] Scoping rules (if names are duplicated in mulitple scopes, need to use the closest scope)
     4. [x] [String literal method calls (ex: "true".equals(blah))](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/BeanInfoFinder.html)
     4. [x] [class literal method calls (ex: boolean.class.getName())](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/PrimitiveTypeMap.html#linenum54)
 5. [ ] Click on variable to the definition of that variable
@@ -124,8 +124,16 @@ Explanation of each:
 9. [ ] Click on variable definition to get all usages
 9. [ ] Click on class/interface definition to get all subtypes
 9. [ ] Click on method definition to get all overrides and impls
-9. [x] Nice syntax highlighting somehow without javascript!
 10. [ ] Multi repository support (ex: browsing guava but also linking to JDK8)
+9. [ ] Nice syntax highlighting somehow without javascript!
+     1. [x] Some syntax highlighting
+     2. A dark mode syntax highlighting on
+         1. [ ] javadoc
+         1. [ ] keywords (public, static, record, class, etc)
+         1. [x] Types
+         1. [x] functions
+         1. [ ] variables
+10. [ ] Render javadoc as text like in Intellij
 10. [ ] Link to native code
 10. [ ] navigation comparison between Odin, IDE, and GitHub
 

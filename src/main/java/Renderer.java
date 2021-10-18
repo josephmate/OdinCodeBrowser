@@ -3,7 +3,13 @@ import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.ImportDeclaration;
 import com.github.javaparser.ast.PackageDeclaration;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.Parameter;
+import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.*;
+import com.github.javaparser.ast.stmt.ForStmt;
+import com.github.javaparser.ast.stmt.IfStmt;
+import com.github.javaparser.ast.stmt.WhileStmt;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 import org.apache.commons.text.StringEscapeUtils;
@@ -188,69 +194,12 @@ class RenderingQueue {
     }
 }
 
-class ImportVisitor extends VoidVisitorAdapter<Void> {
-
-    final Map<String, String> imports = new HashMap<>();
-    private final Index index;
-
-    public ImportVisitor(Index index) {
-        this.index = index;
-        for (String fullyQualifiedName : index.getClassIndex().keySet()) {
-            if (fullyQualifiedName.startsWith("java.lang.")) {
-                imports.put(getLastToken(fullyQualifiedName), fullyQualifiedName);
-            }
-        }
-    }
-
-    private boolean isInPackage(
-            String fullyQualifiedName,
-            String packageName
-    ) {
-        return fullyQualifiedName.startsWith(packageName)
-                && fullyQualifiedName.lastIndexOf('.') <= packageName.length();
-    }
-
-    @Override
-    public void visit(PackageDeclaration packageDeclaration, Void arg) {
-        String packageName = packageDeclaration.getName().asString();
-        for (String fullyQualifiedName : index.getClassIndex().keySet()) {
-            if (isInPackage(fullyQualifiedName, packageName)) {
-                imports.put(getLastToken(fullyQualifiedName), fullyQualifiedName);
-            }
-        }
-        super.visit(packageDeclaration, arg);
-    }
-
-    @Override
-    public void visit(ImportDeclaration importDeclaration, Void arg) {
-        if (!importDeclaration.isAsterisk() && !importDeclaration.isStatic()) {
-            String importName = importDeclaration.getNameAsString();
-            imports.put(getLastToken(importName), importName);
-        } else if (importDeclaration.isAsterisk() && !importDeclaration.isStatic()) {
-            String importName = importDeclaration.getNameAsString();
-            for (String fullyQualifiedName : index.getClassIndex().keySet()) {
-                if (isInPackage(fullyQualifiedName, importName)) {
-                    imports.put(getLastToken(fullyQualifiedName), fullyQualifiedName);
-                }
-            }
-        }
-        super.visit(importDeclaration, arg);
-    }
-
-    private static String getLastToken(String importName) {
-        String [] tokens = importName.split("\\.");
-        if (tokens.length <= 0) {
-            return "";
-        }
-        return tokens[tokens.length-1];
-    }
-}
-
 class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
 
     RenderingQueue renderingQueue = new RenderingQueue();
     private final Index index;
     private final Map<String, String> imports;
+    private final ScopeTracker scopeTracker = new ScopeTracker();
 
     public RenderingQueueVisitor(
             Index index,
@@ -286,6 +235,7 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
 
     private String currentClassName = null;
     public void visit(ClassOrInterfaceDeclaration classOrInterfaceDeclaration, Void arg) {
+        scopeTracker.startScope();
         // need to set the class name before visiting all the nodes
         String previousClassName = currentClassName;
         if (classOrInterfaceDeclaration.getFullyQualifiedName().isPresent()) {
@@ -293,9 +243,73 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
         }
         super.visit(classOrInterfaceDeclaration, arg);
         currentClassName = previousClassName;
+        scopeTracker.endScope();
     }
 
-        @Override
+    @Override
+    public void visit(MethodDeclaration n, Void arg) {
+        scopeTracker.startScope();
+        // don't call super since we copied super's code and changed the order to have the parameters first
+        n.getParameters().forEach(p -> p.accept(this, arg));
+        n.getBody().ifPresent(l -> l.accept(this, arg));
+        n.getType().accept(this, arg);
+        n.getModifiers().forEach(p -> p.accept(this, arg));
+        n.getName().accept(this, arg);
+        n.getParameters().forEach(p -> p.accept(this, arg));
+        n.getReceiverParameter().ifPresent(l -> l.accept(this, arg));
+        n.getThrownExceptions().forEach(p -> p.accept(this, arg));
+        n.getTypeParameters().forEach(p -> p.accept(this, arg));
+        n.getAnnotations().forEach(p -> p.accept(this, arg));
+        n.getComment().ifPresent(l -> l.accept(this, arg));
+        scopeTracker.endScope();
+
+    }
+
+    @Override
+    public void visit(WhileStmt d, Void arg) {
+        scopeTracker.startScope();
+        super.visit(d, arg);
+        scopeTracker.endScope();
+    }
+
+    @Override
+    public void visit(ForStmt n, Void arg) {
+        scopeTracker.startScope();
+        // don't call super since we copied super's code and changed the order to have the parameters first
+        n.getInitialization().forEach(p -> p.accept(this, arg));
+        n.getBody().accept(this, arg);
+        n.getCompare().ifPresent(l -> l.accept(this, arg));
+        n.getUpdate().forEach(p -> p.accept(this, arg));
+        n.getComment().ifPresent(l -> l.accept(this, arg));
+        scopeTracker.endScope();
+    }
+
+    @Override
+    public void visit(IfStmt d, Void arg) {
+        scopeTracker.startScope();
+        super.visit(d, arg);
+        scopeTracker.endScope();
+    }
+
+    @Override
+    public void visit(Parameter d, Void arg) {
+        scopeTracker.addVariable(
+            d.getNameAsString(),
+            d.getType().asString()
+        );
+        super.visit(d, arg);
+    }
+
+    @Override
+    public void visit(VariableDeclarator d, Void arg) {
+        scopeTracker.addVariable(
+                d.getNameAsString(),
+                d.getType().asString()
+        );
+        super.visit(d, arg);
+    }
+
+    @Override
     public void visit(ClassOrInterfaceType classOrInterfaceType, Void arg) {
         SimpleName simpleName = classOrInterfaceType.getName();
         String className = simpleName.asString();
@@ -316,12 +330,21 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
             } else if (scope instanceof ClassExpr) {
                 handleClassName("java.lang.Class", methodSimpleName, false);
             } else if (scope instanceof NameExpr) {
+                NameExpr nameExpr = (NameExpr)scope;
                 // example System.getProperty()
                 // example variable.getProperty()
                 // Need some way to distinguish between them
                 // How about try variable index first, then Class index.
-                NameExpr nameExpr = (NameExpr)scope;
-                String fullyQualifiedClassName = imports.get(nameExpr.getName().asString());
+
+                // trying variable index
+                final String typeFromVariable = scopeTracker.getVariableType(nameExpr.getNameAsString());
+                final String fullyQualifiedClassName;
+                if (typeFromVariable != null) {
+                    fullyQualifiedClassName = imports.get(typeFromVariable);
+                } else {
+                    // trying Class index
+                    fullyQualifiedClassName = imports.get(nameExpr.getName().asString());
+                }
                 handleClassName(fullyQualifiedClassName, methodSimpleName, false);
             } else if (scope instanceof MethodCallExpr) {
                 // method call chaining
