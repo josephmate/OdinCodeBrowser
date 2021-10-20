@@ -18,9 +18,31 @@ and the resulting static webpages are decentralized.
 3. Each page is static, so it can be efficiently host hosted
 
 # How Do I Use This
+
+## As a code browser
 1. Go to the [list of all JDK classes](https://josephmate.github.io/OdinCodeBrowser/jdk8/)
 2. Find your class (ex: my favourite [HashMap](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html))
 3. Start reading code and navigating by clicking on the links
+
+## As a code owner
+```
+git clone git@github.com:josephmate/OdinCodeBrowser.git
+cd OdinCodeBrowser
+mvn install exec:java \
+  -Dexec.mainClass=Main \
+  -Dexec.args="<path_to_your_project> <output_directory> <root_of_website> <sub_directory_in_website>"
+```
+
+Building JDK 8 as an example, with jdk8 checked out to `../jdk8`, relative to Odin's root directory.
+```
+mvn install exec:java \
+  -Dexec.mainClass=Main \
+  -Dexec.args="../jdk8/jdk/src/share/classes docs/jdk8 /OdinCodeBrowser jdk8"
+```
+
+# Fun and games
+1. Start at a random class in [jdk8](https://josephmate.github.io/OdinCodeBrowser/jdk8/)
+2. Using links only, how fast can you get my favourite class: HashMap?
 
 # Alternatives
 Your Java IDE can do a much better job. As I was write this project, I
@@ -116,11 +138,11 @@ Explanation of each:
     4. [x] [String literal method calls (ex: "true".equals(blah))](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/BeanInfoFinder.html)
     4. [x] [class literal method calls (ex: boolean.class.getName())](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/PrimitiveTypeMap.html#linenum54)
 5. [ ] Click on variable to the definition of that variable
-    1. [x] (from function param)[http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum345]
-    1. [x] (local var)[http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum568]
-    1. [x] (from scope (for/while/if))[http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum352]
-    1. [x] (field var)[http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum291]
-    1. [x] (static field var)[http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum384]
+    1. [x] [from function param](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum345)
+    1. [x] [local var](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum568)
+    1. [x] [from scope (for/while/if)](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum352)
+    1. [x] [field var](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum291)
+    1. [x] [static field var](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum384)
     1. [ ] this.field
     1. [ ] Class then variable (ex: System.out)
     1. [ ] variable chaining (ex: a.b.c.d)
@@ -132,7 +154,10 @@ Explanation of each:
 9. [ ] Click on variable definition to get all usages
 9. [ ] Click on class/interface definition to get all subtypes
 9. [ ] Click on method definition to get all overrides and impls
-10. [ ] Multi repository support (ex: browsing guava but also linking to JDK8)
+9. [ ] Multi repository support (ex: browsing guava but also linking to JDK8)
+    1. [ ] Repository exposes it's index file as json
+    1. [ ] Build loads index files, then builds it own index
+    1. [ ] Create a demo using current project OdinCodeBrowser -> apache text -> apache commons -> JDK8
 9. [ ] Nice syntax highlighting somehow without javascript!
      1. [x] Some syntax highlighting
      2. A dark mode syntax highlighting on
