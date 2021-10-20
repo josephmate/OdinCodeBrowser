@@ -112,10 +112,18 @@ Explanation of each:
     1. [ ] Object instance and only one function with the name but in some super class
     1. [ ] Chained method calls
     2. [ ] Functions are overloaded (different parameters)
-    3. [x] Scoping rules (if names are duplicated in mulitple scopes, need to use the closest scope)
+    3. [ ] Scoping rules (if names are duplicated in mulitple scopes, need to use the closest scope)
     4. [x] [String literal method calls (ex: "true".equals(blah))](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/BeanInfoFinder.html)
     4. [x] [class literal method calls (ex: boolean.class.getName())](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/PrimitiveTypeMap.html#linenum54)
 5. [ ] Click on variable to the definition of that variable
+    1. [x] (from function param)[http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum345]
+    1. [x] (local var)[http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum568]
+    1. [x] (from scope (for/while/if))[http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum352]
+    1. [x] (field var)[http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum291]
+    1. [x] (static field var)[http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum384]
+    1. [ ] this.field
+    1. [ ] Class then variable (ex: System.out)
+    1. [ ] variable chaining (ex: a.b.c.d)
 6. [ ] Click on method to get a list of implementations
 7. [ ] Click on Override takes you to nearest super class's method that was overridden
 8. [x] [File list in root directory /OdinCodeBrowser/jdk8](https://josephmate.github.io/OdinCodeBrowser/jdk8/)

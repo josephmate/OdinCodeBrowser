@@ -4,10 +4,12 @@ import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.*;
 import com.github.javaparser.ast.body.*;
 import com.github.javaparser.ast.expr.Name;
+import com.github.javaparser.ast.expr.NameExpr;
 import com.github.javaparser.ast.expr.VariableDeclarationExpr;
 import com.github.javaparser.ast.stmt.ForStmt;
 import com.github.javaparser.ast.stmt.IfStmt;
 import com.github.javaparser.ast.stmt.WhileStmt;
+import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 
 import java.io.File;
@@ -53,7 +55,6 @@ class Visitor extends VoidVisitorAdapter<Void> {
     n.getType().accept(this, arg);
     n.getModifiers().forEach(p -> p.accept(this, arg));
     n.getName().accept(this, arg);
-    n.getParameters().forEach(p -> p.accept(this, arg));
     n.getReceiverParameter().ifPresent(l -> l.accept(this, arg));
     n.getThrownExceptions().forEach(p -> p.accept(this, arg));
     n.getTypeParameters().forEach(p -> p.accept(this, arg));
@@ -101,11 +102,11 @@ class Visitor extends VoidVisitorAdapter<Void> {
 
   @Override
   public void visit(Parameter d, Void arg) {
-    print("start param " + d);
+    print("start param " + d + " " + d.getRange());
     tabCount++;
     super.visit(d, arg);
     tabCount--;
-    print("end param " + d);
+    print("end param " + d + " " + d.getRange());
   }
 
   @Override
@@ -115,5 +116,24 @@ class Visitor extends VoidVisitorAdapter<Void> {
     super.visit(d, arg);
     tabCount--;
     print("end variable " + d);
+  }
+
+
+  @Override
+  public void visit(ClassOrInterfaceType d, Void arg) {
+    print("start classType " + d);
+    tabCount++;
+    super.visit(d, arg);
+    tabCount--;
+    print("end classType " + d);
+  }
+
+  @Override
+  public void visit(NameExpr d, Void arg) {
+    print("start nameExpr " + d);
+    tabCount++;
+    super.visit(d, arg);
+    tabCount--;
+    print("end nameExpr " + d);
   }
 }

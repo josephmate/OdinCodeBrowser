@@ -220,7 +220,7 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
             renderingQueue.add(lineNum, startCol, new ContentRecord(
                     String.format(
                             """
-                            <a href="%s#linenum%d">""",
+                                    <a href="%s#linenum%d">""",
                             filePosition.fileName(),
                             filePosition.lineNumber()
                     ),
@@ -234,6 +234,7 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
     }
 
     private String currentClassName = null;
+
     public void visit(ClassOrInterfaceDeclaration classOrInterfaceDeclaration, Void arg) {
         scopeTracker.startScope();
         // need to set the class name before visiting all the nodes
@@ -255,7 +256,6 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
         n.getType().accept(this, arg);
         n.getModifiers().forEach(p -> p.accept(this, arg));
         n.getName().accept(this, arg);
-        n.getParameters().forEach(p -> p.accept(this, arg));
         n.getReceiverParameter().ifPresent(l -> l.accept(this, arg));
         n.getThrownExceptions().forEach(p -> p.accept(this, arg));
         n.getTypeParameters().forEach(p -> p.accept(this, arg));
@@ -294,8 +294,9 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
     @Override
     public void visit(Parameter d, Void arg) {
         scopeTracker.addVariable(
-            d.getNameAsString(),
-            d.getType().asString()
+                d.getNameAsString(),
+                d.getType().asString(),
+                d.getRange().get().begin.line
         );
         super.visit(d, arg);
     }
@@ -304,7 +305,8 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
     public void visit(VariableDeclarator d, Void arg) {
         scopeTracker.addVariable(
                 d.getNameAsString(),
-                d.getType().asString()
+                d.getType().asString(),
+                d.getRange().get().begin.line
         );
         super.visit(d, arg);
     }
@@ -321,7 +323,7 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
         super.visit(classOrInterfaceType, arg);
     }
 
-    public void visit(MethodCallExpr methodCallExpr , Void arg) {
+    public void visit(MethodCallExpr methodCallExpr, Void arg) {
         SimpleName methodSimpleName = methodCallExpr.getName();
         if (methodCallExpr.getScope().isPresent()) {
             Expression scope = methodCallExpr.getScope().get();
@@ -330,7 +332,7 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
             } else if (scope instanceof ClassExpr) {
                 handleClassName("java.lang.Class", methodSimpleName, false);
             } else if (scope instanceof NameExpr) {
-                NameExpr nameExpr = (NameExpr)scope;
+                NameExpr nameExpr = (NameExpr) scope;
                 // example System.getProperty()
                 // example variable.getProperty()
                 // Need some way to distinguish between them
@@ -381,9 +383,9 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
     }
 
     private boolean handleClassName(
-        String fullyQualifiedClassName,
-        SimpleName methodSimpleName,
-        boolean includePrivates
+            String fullyQualifiedClassName,
+            SimpleName methodSimpleName,
+            boolean includePrivates
     ) {
         if (fullyQualifiedClassName != null) {
             Index.FilePosition filePosition = null;
@@ -408,4 +410,16 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
         }
         return false;
     }
+
+    public void visit(NameExpr nameExpr, Void arg) {
+        // trying variable index
+        final Integer localVariableLineNum = scopeTracker.getVariableLine(nameExpr.getNameAsString());
+        if (localVariableLineNum != null) {
+            addLink(nameExpr.getName(), new Index.FilePosition(
+                    "",
+                    localVariableLineNum
+            ));
+        }
+    }
+
 }
