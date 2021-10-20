@@ -24,6 +24,15 @@ and the resulting static webpages are decentralized.
 2. Find your class (ex: my favourite [HashMap](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html))
 3. Start reading code and navigating by clicking on the links
 
+For example I did
+[I18NImpl](https://josephmate.github.io/OdinCodeBrowser/jdk8//com/sun/imageio/plugins/common/I18NImpl.html)
+->
+[PropertyResourceBundle](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/PropertyResourceBundle.html#linenum122)
+->
+[HashMap](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html#linenum137)
+
+However, sometimes you'll pick a class that does not have a path to HashMap :(.
+
 ## As a code owner
 ```
 git clone git@github.com:josephmate/OdinCodeBrowser.git
