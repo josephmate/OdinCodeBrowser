@@ -411,17 +411,15 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
         return false;
     }
 
-    /*public void visit(NameExpr methodCallExpr, Void arg) {
+    public void visit(NameExpr nameExpr, Void arg) {
         // trying variable index
-        final String typeFromVariable = scopeTracker.getVariableType(nameExpr.getNameAsString());
-        final String fullyQualifiedClassName;
-        if (typeFromVariable != null) {
-            fullyQualifiedClassName = imports.get(typeFromVariable);
-        } else {
-            // trying Class index
-            fullyQualifiedClassName = imports.get(nameExpr.getName().asString());
+        final Integer localVariableLineNum = scopeTracker.getVariableLine(nameExpr.getNameAsString());
+        if (localVariableLineNum != null) {
+            addLink(nameExpr.getName(), new Index.FilePosition(
+                    "",
+                    localVariableLineNum
+            ));
         }
-        handleClassName(fullyQualifiedClassName, methodSimpleName, false);
-    }*/
+    }
 
 }
