@@ -256,7 +256,6 @@ class RenderingQueueVisitor extends VoidVisitorAdapter<Void> {
         n.getType().accept(this, arg);
         n.getModifiers().forEach(p -> p.accept(this, arg));
         n.getName().accept(this, arg);
-        n.getParameters().forEach(p -> p.accept(this, arg));
         n.getReceiverParameter().ifPresent(l -> l.accept(this, arg));
         n.getThrownExceptions().forEach(p -> p.accept(this, arg));
         n.getTypeParameters().forEach(p -> p.accept(this, arg));
