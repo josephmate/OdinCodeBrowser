@@ -1,7 +1,9 @@
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 
 import java.io.IOException;
@@ -14,6 +16,7 @@ public class Index {
     private final Map<String, FilePosition> classIndex = new HashMap<>();
     private final Map<String, Map<String, FilePosition>> methodIndex = new HashMap<>();
     private final Map<String, Map<String, FilePosition>> privateMethodIndex = new HashMap<>();
+    private final Map<String, Map<String, FilePosition>> variableIndex = new HashMap<>();
 
     public void indexFile(
             Path inputFile,
@@ -45,6 +48,7 @@ public class Index {
         }
         methodSubMap.put(methodName, filePosition);
     }
+
     public void addPrivateMethod(
             String fullyQualifiedName,
             String methodName,
@@ -58,6 +62,21 @@ public class Index {
             privateMethodIndex.put(fullyQualifiedName, methodSubMap);
         }
         methodSubMap.put(methodName, filePosition);
+    }
+
+    public void addVariable(
+            String fullyQualifiedName,
+            String variableName,
+            String fileUrl,
+            int lineNumber
+    ) {
+        FilePosition filePosition = new FilePosition(fileUrl, lineNumber);
+        Map<String, FilePosition> variableSubMap = variableIndex.get(fullyQualifiedName);
+        if (variableSubMap == null) {
+            variableSubMap = new HashMap<>();
+            variableIndex.put(fullyQualifiedName, variableSubMap);
+        }
+        variableSubMap.put(variableName, filePosition);
     }
 
     public FilePosition get(String fullyQualifiedName) {
@@ -125,8 +144,8 @@ class IndexVisitor extends VoidVisitorAdapter<Void> {
         String methodName = methodDeclaration.getName().asString();
         if (methodDeclaration.getParentNode().isPresent()
                 && methodDeclaration.getParentNode().get() instanceof ClassOrInterfaceDeclaration
-        )  {
-            ClassOrInterfaceDeclaration classOrInterfaceDeclaration = (ClassOrInterfaceDeclaration)methodDeclaration.getParentNode().get();
+        ) {
+            ClassOrInterfaceDeclaration classOrInterfaceDeclaration = (ClassOrInterfaceDeclaration) methodDeclaration.getParentNode().get();
             if (classOrInterfaceDeclaration.getFullyQualifiedName().isPresent()) {
                 if (methodDeclaration.isPrivate()) {
                     index.addPrivateMethod(
@@ -146,5 +165,26 @@ class IndexVisitor extends VoidVisitorAdapter<Void> {
             }
         }
         super.visit(methodDeclaration, arg);
+    }
+
+    public void visit(FieldDeclaration fieldDeclaration, Void arg) {
+        if (fieldDeclaration.getParentNode().isPresent()
+                && fieldDeclaration.getParentNode().get() instanceof ClassOrInterfaceDeclaration
+        ) {
+            ClassOrInterfaceDeclaration classOrInterfaceDeclaration = (ClassOrInterfaceDeclaration) fieldDeclaration.getParentNode().get();
+            if (classOrInterfaceDeclaration.getFullyQualifiedName().isPresent()) {
+                if (!fieldDeclaration.isPrivate()) {
+                    for (VariableDeclarator vd : fieldDeclaration.getVariables()) {
+                        index.addVariable(
+                                classOrInterfaceDeclaration.getFullyQualifiedName().get(),
+                                vd.getNameAsString(),
+                                fileUrl,
+                                fieldDeclaration.getRange().get().begin.line
+                        );
+                    }
+                }
+            }
+        }
+        super.visit(fieldDeclaration, arg);
     }
 }
