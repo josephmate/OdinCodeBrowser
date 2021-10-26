@@ -49,9 +49,14 @@ public record Director(
                         getFileUrl(path)
                 );
             }
-            new IndexFileRenderer().render(
+            new IndexHtmlRenderer().render(
                     outputDirectory + "/index.html",
                     fileTreeData
+            );
+
+            new IndexJsonRenderer().render(
+                    outputDirectory + "/index.json",
+                    index
             );
         }
     }

@@ -15,7 +15,7 @@ and the resulting static webpages are decentralized.
 # Design Philosophy 
 1. No javascript
 2. No javascript!!!
-3. Each page is static, so it can be efficiently host hosted
+3. Each page is static, so it can be efficiently hosted
 
 # How Do I Use This
 
@@ -143,6 +143,7 @@ Explanation of each:
     1. [ ] Object instance and only one function with the name but in some super class
     1. [ ] Chained method calls
     2. [ ] Functions are overloaded (different parameters)
+    3. [ ] import static functions
     3. [ ] Scoping rules (if names are duplicated in mulitple scopes, need to use the closest scope)
     4. [x] [String literal method calls (ex: "true".equals(blah))](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/BeanInfoFinder.html)
     4. [x] [class literal method calls (ex: boolean.class.getName())](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/PrimitiveTypeMap.html#linenum54)
@@ -164,7 +165,7 @@ Explanation of each:
 9. [ ] Click on class/interface definition to get all subtypes
 9. [ ] Click on method definition to get all overrides and impls
 9. [ ] Multi repository support (ex: browsing guava but also linking to JDK8)
-    1. [ ] Repository exposes it's index file as json
+    1. [x] Repository exposes it's index file as json
     1. [ ] Build loads index files, then builds it own index
     1. [ ] Create a demo using current project OdinCodeBrowser -> apache text -> apache commons -> JDK8
 9. [ ] Nice syntax highlighting somehow without javascript!

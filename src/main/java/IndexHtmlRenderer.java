@@ -4,7 +4,10 @@ import java.nio.file.Paths;
 import java.util.Map;
 import java.util.SortedMap;
 
-public class IndexFileRenderer {
+/**
+ * Creates an html file listing out all the class files in the repository.
+ */
+public class IndexHtmlRenderer {
 
     public void render(
             String outputFile,
