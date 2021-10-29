@@ -22,15 +22,15 @@ import java.nio.file.Paths;
 import java.util.*;
 import java.util.stream.Collectors;
 
-public record Renderer (
+public record SourceHtmlRenderer(
     Index index,
-    String webRootUrl,
+    String webPathToCssFile,
     String header
 ){
 
-    public Renderer(Index index,
-             String webRootUrl) {
-        this(index, webRootUrl,
+    public SourceHtmlRenderer(Index index,
+                              String webPathToCssFile) {
+        this(index, webPathToCssFile,
             String.format(
                     """
                     <html>
@@ -40,7 +40,7 @@ public record Renderer (
                     <body>
                     <table>
                     """,
-                    webRootUrl + "/css/styles.css"
+                    webPathToCssFile
             )
         );
     }

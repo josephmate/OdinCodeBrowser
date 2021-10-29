@@ -17,16 +17,13 @@ import java.util.stream.Stream;
  * </ol>
  */
 public record Director(
-    String inputDirectory,
-    String outputDirectory,
-    String webRootDir,
-    String sourceSubUrl
+    OdinOptions odinOptions
 ) {
     public void processFiles() throws IOException {
         Index index = new Index();
-        Renderer render = new Renderer(index, webRootDir);
+        SourceHtmlRenderer render = new SourceHtmlRenderer(index, odinOptions.webPathToCssFile);
 
-        try (Stream<Path> stream = Files.walk(Paths.get(inputDirectory))){
+        try (Stream<Path> stream = Files.walk(Paths.get(odinOptions.inputSourceDirectory))){
             List<Path> files = stream.filter(Files::isRegularFile)
                     .filter(path -> path.toString().endsWith(".java"))
                     .collect(Collectors.toList());
@@ -45,28 +42,28 @@ public record Director(
             SortedMap<String, String> fileTreeData = new TreeMap<>();
             for (Path path : files) {
                 fileTreeData.put(
-                        path.toString().replace(inputDirectory, ""),
+                        path.toString().replace(odinOptions.inputSourceDirectory, ""),
                         getFileUrl(path)
                 );
             }
             new IndexHtmlRenderer().render(
-                    outputDirectory + "/index.html",
+                    odinOptions.outputDirectory + "/index.html",
                     fileTreeData
             );
 
             new IndexJsonRenderer().render(
-                    outputDirectory + "/index.json",
+                    odinOptions.outputDirectory + "/index.json",
                     index
             );
         }
     }
 
     private String getFileUrl(Path javaSourceFile) {
-        return webRootDir + "/" + sourceSubUrl + "/"
+        return odinOptions.webPathToSourceHtmlFiles
                 + (
                 javaSourceFile.toString()
                         .substring(0, javaSourceFile.toString().length()-5)
-                        .replace(inputDirectory, "")
+                        .replace(odinOptions.inputSourceDirectory, "")
                         + ".html"
         );
     }
@@ -77,11 +74,11 @@ public record Director(
         index.indexFile(path, fileUrl);
     }
 
-    private void processFile(Renderer render, Path path) throws IOException {
+    private void processFile(SourceHtmlRenderer render, Path path) throws IOException {
         System.out.println("Rendering " + path);
         final String destinationStr = path.toString()
                 .substring(0, path.toString().length()-5)
-                .replace(inputDirectory, outputDirectory)
+                .replace(odinOptions.inputSourceDirectory, odinOptions.outputDirectory)
                 + ".html";
         render.renderFile(path, destinationStr);
     }
