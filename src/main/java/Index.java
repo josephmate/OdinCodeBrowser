@@ -13,10 +13,25 @@ import java.util.Map;
 
 public class Index {
 
-    private final Map<String, FilePosition> classIndex = new HashMap<>();
-    private final Map<String, Map<String, FilePosition>> methodIndex = new HashMap<>();
-    private final Map<String, Map<String, FilePosition>> privateMethodIndex = new HashMap<>();
-    private final Map<String, Map<String, FilePosition>> variableIndex = new HashMap<>();
+    /**
+     * Fully Qualified Class Name -> File Position
+     */
+    final Map<String, FilePosition> classIndex = new HashMap<>();
+
+    /**
+     * Fully Qualified Class Name -> method name -> File Position
+     */
+    final Map<String, Map<String, FilePosition>> methodIndex = new HashMap<>();
+
+    /**
+     * Fully Qualified Class Name -> method name -> File Position
+     */
+    final Map<String, Map<String, FilePosition>> privateMethodIndex = new HashMap<>();
+
+    /**
+     * Fully Qualified Class Name -> variable name -> File Position
+     */
+    final Map<String, Map<String, FilePosition>> variableIndex = new HashMap<>();
 
     public void indexFile(
             Path inputFile,
