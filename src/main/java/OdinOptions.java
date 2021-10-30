@@ -1,5 +1,7 @@
 import org.kohsuke.args4j.Option;
 
+import java.util.List;
+
 public class OdinOptions {
 
     @Option(name="--inputSourceDirectory",
@@ -36,4 +38,11 @@ public class OdinOptions {
                --webPathToSourceHtmlFiles /OdinCodeBrowser/jdk8
                """)
     public String webPathToSourceHtmlFiles;
+
+    @Option(name="--urlToDependantIndexJson",
+            required = true,
+            usage= """
+               Url of the index.json of the dependencies of this repository.
+               """)
+    public List<String> urlsToDependantIndexJsons;
 }
