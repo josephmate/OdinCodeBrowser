@@ -3,6 +3,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
+import java.util.Map;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
@@ -20,8 +21,7 @@ public record Director(
     OdinOptions odinOptions
 ) {
     public void processFiles() throws IOException {
-        Index index = new Index();
-        SourceHtmlRenderer render = new SourceHtmlRenderer(index, odinOptions.webPathToCssFile);
+        Index localIndex = new Index();
 
         try (Stream<Path> stream = Files.walk(Paths.get(odinOptions.inputSourceDirectory))){
             List<Path> files = stream.filter(Files::isRegularFile)
@@ -29,12 +29,52 @@ public record Director(
                     .collect(Collectors.toList());
             for (Path path: files) {
                 try {
-                    indexFile(index, path);
+                    indexFile(localIndex, path);
                 } catch (Exception e) {
                     throw new RuntimeException("Error processing " + path, e);
                 }
             }
 
+            Index externalIndex = new UrlIndexLoader().load(odinOptions.urlsToDependantIndexJsons);
+            for (Map.Entry<String, Index.FilePosition> entry : localIndex.classIndex.entrySet()) {
+                String fullyQualifiedClassName = entry.getKey();
+                Index.FilePosition filePosition = entry.getValue();
+                externalIndex.addClass(
+                        fullyQualifiedClassName,
+                        filePosition.fileName(),
+                        filePosition.lineNumber()
+                );
+            }
+            for (Map.Entry<String, Map<String, Index.FilePosition>> entry : localIndex.variableIndex.entrySet()) {
+                String fullyQualifiedClassName = entry.getKey();
+                for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
+                    String variableName = entry.getKey();
+                    Index.FilePosition filePosition = entry2.getValue();
+                    externalIndex.addVariable(
+                            fullyQualifiedClassName,
+                            variableName,
+                            filePosition.fileName(),
+                            filePosition.lineNumber()
+                    );
+                }
+            }
+            for (Map.Entry<String, Map<String, Index.FilePosition>> entry : localIndex.methodIndex.entrySet()) {
+                String fullyQualifiedClassName = entry.getKey();
+                for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
+                    String methodName = entry.getKey();
+                    Index.FilePosition filePosition = entry2.getValue();
+                    externalIndex.addMethod(
+                            fullyQualifiedClassName,
+                            methodName,
+                            filePosition.fileName(),
+                            filePosition.lineNumber()
+                    );
+                }
+            }
+            // there should be no existing private index, so this should merge it properly
+            externalIndex.privateMethodIndex.putAll(localIndex.privateMethodIndex);
+
+            SourceHtmlRenderer render = new SourceHtmlRenderer(externalIndex, odinOptions.webPathToCssFile);
             for (Path path : files) {
                 processFile(render, path);
             }
@@ -53,7 +93,8 @@ public record Director(
 
             new IndexJsonRenderer().render(
                     odinOptions.outputDirectory + "/index.json",
-                    index
+                    // only export an index for the sources belonging to this project
+                    localIndex
             );
         }
     }
