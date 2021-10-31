@@ -164,10 +164,10 @@ Explanation of each:
 9. [ ] Click on variable definition to get all usages
 9. [ ] Click on class/interface definition to get all subtypes
 9. [ ] Click on method definition to get all overrides and impls
-9. [ ] Multi repository support (ex: browsing guava but also linking to JDK8)
+9. [x] Multi repository support (ex: browsing guava but also linking to JDK8)
     1. [x] Repository exposes it's index file as json
-    1. [ ] Build loads index files, then builds it own index
-    1. [ ] Create a demo using current project OdinCodeBrowser -> apache text -> apache commons -> JDK8
+    1. [x] Build loads index files, then builds it own index
+    1. [x] Create a demo using current project OdinCodeBrowser -> apache text -> apache commons -> JDK8
 9. [ ] Nice syntax highlighting somehow without javascript!
      1. [x] Some syntax highlighting
      2. A dark mode syntax highlighting on

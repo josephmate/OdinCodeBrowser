@@ -1,4 +1,5 @@
-import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.JavaParser;
+import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
@@ -37,7 +38,9 @@ public class Index {
             Path inputFile,
             String fileUrl
     ) throws IOException {
-        CompilationUnit compilationUnit = StaticJavaParser.parse(inputFile);
+        JavaParser javaParser = new JavaParser(new ParserConfiguration().setLanguageLevel(
+                ParserConfiguration.LanguageLevel.JAVA_16));
+        CompilationUnit compilationUnit = javaParser.parse(inputFile).getResult().get();
         IndexVisitor indexVisitor = new IndexVisitor(this, fileUrl);
         indexVisitor.visit(compilationUnit, null);
     }
