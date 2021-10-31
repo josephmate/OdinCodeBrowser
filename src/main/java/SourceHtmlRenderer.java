@@ -1,3 +1,5 @@
+import com.github.javaparser.JavaParser;
+import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.ImportDeclaration;
@@ -49,7 +51,9 @@ public record SourceHtmlRenderer(
             Path inputFile,
             String outputFile
     ) throws IOException {
-        CompilationUnit compilationUnit = StaticJavaParser.parse(inputFile);
+        JavaParser javaParser = new JavaParser(new ParserConfiguration().setLanguageLevel(
+                ParserConfiguration.LanguageLevel.JAVA_16));
+        CompilationUnit compilationUnit = javaParser.parse(inputFile).getResult().get();
         ImportVisitor importVisitor = new ImportVisitor(index);
         importVisitor.visit(compilationUnit, null);
 
