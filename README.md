@@ -169,6 +169,14 @@ Explanation of each:
     1. [x] Repository exposes it's index file as json
     1. [x] Build loads index files, then builds it own index
     1. [x] Create a demo using current project OdinCodeBrowser -> apache text -> apache commons -> JDK8
+        1. Take a look at [SourceHtmlRenderer](https://josephmate.github.io/OdinCodeBrowser/odin.code.browser/SourceHtmlRenderer.html)
+        2. In there [I use apache commons text to handle the html escaping for me](https://josephmate.github.io/OdinCodeBrowser/odin.code.browser/SourceHtmlRenderer.html#linenum145)
+        3. From SourceHtmlRenderer can navigate to the [StringEscapeUtils.escapeHtml4 implementation](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html#linenum660)
+        4. escapeHtml4 uses
+           [CharSequenceTranslator.translate](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/translate/CharSequenceTranslator.html#linenum84)
+        5. Ignore not being able to navigate to the overloaded method. Odin doesn't support that yet.
+        6. Validate.isTrue which is in apache commons lang3
+        7. Which throws IllegalArgumentException which allows you to navigate to jdk8!
 9. [ ] Nice syntax highlighting somehow without javascript!
      1. [x] Some syntax highlighting
      2. A dark mode syntax highlighting on
