@@ -24,15 +24,6 @@ and the resulting static webpages are decentralized.
 2. Find your class (ex: my favourite [HashMap](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html))
 3. Start reading code and navigating by clicking on the links
 
-For example I did
-[I18NImpl](https://josephmate.github.io/OdinCodeBrowser/jdk8//com/sun/imageio/plugins/common/I18NImpl.html)
-->
-[PropertyResourceBundle](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/PropertyResourceBundle.html#linenum122)
-->
-[HashMap](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html#linenum137)
-
-However, sometimes you'll pick a class that does not have a path to HashMap :(.
-
 ## As a code owner
 ```
 git clone git@github.com:josephmate/OdinCodeBrowser.git
@@ -52,6 +43,15 @@ mvn install exec:java \
 # Fun and games
 1. Start at a random class in [jdk8](https://josephmate.github.io/OdinCodeBrowser/jdk8/)
 2. Using links only, how fast can you get my favourite class: HashMap?
+
+For example I did
+[I18NImpl](https://josephmate.github.io/OdinCodeBrowser/jdk8//com/sun/imageio/plugins/common/I18NImpl.html)
+->
+[PropertyResourceBundle](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/PropertyResourceBundle.html#linenum122)
+->
+[HashMap](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html#linenum137)
+
+However, sometimes you'll pick a class that does not have a path to HashMap :(.
 
 # Alternatives
 Your Java IDE can do a much better job. As I was write this project, I
@@ -176,6 +176,7 @@ Explanation of each:
            [CharSequenceTranslator.translate](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/translate/CharSequenceTranslator.html#linenum84)
         5. Ignore not being able to navigate to the overloaded method. Odin doesn't support that yet.
         6. Validate.isTrue which is in apache commons lang3
+        7. Again ignore that it went to the wrong overload of Validate.isTrue
         7. Which throws IllegalArgumentException which allows you to navigate to jdk8!
 9. [ ] Nice syntax highlighting somehow without javascript!
      1. [x] Some syntax highlighting
