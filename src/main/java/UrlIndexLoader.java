@@ -29,7 +29,7 @@ public class UrlIndexLoader {
             for (Map.Entry<String, Map<String, Index.FilePosition>> entry : externalIndex.variableIndex.entrySet()) {
                 String fullyQualifiedClassName = entry.getKey();
                 for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
-                    String variableName = entry.getKey();
+                    String variableName = entry2.getKey();
                     Index.FilePosition filePosition = entry2.getValue();
                     allExternalIndexes.addVariable(
                             fullyQualifiedClassName,
@@ -43,7 +43,7 @@ public class UrlIndexLoader {
             for (Map.Entry<String, Map<String, Index.FilePosition>> entry : externalIndex.methodIndex.entrySet()) {
                 String fullyQualifiedClassName = entry.getKey();
                 for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
-                    String methodName = entry.getKey();
+                    String methodName = entry2.getKey();
                     Index.FilePosition filePosition = entry2.getValue();
                     allExternalIndexes.addMethod(
                             fullyQualifiedClassName,

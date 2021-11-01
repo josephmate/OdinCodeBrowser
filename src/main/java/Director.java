@@ -48,7 +48,7 @@ public record Director(
             for (Map.Entry<String, Map<String, Index.FilePosition>> entry : localIndex.variableIndex.entrySet()) {
                 String fullyQualifiedClassName = entry.getKey();
                 for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
-                    String variableName = entry.getKey();
+                    String variableName = entry2.getKey();
                     Index.FilePosition filePosition = entry2.getValue();
                     externalIndex.addVariable(
                             fullyQualifiedClassName,
@@ -61,7 +61,7 @@ public record Director(
             for (Map.Entry<String, Map<String, Index.FilePosition>> entry : localIndex.methodIndex.entrySet()) {
                 String fullyQualifiedClassName = entry.getKey();
                 for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
-                    String methodName = entry.getKey();
+                    String methodName = entry2.getKey();
                     Index.FilePosition filePosition = entry2.getValue();
                     externalIndex.addMethod(
                             fullyQualifiedClassName,
@@ -74,7 +74,11 @@ public record Director(
             // there should be no existing private index, so this should merge it properly
             externalIndex.privateMethodIndex.putAll(localIndex.privateMethodIndex);
 
-            SourceHtmlRenderer render = new SourceHtmlRenderer(externalIndex, odinOptions.webPathToCssFile);
+            SourceHtmlRenderer render = new SourceHtmlRenderer(
+                    externalIndex,
+                    odinOptions.webPathToCssFile,
+                    odinOptions.languageLevel
+            );
             for (Path path : files) {
                 processFile(render, path);
             }
@@ -112,7 +116,11 @@ public record Director(
     private void indexFile(Index index, Path path) throws IOException {
         System.out.println("Indexing " + path);
         final String fileUrl = getFileUrl(path);
-        index.indexFile(path, fileUrl);
+        index.indexFile(
+                path,
+                fileUrl,
+                odinOptions.languageLevel
+        );
     }
 
     private void processFile(SourceHtmlRenderer render, Path path) throws IOException {

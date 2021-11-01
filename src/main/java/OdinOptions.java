@@ -1,5 +1,8 @@
+import com.github.javaparser.ParserConfiguration;
 import org.kohsuke.args4j.Option;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 public class OdinOptions {
@@ -40,9 +43,16 @@ public class OdinOptions {
     public String webPathToSourceHtmlFiles;
 
     @Option(name="--urlToDependantIndexJson",
-            required = true,
+            required = false,
             usage= """
                Url of the index.json of the dependencies of this repository.
                """)
-    public List<String> urlsToDependantIndexJsons;
+    public List<String> urlsToDependantIndexJsons = new ArrayList<>();
+
+    @Option(name="--languageLevel",
+            required = false,
+            usage= """
+               Which version of the JDK the source code uses.
+               """)
+    public ParserConfiguration.LanguageLevel languageLevel = ParserConfiguration.LanguageLevel.JAVA_16;
 }

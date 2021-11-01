@@ -36,10 +36,11 @@ public class Index {
 
     public void indexFile(
             Path inputFile,
-            String fileUrl
+            String fileUrl,
+            ParserConfiguration.LanguageLevel languageLevel
     ) throws IOException {
         JavaParser javaParser = new JavaParser(new ParserConfiguration().setLanguageLevel(
-                ParserConfiguration.LanguageLevel.JAVA_16));
+                languageLevel));
         CompilationUnit compilationUnit = javaParser.parse(inputFile).getResult().get();
         IndexVisitor indexVisitor = new IndexVisitor(this, fileUrl);
         indexVisitor.visit(compilationUnit, null);
@@ -125,6 +126,14 @@ public class Index {
 
     public Map<String, FilePosition> getClassIndex() {
         return classIndex;
+    }
+
+    public Map<String, Map<String, FilePosition>> getMethodIndex() {
+        return methodIndex;
+    }
+
+    public Map<String, Map<String, FilePosition>> getVariableIndex() {
+        return variableIndex;
     }
 
     public record FilePosition (

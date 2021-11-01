@@ -27,12 +27,14 @@ import java.util.stream.Collectors;
 public record SourceHtmlRenderer(
     Index index,
     String webPathToCssFile,
+    ParserConfiguration.LanguageLevel languageLevel,
     String header
 ){
 
     public SourceHtmlRenderer(Index index,
-                              String webPathToCssFile) {
-        this(index, webPathToCssFile,
+                              String webPathToCssFile,
+                              ParserConfiguration.LanguageLevel languageLevel) {
+        this(index, webPathToCssFile, languageLevel,
             String.format(
                     """
                     <html>
@@ -52,7 +54,7 @@ public record SourceHtmlRenderer(
             String outputFile
     ) throws IOException {
         JavaParser javaParser = new JavaParser(new ParserConfiguration().setLanguageLevel(
-                ParserConfiguration.LanguageLevel.JAVA_16));
+                languageLevel));
         CompilationUnit compilationUnit = javaParser.parse(inputFile).getResult().get();
         ImportVisitor importVisitor = new ImportVisitor(index);
         importVisitor.visit(compilationUnit, null);
