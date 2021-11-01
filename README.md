@@ -77,7 +77,7 @@ The two features together that sets Odin apart from an IDE and GitHub:
 | Automatically Applied    | ❌   | ✅  | ✅     |
 | Static Pages             | ✅   |     | ❌     |
 | No javascript            | ✅   |     | ❌     |
-| Navigate to dependencies | TODO | ✅  | ❌     |
+| Navigate to dependencies | ✅   | ✅  | ❌     |
 | Comment on code          | ❌   | ✅  | ✅     |
 | Navigatation Complete    | ❌   | ✅  | ❌     |
 
