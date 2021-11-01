@@ -122,6 +122,7 @@ Explanation of each:
         1. [x] Annotation
         1. [x] Outer class
         2. [x] Inner class
+        3. [ ] Record
         3. [ ] Class inside function
         4. [ ] Anonymous class
     1. Type Usage
