@@ -2,7 +2,8 @@
 
 This project attempts to create a completely static website of your source code,
 implementing navigate using anchors and links. The goal is to be as good as
-navigating code as in Intellij.
+navigating code as in Intellij. See a sample
+[here](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html).
 
 # Motivation
 I used grepcode at least once a week and I am sad to see it go.
@@ -15,32 +16,51 @@ and the resulting static webpages are decentralized.
 # Design Philosophy 
 1. No javascript
 2. No javascript!!!
-3. Each page is static, so it can be efficiently hosted
+3. Each page is static
 
 # How Do I Use This
 
 ## As a code browser
-1. Go to the [list of all JDK classes](https://josephmate.github.io/OdinCodeBrowser/jdk8/)
-2. Find your class (ex: my favourite [HashMap](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html))
+1. Find a project you like from [this list of supported repos](https://josephmate.github.io/OdinCodeBrowser/)
+1. Go to the list of all classes [(ex: Apache Commons Text)](https://josephmate.github.io/OdinCodeBrowser/jdk8/)
+2. Find your class (ex: A class Odin uses 
+   [StringEscapeUtils](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html))
 3. Start reading code and navigating by clicking on the links
 
 ## As a code owner
 ```
 git clone git@github.com:josephmate/OdinCodeBrowser.git
 cd OdinCodeBrowser
+args="--inputSourceDirectory <path_to_your_source>"
+args="$args --outputDirectory <output_directory>"
+args="$args --webPathToCssFile https://josephmate.github.io/OdinCodeBrowser/css/styles.css"
+args="$args --webPathToSourceHtmlFiles <directory_on_webserver>"
+args="$args --languageLevel JAVA_16"
+args="$args --urlToDependantIndexJson <url_of_dependencies_index_file>"
 mvn install exec:java \
   -Dexec.mainClass=Main \
-  -Dexec.args="<path_to_your_project> <output_directory> <root_of_website> <sub_directory_in_website>"
+  -Dexec.args="$args"
 ```
 
-Building JDK 8 as an example, with jdk8 checked out to `../jdk8`, relative to Odin's root directory.
+Creating an Odin Navigator for my project as an example, with dependencies on
+github javaparser, apache commons, apache commons text, and JDK8 that I host on
+https://josephmate.github.io/OdinCodeBrowser/ .
 ```
+args="--inputSourceDirectory src/main/java"
+args="$args --outputDirectory docs/odin.code.browser"
+args="$args --webPathToCssFile /OdinCodeBrowser/css/styles.css"
+args="$args --webPathToSourceHtmlFiles /OdinCodeBrowser/odin.code.browser"
+args="$args --languageLevel JAVA_16"
+args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowser/jdk8/index.json"
+args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowser/javaparser-core_3.23.1/index.json"
+args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowser/commons-lang3_3.11/index.json"
+args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/index.json"
 mvn install exec:java \
   -Dexec.mainClass=Main \
-  -Dexec.args="../jdk8/jdk/src/share/classes docs/jdk8 /OdinCodeBrowser jdk8"
+  -Dexec.args="$args"
 ```
 
-# Fun and games
+## Fun and games
 1. Start at a random class in [jdk8](https://josephmate.github.io/OdinCodeBrowser/jdk8/)
 2. Using links only, how fast can you get my favourite class: HashMap?
 
@@ -60,11 +80,12 @@ depend on. The experience is so much better in the IDE and you should use that.
 If you are already using your IDE, keep using it!
 
 If you don't use an IDE then github provides some support for navigating code without any extra effort.
+Just commit your code as you normally do and github updates the navigation.
 
 The two features together that sets Odin apart from an IDE and GitHub:
 1. [x] sharing links to the code (can't do this in an IDE). Since it's webpage,
-   this means you can use it on low memory devices like your phone.
-2. [ ] can link to the dependant sources as well (github can't do this)
+   this means you can use it on low memory devices like your phone!
+2. [x] can link to the dependant sources as well (github can't do this)
 
 # Comparison
 | Dimension                | Odin | IDE | Github |
@@ -179,6 +200,7 @@ Explanation of each:
         7. Again ignore that it went to the wrong overload of Validate.isTrue
         7. Which throws IllegalArgumentException which allows you to navigate to jdk8!
 9. [ ] Nice syntax highlighting somehow without javascript!
+     1. [ ] Make it look decent on mobile (IE: not tiny text)
      1. [x] Some syntax highlighting
      2. A dark mode syntax highlighting on
          1. [ ] javadoc
