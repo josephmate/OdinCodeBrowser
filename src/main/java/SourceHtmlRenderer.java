@@ -1,9 +1,6 @@
 import com.github.javaparser.JavaParser;
 import com.github.javaparser.ParserConfiguration;
-import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
-import com.github.javaparser.ast.ImportDeclaration;
-import com.github.javaparser.ast.PackageDeclaration;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
@@ -40,6 +37,7 @@ public record SourceHtmlRenderer(
                     <html>
                         <head>
                             <link rel="stylesheet" type="text/css" href="%s"/>
+                            <meta name="viewport" content="width=device-width, initial-scale=1.0">
                         </head>
                     <body>
                     <table>

@@ -200,7 +200,7 @@ Explanation of each:
         7. Again ignore that it went to the wrong overload of Validate.isTrue
         7. Which throws IllegalArgumentException which allows you to navigate to jdk8!
 9. [ ] Nice syntax highlighting somehow without javascript!
-     1. [ ] Make it look decent on mobile (IE: not tiny text)
+     1. [x] Make it look decent on mobile (IE: not tiny text)
      1. [x] Some syntax highlighting
      2. A dark mode syntax highlighting on
          1. [ ] javadoc
