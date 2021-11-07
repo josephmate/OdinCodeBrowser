@@ -1,4 +1,7 @@
+package rendering;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
+import indexing.Index;
 
 import java.io.File;
 import java.io.IOException;

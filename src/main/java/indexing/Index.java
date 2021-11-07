@@ -1,3 +1,6 @@
+package indexing;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.github.javaparser.JavaParser;
 import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
@@ -17,22 +20,23 @@ public class Index {
     /**
      * Fully Qualified Class Name -> File Position
      */
-    final Map<String, FilePosition> classIndex = new HashMap<>();
+    public final Map<String, FilePosition> classIndex = new HashMap<>();
 
     /**
      * Fully Qualified Class Name -> method name -> File Position
      */
-    final Map<String, Map<String, FilePosition>> methodIndex = new HashMap<>();
+    public final Map<String, Map<String, FilePosition>> methodIndex = new HashMap<>();
 
     /**
      * Fully Qualified Class Name -> method name -> File Position
      */
-    final Map<String, Map<String, FilePosition>> privateMethodIndex = new HashMap<>();
+    @JsonIgnore
+    public final Map<String, Map<String, FilePosition>> privateMethodIndex = new HashMap<>();
 
     /**
      * Fully Qualified Class Name -> variable name -> File Position
      */
-    final Map<String, Map<String, FilePosition>> variableIndex = new HashMap<>();
+    public final Map<String, Map<String, FilePosition>> variableIndex = new HashMap<>();
 
     public void indexFile(
             Path inputFile,

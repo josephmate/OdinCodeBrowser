@@ -1,6 +1,9 @@
+package rendering.source;
+
 import com.github.javaparser.ast.ImportDeclaration;
 import com.github.javaparser.ast.PackageDeclaration;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
+import indexing.Index;
 
 import java.util.HashMap;
 import java.util.Map;

@@ -1,3 +1,9 @@
+import indexing.Index;
+import indexing.UrlIndexLoader;
+import rendering.IndexHtmlRenderer;
+import rendering.IndexJsonRenderer;
+import rendering.source.SourceHtmlRenderer;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
