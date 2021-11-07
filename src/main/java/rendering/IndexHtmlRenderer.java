@@ -13,17 +13,22 @@ public class IndexHtmlRenderer {
 
     public void render(
             String outputFile,
+            String webPathToCssFile,
             SortedMap<String,String> javaFileToHtmlFile
     ) throws IOException {
         StringBuilder sb = new StringBuilder();
         sb.append(
-                """
-                <html>
-                    <head>
-                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    </head>
-                <body>
-                """
+                String.format(
+                        """
+                        <html>
+                            <head>
+                                <link rel="stylesheet" type="text/css" href="%s"/>
+                                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                            </head>
+                        <body>
+                        """,
+                        webPathToCssFile
+                )
         );
 
         for (Map.Entry<String, String> entry : javaFileToHtmlFile.entrySet()) {
