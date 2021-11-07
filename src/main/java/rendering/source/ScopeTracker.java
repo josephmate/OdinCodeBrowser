@@ -1,3 +1,5 @@
+package rendering.source;
+
 import java.util.*;
 
 public class ScopeTracker {
