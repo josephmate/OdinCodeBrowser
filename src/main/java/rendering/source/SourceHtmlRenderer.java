@@ -3,16 +3,6 @@ package rendering.source;
 import com.github.javaparser.JavaParser;
 import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
-import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
-import com.github.javaparser.ast.body.MethodDeclaration;
-import com.github.javaparser.ast.body.Parameter;
-import com.github.javaparser.ast.body.VariableDeclarator;
-import com.github.javaparser.ast.expr.*;
-import com.github.javaparser.ast.stmt.ForStmt;
-import com.github.javaparser.ast.stmt.IfStmt;
-import com.github.javaparser.ast.stmt.WhileStmt;
-import com.github.javaparser.ast.type.ClassOrInterfaceType;
-import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 import indexing.Index;
 import org.apache.commons.text.StringEscapeUtils;
 
@@ -100,10 +90,26 @@ public record SourceHtmlRenderer(
         for (String line : lines) {
             linePrefix(sb, lineNumber);
 
-            renderLine(sb, line, renderingQueue.renderingQueue.getOrDefault(
+            Collection<String> beforeTasks = renderingQueue.beginningOfLineRenderingQueue.get(lineNumber);
+            if (beforeTasks != null) {
+                for (String content : beforeTasks) {
+                    sb.append(content);
+                }
+            }
+
+            renderLine(sb, line, renderingQueue.withinLineRenderingQueue.getOrDefault(
                     lineNumber,
                     new RenderQueueLine()
             ));
+
+            Collection<String> afterTasksRaw = renderingQueue.beginningOfLineRenderingQueue.get(lineNumber);
+            if (afterTasksRaw != null) {
+                List<String> afterTasks = new ArrayList<>(afterTasksRaw);
+                Collections.reverse(afterTasks);
+                for (String content : afterTasks) {
+                    sb.append(content);
+                }
+            }
 
             lineSuffix(sb);
             lineNumber++;
