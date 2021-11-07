@@ -14,7 +14,11 @@ import indexing.Index;
 
 import java.util.Map;
 
-class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
+/**
+ * Applies the Index to the source code by recording the changes that are need
+ * in the rendering queue.
+ */
+public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
 
     private final RenderingQueue renderingQueue;
     private final Index index;

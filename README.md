@@ -203,7 +203,8 @@ Explanation of each:
      1. [x] Make it look decent on mobile (IE: not tiny text)
      1. [x] Some syntax highlighting
      2. A dark mode syntax highlighting on
-         1. [ ] javadoc
+         1. [x] pick a colour scheme: [vim-dichromatic](https://github.com/romainl/vim-dichromatic)
+         1. [x] comments
          1. [ ] keywords (public, static, record, class, etc)
          1. [x] Types
          1. [x] functions
