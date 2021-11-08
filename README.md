@@ -206,6 +206,8 @@ Explanation of each:
          1. [x] pick a colour scheme: [vim-dichromatic](https://github.com/romainl/vim-dichromatic)
          1. [x] comments
          1. [x] strings
+         1. [ ] literals
+         1. [ ] native types (boolean, char, int, etc.)
          1. [ ] keywords (public, static, record, class, etc)
              1. [ ] this
              1. [ ] super
