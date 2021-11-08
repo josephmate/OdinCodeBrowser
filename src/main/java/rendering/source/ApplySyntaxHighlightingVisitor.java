@@ -4,6 +4,8 @@ import com.github.javaparser.Range;
 import com.github.javaparser.ast.comments.BlockComment;
 import com.github.javaparser.ast.comments.JavadocComment;
 import com.github.javaparser.ast.comments.LineComment;
+import com.github.javaparser.ast.expr.StringLiteralExpr;
+import com.github.javaparser.ast.expr.TextBlockLiteralExpr;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 
 import java.util.Optional;
@@ -23,17 +25,23 @@ public class ApplySyntaxHighlightingVisitor  extends VoidVisitorAdapter<Void> {
         this.renderingQueue = renderingQueue;
     }
 
-    private void handleComment(Optional<Range> range) {
+    private void highlightToken(
+            Optional<Range> range,
+            String cssClass
+    ) {
         int startLineNum = range.get().begin.line;
         int startCol = range.get().begin.column;
         int endLineNum = range.get().end.line;
         int endCol = range.get().end.column;
 
+        final String startTag = "<span class='" + cssClass+ "'>";
+        final String endTag = "</span>";
+
         renderingQueue.add(
                 startLineNum,
                 startCol,
                 new ContentRecord(
-                        "<span class='comment'>",
+                        startTag,
                         PositionType.BEFORE
                 )
         );
@@ -41,35 +49,47 @@ public class ApplySyntaxHighlightingVisitor  extends VoidVisitorAdapter<Void> {
                 endLineNum,
                 endCol,
                 new ContentRecord(
-                        "</span>",
+                        endTag,
                         PositionType.AFTER
                 )
         );
         if (startLineNum != endLineNum) {
-            renderingQueue.endOfLine(startLineNum, "<span class='comment'>");
+            renderingQueue.endOfLine(startLineNum, endTag);
             for (int i = startLineNum + 1; i < endLineNum; i++) {
-                renderingQueue.beginningOfLine(i, "<span class='comment'>");
-                renderingQueue.endOfLine(i, "<span class='comment'>");
+                renderingQueue.beginningOfLine(i, startTag);
+                renderingQueue.endOfLine(i, endTag);
             }
-            renderingQueue.endOfLine(endLineNum, "<span class='comment'>");
+            renderingQueue.endOfLine(endLineNum, endTag);
         }
     }
 
     @Override
     public void visit(LineComment comment, Void arg) {
-        handleComment(comment.getRange());
+        highlightToken(comment.getRange(), "comment");
         super.visit(comment, arg);
     }
 
     @Override
     public void visit(JavadocComment comment, Void arg) {
-        handleComment(comment.getRange());
+        highlightToken(comment.getRange(), "comment");
         super.visit(comment, arg);
     }
 
     @Override
     public void visit(BlockComment comment, Void arg) {
-        handleComment(comment.getRange());
+        highlightToken(comment.getRange(), "comment");
         super.visit(comment, arg);
+    }
+
+    @Override
+    public void visit(StringLiteralExpr str, Void arg) {
+        highlightToken(str.getRange(), "string");
+        super.visit(str, arg);
+    }
+
+    @Override
+    public void visit(TextBlockLiteralExpr str, Void arg) {
+        highlightToken(str.getRange(), "string");
+        super.visit(str, arg);
     }
 }
