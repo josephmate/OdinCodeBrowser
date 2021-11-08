@@ -205,7 +205,26 @@ Explanation of each:
      2. A dark mode syntax highlighting on
          1. [x] pick a colour scheme: [vim-dichromatic](https://github.com/romainl/vim-dichromatic)
          1. [x] comments
+         1. [x] strings
          1. [ ] keywords (public, static, record, class, etc)
+             1. [ ] this
+             1. [ ] super
+             1. [ ] class + modifiers
+             1. [ ] modifiers of constructors
+             1. [ ] modifiers of fields
+             1. [ ] modifiers of functions
+             1. [ ] modifiers of params
+             1. [ ] modifiers of locals
+             1. [ ] for
+             1. [ ] synchronized
+             1. [ ] import
+             1. [ ] switch case
+             1. [ ] if
+             1. [ ] while
+             1. [ ] do
+             1. [ ] return
+             1. [ ] extends
+             1. [ ] implements
          1. [x] Types
          1. [x] functions
          1. [ ] variables
