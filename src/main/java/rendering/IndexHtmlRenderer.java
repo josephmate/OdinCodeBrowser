@@ -34,7 +34,7 @@ public class IndexHtmlRenderer {
         for (Map.Entry<String, String> entry : javaFileToHtmlFile.entrySet()) {
             sb.append(String.format(
                     """
-                    <div><a href="%s">%s</a></div>
+                    <div><a class="index-link" href="%s">%s</a></div>
                     """,
                     entry.getValue(),
                     entry.getKey()
