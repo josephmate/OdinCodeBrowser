@@ -142,6 +142,9 @@ In order for someone to change the style, they will need to install a plugin for
 their brorwser and override odin's css styles.
 
 # Feature List
+
+Below is a checklist of features odin needs.
+
 1. [x] Line numbers with links
 2. [ ] Code is easily copy and pastable
     1. [x] Code is copy and pastable 
@@ -153,7 +156,7 @@ their brorwser and override odin's css styles.
         1. [x] Outer class
         2. [x] Inner class
         3. [ ] Enum
-        3. [ ] Record
+        3. [x] Record
         3. [ ] Class inside function
         4. [ ] Anonymous class
     1. Type Usage
@@ -161,6 +164,8 @@ their brorwser and override odin's css styles.
         2. [x] [Method return type](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/oracle/net/Sdp.html#linenum104)
         3. [x] [Extends type](http://josephmate.github.io/OdinCodeBrowser/jdk8/com/oracle/net/Sdp.html#linenum95)
         4. [x] Implement type
+        4. [x] Record
+        4. [ ] Enum
         5. [ ] Annotation (the implementation of the annotation)
         6. [ ] Import
         7. [x] [Types through wildcard imports (ex: List from java.util.*)](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/concurrent/ScheduledThreadPoolExecutor.html#linenum785)
