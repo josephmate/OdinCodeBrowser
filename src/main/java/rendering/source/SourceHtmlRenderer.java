@@ -17,14 +17,21 @@ import java.util.stream.Collectors;
 public record SourceHtmlRenderer(
     Index index,
     String webPathToCssFile,
+    String pathToRepoRoot,
     ParserConfiguration.LanguageLevel languageLevel,
-    String header
+    String header,
+    String footer
 ){
 
     public SourceHtmlRenderer(Index index,
                               String webPathToCssFile,
+                              String pathToRepoRoot,
                               ParserConfiguration.LanguageLevel languageLevel) {
-        this(index, webPathToCssFile, languageLevel,
+        this(
+            index,
+            webPathToCssFile,
+            pathToRepoRoot,
+            languageLevel,
             String.format(
                     """
                     <html>
@@ -33,10 +40,21 @@ public record SourceHtmlRenderer(
                             <meta name="viewport" content="width=device-width, initial-scale=1.0">
                         </head>
                     <body>
+                    <a class="index-link" href="%s">Back to index...</a>
                     <table>
                     """,
-                    webPathToCssFile
-            )
+                webPathToCssFile,
+                pathToRepoRoot
+                ),
+            String.format(
+                """
+                </table>
+                </body>
+                <a class="index-link" href="%s">Back to index...</a>
+                </html>
+                """,
+                pathToRepoRoot
+                )
         );
     }
 
@@ -70,13 +88,6 @@ public record SourceHtmlRenderer(
                 codeToHtml(code, renderingQueue)
         );
     }
-
-    private static final String FOOTER =
-            """
-            </table>
-            </body>
-            </html>
-            """;
 
     private String codeToHtml(
             String code,
@@ -115,7 +126,7 @@ public record SourceHtmlRenderer(
             lineNumber++;
         }
 
-        sb.append(FOOTER);
+        sb.append(footer);
         return sb.toString();
     }
 

@@ -83,6 +83,7 @@ public record Director(
             SourceHtmlRenderer render = new SourceHtmlRenderer(
                     externalIndex,
                     odinOptions.webPathToCssFile,
+                    odinOptions().webPathToSourceHtmlFiles,
                     odinOptions.languageLevel
             );
             for (Path path : files) {
