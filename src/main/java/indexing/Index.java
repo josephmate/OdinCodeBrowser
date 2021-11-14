@@ -4,10 +4,7 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.github.javaparser.JavaParser;
 import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
-import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
-import com.github.javaparser.ast.body.FieldDeclaration;
-import com.github.javaparser.ast.body.MethodDeclaration;
-import com.github.javaparser.ast.body.VariableDeclarator;
+import com.github.javaparser.ast.body.*;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 
 import java.io.IOException;
@@ -168,6 +165,30 @@ class IndexVisitor extends VoidVisitorAdapter<Void> {
             );
         }
         super.visit(classOrInterfaceDeclaration, arg);
+    }
+
+    @Override
+    public void visit(RecordDeclaration recordDeclaration, Void arg) {
+        if (recordDeclaration.getFullyQualifiedName().isPresent()) {
+            index.addClass(
+                    recordDeclaration.getFullyQualifiedName().get(),
+                    fileUrl,
+                    recordDeclaration.getRange().get().begin.line
+            );
+        }
+        super.visit(recordDeclaration, arg);
+    }
+
+    @Override
+    public void visit(EnumDeclaration enumDeclaration, Void arg) {
+        if (enumDeclaration.getFullyQualifiedName().isPresent()) {
+            index.addClass(
+                    enumDeclaration.getFullyQualifiedName().get(),
+                    fileUrl,
+                    enumDeclaration.getRange().get().begin.line
+            );
+        }
+        super.visit(enumDeclaration, arg);
     }
 
     @Override
