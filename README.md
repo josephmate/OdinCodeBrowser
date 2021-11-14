@@ -132,6 +132,15 @@ Explanation of each:
   as GitHub. Since Odin pages are static without javascript, it's impossible to
   have commenting.
 
+# Color Scheme
+
+The colorscheme is based on [vim-dichromatic](https://github.com/romainl/vim-dichromatic)
+put together by [Romain Lafourcade](https://github.com/romainl).
+I wanted a single color scheme that could be used by anyone,
+since it is really difficult for reader to change the styles.
+In order for someone to change the style, they will need to install a plugin for
+their brorwser and override odin's css styles.
+
 # Feature List
 1. [x] Line numbers with links
 2. [ ] Code is easily copy and pastable
@@ -143,6 +152,7 @@ Explanation of each:
         1. [x] Annotation
         1. [x] Outer class
         2. [x] Inner class
+        3. [ ] Enum
         3. [ ] Record
         3. [ ] Class inside function
         4. [ ] Anonymous class
@@ -205,8 +215,11 @@ Explanation of each:
      2. A dark mode syntax highlighting on
          1. [x] pick a colour scheme: [vim-dichromatic](https://github.com/romainl/vim-dichromatic)
          1. [x] comments
-         1. [x] strings
          1. [ ] literals
+             1. [x] strings
+             1. [ ] numbers
+             1. [ ] boolean
+             1. [ ] enum values
          1. [ ] native types (boolean, char, int, etc.)
          1. [ ] keywords (public, static, record, class, etc)
              1. [ ] this
@@ -228,8 +241,8 @@ Explanation of each:
              1. [ ] extends
              1. [ ] implements
          1. [x] Types
-         1. [x] functions
-         1. [ ] variables
+         1. [x] function calls
+         1. [x] variables
 10. [ ] Render javadoc as text like in Intellij
 10. [ ] Link to native code
 10. [ ] navigation comparison between Odin, IDE, and GitHub

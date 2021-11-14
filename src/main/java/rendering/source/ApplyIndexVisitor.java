@@ -37,7 +37,8 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
 
     private void addLink(
             SimpleName simpleName,
-            Index.FilePosition filePosition
+            Index.FilePosition filePosition,
+            String cssClass
     ) {
         if (filePosition != null) {
             int lineNum = simpleName.getRange().get().begin.line;
@@ -46,7 +47,8 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
             renderingQueue.add(lineNum, startCol, new ContentRecord(
                     String.format(
                             """
-                                    <a href="%s#linenum%d">""",
+                                    <a class="%s" href="%s#linenum%d">""",
+                            cssClass,
                             filePosition.fileName(),
                             filePosition.lineNumber()
                     ),
@@ -144,7 +146,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
         if (imports.containsKey(className)) {
             String fullyQualifiedName = imports.get(className);
             Index.FilePosition filePosition = index.get(fullyQualifiedName);
-            addLink(simpleName, filePosition);
+            addLink(simpleName, filePosition, "type");
         }
         super.visit(classOrInterfaceType, arg);
     }
@@ -221,7 +223,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                         methodSimpleName.asString()
                 );
             }
-            addLink(methodSimpleName, filePosition);
+            addLink(methodSimpleName, filePosition, "type");
 
             if (filePosition != null) {
                 return true;
@@ -230,7 +232,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                     fullyQualifiedClassName,
                     methodSimpleName.asString()
             );
-            addLink(methodSimpleName, filePosition);
+            addLink(methodSimpleName, filePosition, "type");
 
             return filePosition != null;
         }
@@ -244,7 +246,9 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
             addLink(nameExpr.getName(), new Index.FilePosition(
                     "",
                     localVariableLineNum
-            ));
+                ),
+        "variable"
+            );
         }
     }
 
