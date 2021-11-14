@@ -100,6 +100,7 @@ public record Director(
             new IndexHtmlRenderer().render(
                     odinOptions.outputDirectory + "/index.html",
                     odinOptions.webPathToCssFile,
+                    odinOptions.multiRepoRoot,
                     fileTreeData
             );
 

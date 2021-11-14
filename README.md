@@ -155,7 +155,7 @@ Below is a checklist of features odin needs.
         1. [x] Annotation
         1. [x] Outer class
         2. [x] Inner class
-        3. [ ] Enum
+        3. [x] Enum
         3. [x] Record
         3. [ ] Class inside function
         4. [ ] Anonymous class
@@ -165,7 +165,7 @@ Below is a checklist of features odin needs.
         3. [x] [Extends type](http://josephmate.github.io/OdinCodeBrowser/jdk8/com/oracle/net/Sdp.html#linenum95)
         4. [x] Implement type
         4. [x] Record
-        4. [ ] Enum
+        4. [x] Enum
         5. [ ] Annotation (the implementation of the annotation)
         6. [ ] Import
         7. [x] [Types through wildcard imports (ex: List from java.util.*)](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/concurrent/ScheduledThreadPoolExecutor.html#linenum785)
@@ -190,6 +190,7 @@ Below is a checklist of features odin needs.
     1. [x] [from scope (for/while/if)](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum352)
     1. [x] [field var](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum291)
     1. [x] [static field var](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum384)
+    1. [ ] Enum value
     1. [ ] this.field
     1. [ ] Class then variable (ex: System.out)
     1. [ ] variable chaining (ex: a.b.c.d)

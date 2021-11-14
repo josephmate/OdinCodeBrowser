@@ -1,5 +1,7 @@
 package rendering;
 
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -12,9 +14,10 @@ import java.util.SortedMap;
 public class IndexHtmlRenderer {
 
     public void render(
-            String outputFile,
-            String webPathToCssFile,
-            SortedMap<String,String> javaFileToHtmlFile
+            @Nonnull String outputFile,
+            @Nonnull String webPathToCssFile,
+            @Nullable String multiRepoRoot,
+            @Nonnull SortedMap<String,String> javaFileToHtmlFile
     ) throws IOException {
         StringBuilder sb = new StringBuilder();
         sb.append(
@@ -30,6 +33,17 @@ public class IndexHtmlRenderer {
                         webPathToCssFile
                 )
         );
+
+        if (multiRepoRoot != null) {
+            sb.append(String.format(
+                    """
+                    <div>
+                        <a class="index-link" href="%s">Back to list of repositories...</a>
+                    </div>
+                    """,
+                    multiRepoRoot
+            ));
+        }
 
         for (Map.Entry<String, String> entry : javaFileToHtmlFile.entrySet()) {
             sb.append(String.format(
