@@ -55,4 +55,13 @@ public class OdinOptions {
                Which version of the JDK the source code uses.
                """)
     public ParserConfiguration.LanguageLevel languageLevel = ParserConfiguration.LanguageLevel.JAVA_16;
+
+
+    @Option(name="--multiRepoRoot",
+            required = false,
+            usage= """
+               If this this website hold multiple repos under a root directory, provide this root directory
+               so that the repositories can link back the the repository list.
+               """)
+    public String multiRepoRoot = null;
 }
