@@ -1,4 +1,4 @@
-package rendering.source;
+package indexing;
 
 import com.github.javaparser.ast.ImportDeclaration;
 import com.github.javaparser.ast.PackageDeclaration;
@@ -19,7 +19,10 @@ import java.util.Map;
  */
 public class ImportVisitor extends VoidVisitorAdapter<Void> {
 
-    final Map<String, String> imports = new HashMap<>();
+    /**
+     * SimpleName (ex: Object) to Fully Qualified Name (ex: java.lang.Object)
+     */
+    public final Map<String, String> imports = new HashMap<>();
     private final Index index;
 
     public ImportVisitor(Index index) {

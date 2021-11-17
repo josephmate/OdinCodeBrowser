@@ -157,6 +157,7 @@ Below is a checklist of features odin needs.
         2. [x] Inner class
         3. [x] Enum
         3. [x] Record
+        3. [ ] Generics
         3. [ ] Class inside function
         4. [ ] Anonymous class
     1. Type Usage
@@ -166,6 +167,7 @@ Below is a checklist of features odin needs.
         4. [x] Implement type
         4. [x] Record
         4. [x] Enum
+        3. [ ] Generics
         5. [ ] Annotation (the implementation of the annotation)
         6. [ ] Import
         7. [x] [Types through wildcard imports (ex: List from java.util.*)](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/concurrent/ScheduledThreadPoolExecutor.html#linenum785)
@@ -181,6 +183,7 @@ Below is a checklist of features odin needs.
     1. [ ] Chained method calls
     2. [ ] Functions are overloaded (different parameters)
     3. [ ] import static functions
+    3. [ ] Record getter functions
     3. [ ] Scoping rules (if names are duplicated in mulitple scopes, need to use the closest scope)
     4. [x] [String literal method calls (ex: "true".equals(blah))](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/BeanInfoFinder.html)
     4. [x] [class literal method calls (ex: boolean.class.getName())](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/PrimitiveTypeMap.html#linenum54)
