@@ -1,3 +1,5 @@
+package options;
+
 import com.github.javaparser.ParserConfiguration;
 import org.kohsuke.args4j.Option;
 

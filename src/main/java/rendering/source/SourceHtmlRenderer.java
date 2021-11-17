@@ -3,7 +3,9 @@ package rendering.source;
 import com.github.javaparser.JavaParser;
 import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
+import indexing.ImportVisitor;
 import indexing.Index;
+import options.OdinOptions;
 import org.apache.commons.text.StringEscapeUtils;
 
 import javax.annotation.Nonnull;
@@ -16,22 +18,16 @@ import java.util.stream.Collectors;
 
 public record SourceHtmlRenderer(
     Index index,
-    String webPathToCssFile,
-    String pathToRepoRoot,
-    ParserConfiguration.LanguageLevel languageLevel,
+    OdinOptions odinOptions,
     String header,
     String footer
 ){
 
     public SourceHtmlRenderer(Index index,
-                              String webPathToCssFile,
-                              String pathToRepoRoot,
-                              ParserConfiguration.LanguageLevel languageLevel) {
+                              OdinOptions odinOptions) {
         this(
             index,
-            webPathToCssFile,
-            pathToRepoRoot,
-            languageLevel,
+            odinOptions,
             String.format(
                     """
                     <html>
@@ -43,8 +39,8 @@ public record SourceHtmlRenderer(
                     <a class="index-link" href="%s">Back to index...</a>
                     <table>
                     """,
-                webPathToCssFile,
-                pathToRepoRoot
+                odinOptions.webPathToCssFile,
+                odinOptions.webPathToSourceHtmlFiles
                 ),
             String.format(
                 """
@@ -53,12 +49,27 @@ public record SourceHtmlRenderer(
                 <a class="index-link" href="%s">Back to index...</a>
                 </html>
                 """,
-                pathToRepoRoot
+                odinOptions.webPathToSourceHtmlFiles
                 )
         );
     }
 
-    public void renderFile(
+    public void proccessFiles(Collection<Path> files) throws IOException {
+        for (Path path : files) {
+            processFile(path);
+        }
+    }
+
+    private void processFile(Path path) throws IOException {
+        System.out.println("Rendering " + path);
+        final String destinationStr = path.toString()
+                .substring(0, path.toString().length()-5)
+                .replace(odinOptions.inputSourceDirectory, odinOptions.outputDirectory)
+                + ".html";
+        renderFile(path, destinationStr);
+    }
+
+    private void renderFile(
             Path inputFile,
             String outputFile
     ) throws IOException {
