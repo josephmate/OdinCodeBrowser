@@ -11,14 +11,14 @@ import java.util.List;
 
 public class SuperClassIndexer {
 
-    private final Index externalIndex;
+    private final Index completeIndex;
     private final OdinOptions odinOptions;
 
     public SuperClassIndexer(
-            Index externalIndex,
+            Index completeIndex,
             OdinOptions odinOptions
     ) {
-        this.externalIndex = externalIndex;
+        this.completeIndex = completeIndex;
         this.odinOptions = odinOptions;
     }
 
@@ -42,7 +42,11 @@ public class SuperClassIndexer {
         JavaParser javaParser = new JavaParser(new ParserConfiguration().setLanguageLevel(
                 odinOptions.languageLevel));
         CompilationUnit compilationUnit = javaParser.parse(file).getResult().get();
-        SuperClassIndexVisitor indexVisitor = new SuperClassIndexVisitor(localIndex, TODO);
+
+        ImportVisitor importVisitor = new ImportVisitor(completeIndex);
+        importVisitor.visit(compilationUnit, null);
+
+        SuperClassIndexVisitor indexVisitor = new SuperClassIndexVisitor(localIndex, importVisitor.imports);
         indexVisitor.visit(compilationUnit, null);
     }
 }
