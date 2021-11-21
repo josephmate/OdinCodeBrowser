@@ -179,7 +179,7 @@ Below is a checklist of features odin needs.
     3. [x] [Functions within the same file (ex: putMapEntries(m, true)](http://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html#linenum784)
     3. [x] [Functions on this (ex: this.getCanonName())](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/net/SocketPermission.html#linenum621)
     1. [x] [Object instance and only one function with the name and not in super class (ex: x.getClass())](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum348)
-    1. [ ] Object instance and only one function with the name but in some super class
+    1. [x] [Object instance and only one function with the name but in some super class](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/concurrent/locks/ReentrantLock.html#linenum131)
     1. [ ] Chained method calls
     2. [ ] Functions are overloaded (different parameters)
     3. [ ] import static functions
