@@ -1,5 +1,6 @@
 import indexing.Index;
 import indexing.Indexer;
+import indexing.SuperClassIndexer;
 import indexing.UrlIndexLoader;
 import options.OdinOptions;
 import rendering.IndexHtmlRenderer;
@@ -28,21 +29,31 @@ public record Director(
     OdinOptions odinOptions
 ) {
     public void processFiles() throws IOException {
-        Index index = new UrlIndexLoader().load(odinOptions.urlsToDependantIndexJsons);
-        index.privateMethodIndex.clear();
+        Index completeIndex = new UrlIndexLoader().load(odinOptions.urlsToDependantIndexJsons);
+        // don't use private methods from dependencies
+        completeIndex.privateMethodIndex.clear();
 
         try (Stream<Path> stream = Files.walk(Paths.get(odinOptions.inputSourceDirectory))){
             List<Path> files = stream.filter(Files::isRegularFile)
                     .filter(path -> path.toString().endsWith(".java"))
                     .collect(Collectors.toList());
 
-            new Indexer(odinOptions).indexFiles(files, index);
-            new SourceHtmlRenderer(index, odinOptions).proccessFiles(files);
+            Index localIndex = new Index();
+            new Indexer(odinOptions).indexFiles(files, localIndex);
+            // need complete index for super class since we need all the imports
+            // this index will be missing the super classes which is fine. we don't
+            // need the dependencies super class mapping to calculate the super class
+            // mapping.
+            completeIndex.addAll(localIndex);
+            new SuperClassIndexer(completeIndex, odinOptions).indexFiles(files, localIndex);
+            completeIndex.addAll(localIndex);
+
+            new SourceHtmlRenderer(completeIndex, odinOptions).proccessFiles(files);
             new IndexHtmlRenderer(odinOptions).render(files);
             new IndexJsonRenderer().render(
                     odinOptions.outputDirectory + "/index.json",
                     // only export an index for the sources belonging to this project
-                    localIndex // TODO: figure this out
+                    localIndex
             );
         }
     }

@@ -74,7 +74,7 @@ public record SourceHtmlRenderer(
             String outputFile
     ) throws IOException {
         JavaParser javaParser = new JavaParser(new ParserConfiguration().setLanguageLevel(
-                languageLevel));
+                odinOptions.languageLevel));
         CompilationUnit compilationUnit = javaParser.parse(inputFile).getResult().get();
         ImportVisitor importVisitor = new ImportVisitor(index);
         importVisitor.visit(compilationUnit, null);
