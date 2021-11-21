@@ -23,18 +23,12 @@ public class SuperClassIndexVisitor extends VoidVisitorAdapter<Void> {
     public void visit(ClassOrInterfaceDeclaration classOrInterfaceDeclaration, Void arg) {
         if (classOrInterfaceDeclaration.getFullyQualifiedName().isPresent()) {
             String fullyQualifiedClassName = classOrInterfaceDeclaration.getFullyQualifiedName().get();
-
-            if (classOrInterfaceDeclaration.getExtendedTypes().size() > 1) {
-                System.out.println(fullyQualifiedClassName + " has "
-                    + classOrInterfaceDeclaration.getExtendedTypes()
-                    + " extended types");
-            }
-
             boolean found = false;
             for (ClassOrInterfaceType extension : classOrInterfaceDeclaration.getExtendedTypes()) {
-                String superClassFullyQualifiedName = importIndex.get(extension.getNameAsString());
+                String superClassFullyQualifiedName = importIndex.get(extension.getName().asString());
                 if (superClassFullyQualifiedName != null) {
                     found = true;
+                    index.addSuperClass(fullyQualifiedClassName, superClassFullyQualifiedName);
                 }
             }
 
