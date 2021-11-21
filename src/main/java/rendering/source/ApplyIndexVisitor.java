@@ -145,7 +145,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
         String className = simpleName.asString();
         if (imports.containsKey(className)) {
             String fullyQualifiedName = imports.get(className);
-            Index.FilePosition filePosition = index.get(fullyQualifiedName);
+            Index.FilePosition filePosition = index.getClass(fullyQualifiedName);
             addLink(simpleName, filePosition, "type");
         }
         super.visit(classOrInterfaceType, arg);
