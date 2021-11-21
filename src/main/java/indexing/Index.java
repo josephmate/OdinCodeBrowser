@@ -2,10 +2,7 @@ package indexing;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 public class Index {
 
@@ -120,6 +117,14 @@ public class Index {
             return null;
         }
         return methodSubMap.get(methodName);
+    }
+
+    public List<String> getSuperClasses(String fullyQualifiedClassName) {
+        List<String> result = superClassMap.get(fullyQualifiedClassName);
+        if (result == null) {
+            return Collections.emptyList();
+        }
+        return result;
     }
 
     public Map<String, FilePosition> getClassIndex() {
