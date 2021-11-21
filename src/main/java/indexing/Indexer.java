@@ -1,6 +1,8 @@
 package indexing;
 
+import com.github.javaparser.JavaParser;
 import com.github.javaparser.ParserConfiguration;
+import com.github.javaparser.ast.CompilationUnit;
 import options.OdinOptions;
 
 import java.io.IOException;
@@ -43,10 +45,24 @@ public class Indexer {
     private void indexFile(Index index, Path path) throws IOException {
         System.out.println("Indexing " + path);
         final String fileUrl = getFileUrl(path);
-        index.indexFile(
+        indexFile(
+                index,
                 path,
                 fileUrl,
                 odinOptions.languageLevel
         );
+    }
+
+    private void indexFile(
+            Index index,
+            Path inputFile,
+            String fileUrl,
+            ParserConfiguration.LanguageLevel languageLevel
+    ) throws IOException {
+        JavaParser javaParser = new JavaParser(new ParserConfiguration().setLanguageLevel(
+                languageLevel));
+        CompilationUnit compilationUnit = javaParser.parse(inputFile).getResult().get();
+        IndexVisitor indexVisitor = new IndexVisitor(index, fileUrl);
+        indexVisitor.visit(compilationUnit, null);
     }
 }

@@ -37,18 +37,6 @@ public class Index {
 
     public final Map<String, String> superClasses = new HashMap<>();
 
-    public void indexFile(
-            Path inputFile,
-            String fileUrl,
-            ParserConfiguration.LanguageLevel languageLevel
-    ) throws IOException {
-        JavaParser javaParser = new JavaParser(new ParserConfiguration().setLanguageLevel(
-                languageLevel));
-        CompilationUnit compilationUnit = javaParser.parse(inputFile).getResult().get();
-        IndexVisitor indexVisitor = new IndexVisitor(this, fileUrl);
-        indexVisitor.visit(compilationUnit, null);
-    }
-
     public void addClass(
             String fullyQualifiedName,
             String fileUrl,
@@ -108,7 +96,7 @@ public class Index {
         superClasses.put(subClassFullyQualifiedName, superClassFullyQualifiedName);
     }
 
-    public FilePosition get(String fullyQualifiedName) {
+    public FilePosition getClass(String fullyQualifiedName) {
         return classIndex.get(fullyQualifiedName);
     }
 
@@ -148,6 +136,59 @@ public class Index {
 
     public Map<String, String> getSuperClasses() {
         return superClasses;
+    }
+
+    public void addAll(Index otherIndex) {
+        for (Map.Entry<String, Index.FilePosition> entry : otherIndex.classIndex.entrySet()) {
+            String fullyQualifiedClassName = entry.getKey();
+            Index.FilePosition filePosition = entry.getValue();
+            this.addClass(
+                    fullyQualifiedClassName,
+                    filePosition.fileName(),
+                    filePosition.lineNumber()
+            );
+        }
+        for (Map.Entry<String, Map<String, Index.FilePosition>> entry : otherIndex.variableIndex.entrySet()) {
+            String fullyQualifiedClassName = entry.getKey();
+            for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
+                String variableName = entry2.getKey();
+                Index.FilePosition filePosition = entry2.getValue();
+                this.addVariable(
+                        fullyQualifiedClassName,
+                        variableName,
+                        filePosition.fileName(),
+                        filePosition.lineNumber()
+                );
+            }
+        }
+        for (Map.Entry<String, Map<String, Index.FilePosition>> entry : otherIndex.methodIndex.entrySet()) {
+            String fullyQualifiedClassName = entry.getKey();
+            for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
+                String methodName = entry2.getKey();
+                Index.FilePosition filePosition = entry2.getValue();
+                this.addMethod(
+                        fullyQualifiedClassName,
+                        methodName,
+                        filePosition.fileName(),
+                        filePosition.lineNumber()
+                );
+            }
+        }
+        for (Map.Entry<String, Map<String, Index.FilePosition>> entry : otherIndex.privateMethodIndex.entrySet()) {
+            String fullyQualifiedClassName = entry.getKey();
+            for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
+                String methodName = entry2.getKey();
+                Index.FilePosition filePosition = entry2.getValue();
+                this.addPrivateMethod(
+                        fullyQualifiedClassName,
+                        methodName,
+                        filePosition.fileName(),
+                        filePosition.lineNumber()
+                );
+            }
+        }
+
+        this.superClasses.putAll(otherIndex.getSuperClasses());
     }
 
     public record FilePosition (
