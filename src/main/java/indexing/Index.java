@@ -1,15 +1,10 @@
 package indexing;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
-import com.github.javaparser.JavaParser;
-import com.github.javaparser.ParserConfiguration;
-import com.github.javaparser.ast.CompilationUnit;
-import com.github.javaparser.ast.body.*;
-import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 
-import java.io.IOException;
-import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 public class Index {
@@ -35,7 +30,7 @@ public class Index {
      */
     public final Map<String, Map<String, FilePosition>> variableIndex = new HashMap<>();
 
-    public final Map<String, String> superClasses = new HashMap<>();
+    public final Map<String, List<String>> superClassMap = new HashMap<>();
 
     public void addClass(
             String fullyQualifiedName,
@@ -93,7 +88,12 @@ public class Index {
         String subClassFullyQualifiedName,
         String superClassFullyQualifiedName
     ) {
-        superClasses.put(subClassFullyQualifiedName, superClassFullyQualifiedName);
+        List<String> superClasses = superClasses = superClassMap.get(subClassFullyQualifiedName);
+        if (superClasses == null) {
+            superClasses = new ArrayList<>();
+            superClassMap.put(subClassFullyQualifiedName, superClasses);
+        }
+        superClasses.add(superClassFullyQualifiedName);
     }
 
     public FilePosition getClass(String fullyQualifiedName) {
@@ -134,8 +134,8 @@ public class Index {
         return variableIndex;
     }
 
-    public Map<String, String> getSuperClasses() {
-        return superClasses;
+    public Map<String, List<String>> getSuperClassMap() {
+        return superClassMap;
     }
 
     public void addAll(Index otherIndex) {
@@ -187,8 +187,17 @@ public class Index {
                 );
             }
         }
+        for (Map.Entry<String, List<String>> entry : otherIndex.superClassMap.entrySet()) {
+            String fullyQualifiedClassName = entry.getKey();
+            for (String superClass : entry.getValue()) {
+                this.addSuperClass(
+                        fullyQualifiedClassName,
+                        superClass
+                );
+            }
+        }
 
-        this.superClasses.putAll(otherIndex.getSuperClasses());
+        this.superClassMap.putAll(otherIndex.getSuperClassMap());
     }
 
     public record FilePosition (
