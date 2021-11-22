@@ -14,9 +14,8 @@ that will live much longer since the source code is available,
 and the resulting static webpages are decentralized.
 
 # Design Philosophy 
-1. No javascript
-2. No javascript!!!
-3. Each page is static
+1. Each page is static
+2. Works well without javascript
 
 # How Do I Use This
 
