@@ -1,16 +1,8 @@
 package indexing;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
-import com.github.javaparser.JavaParser;
-import com.github.javaparser.ParserConfiguration;
-import com.github.javaparser.ast.CompilationUnit;
-import com.github.javaparser.ast.body.*;
-import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 
-import java.io.IOException;
-import java.nio.file.Path;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.*;
 
 public class Index {
 
@@ -35,17 +27,7 @@ public class Index {
      */
     public final Map<String, Map<String, FilePosition>> variableIndex = new HashMap<>();
 
-    public void indexFile(
-            Path inputFile,
-            String fileUrl,
-            ParserConfiguration.LanguageLevel languageLevel
-    ) throws IOException {
-        JavaParser javaParser = new JavaParser(new ParserConfiguration().setLanguageLevel(
-                languageLevel));
-        CompilationUnit compilationUnit = javaParser.parse(inputFile).getResult().get();
-        IndexVisitor indexVisitor = new IndexVisitor(this, fileUrl);
-        indexVisitor.visit(compilationUnit, null);
-    }
+    public final Map<String, List<String>> superClassMap = new HashMap<>();
 
     public void addClass(
             String fullyQualifiedName,
@@ -99,7 +81,19 @@ public class Index {
         variableSubMap.put(variableName, filePosition);
     }
 
-    public FilePosition get(String fullyQualifiedName) {
+    public void addSuperClass(
+        String subClassFullyQualifiedName,
+        String superClassFullyQualifiedName
+    ) {
+        List<String> superClasses = superClasses = superClassMap.get(subClassFullyQualifiedName);
+        if (superClasses == null) {
+            superClasses = new ArrayList<>();
+            superClassMap.put(subClassFullyQualifiedName, superClasses);
+        }
+        superClasses.add(superClassFullyQualifiedName);
+    }
+
+    public FilePosition getClass(String fullyQualifiedName) {
         return classIndex.get(fullyQualifiedName);
     }
 
@@ -125,6 +119,14 @@ public class Index {
         return methodSubMap.get(methodName);
     }
 
+    public List<String> getSuperClasses(String fullyQualifiedClassName) {
+        List<String> result = superClassMap.get(fullyQualifiedClassName);
+        if (result == null) {
+            return Collections.emptyList();
+        }
+        return result;
+    }
+
     public Map<String, FilePosition> getClassIndex() {
         return classIndex;
     }
@@ -137,106 +139,74 @@ public class Index {
         return variableIndex;
     }
 
+    public Map<String, List<String>> getSuperClassMap() {
+        return superClassMap;
+    }
+
+    public void addAll(Index otherIndex) {
+        for (Map.Entry<String, Index.FilePosition> entry : otherIndex.classIndex.entrySet()) {
+            String fullyQualifiedClassName = entry.getKey();
+            Index.FilePosition filePosition = entry.getValue();
+            this.addClass(
+                    fullyQualifiedClassName,
+                    filePosition.fileName(),
+                    filePosition.lineNumber()
+            );
+        }
+        for (Map.Entry<String, Map<String, Index.FilePosition>> entry : otherIndex.variableIndex.entrySet()) {
+            String fullyQualifiedClassName = entry.getKey();
+            for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
+                String variableName = entry2.getKey();
+                Index.FilePosition filePosition = entry2.getValue();
+                this.addVariable(
+                        fullyQualifiedClassName,
+                        variableName,
+                        filePosition.fileName(),
+                        filePosition.lineNumber()
+                );
+            }
+        }
+        for (Map.Entry<String, Map<String, Index.FilePosition>> entry : otherIndex.methodIndex.entrySet()) {
+            String fullyQualifiedClassName = entry.getKey();
+            for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
+                String methodName = entry2.getKey();
+                Index.FilePosition filePosition = entry2.getValue();
+                this.addMethod(
+                        fullyQualifiedClassName,
+                        methodName,
+                        filePosition.fileName(),
+                        filePosition.lineNumber()
+                );
+            }
+        }
+        for (Map.Entry<String, Map<String, Index.FilePosition>> entry : otherIndex.privateMethodIndex.entrySet()) {
+            String fullyQualifiedClassName = entry.getKey();
+            for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
+                String methodName = entry2.getKey();
+                Index.FilePosition filePosition = entry2.getValue();
+                this.addPrivateMethod(
+                        fullyQualifiedClassName,
+                        methodName,
+                        filePosition.fileName(),
+                        filePosition.lineNumber()
+                );
+            }
+        }
+        for (Map.Entry<String, List<String>> entry : otherIndex.superClassMap.entrySet()) {
+            String fullyQualifiedClassName = entry.getKey();
+            for (String superClass : entry.getValue()) {
+                this.addSuperClass(
+                        fullyQualifiedClassName,
+                        superClass
+                );
+            }
+        }
+
+        this.superClassMap.putAll(otherIndex.getSuperClassMap());
+    }
+
     public record FilePosition (
         String fileName,
         int lineNumber) { }
 }
 
-class IndexVisitor extends VoidVisitorAdapter<Void> {
-
-    private final Index index;
-    private final String fileUrl;
-
-    public IndexVisitor(
-            Index index,
-            String fileUrl
-    ) {
-        this.index = index;
-        this.fileUrl = fileUrl;
-    }
-
-    @Override
-    public void visit(ClassOrInterfaceDeclaration classOrInterfaceDeclaration, Void arg) {
-        if (classOrInterfaceDeclaration.getFullyQualifiedName().isPresent()) {
-            index.addClass(
-                    classOrInterfaceDeclaration.getFullyQualifiedName().get(),
-                    fileUrl,
-                    classOrInterfaceDeclaration.getRange().get().begin.line
-            );
-        }
-        super.visit(classOrInterfaceDeclaration, arg);
-    }
-
-    @Override
-    public void visit(RecordDeclaration recordDeclaration, Void arg) {
-        if (recordDeclaration.getFullyQualifiedName().isPresent()) {
-            index.addClass(
-                    recordDeclaration.getFullyQualifiedName().get(),
-                    fileUrl,
-                    recordDeclaration.getRange().get().begin.line
-            );
-        }
-        super.visit(recordDeclaration, arg);
-    }
-
-    @Override
-    public void visit(EnumDeclaration enumDeclaration, Void arg) {
-        if (enumDeclaration.getFullyQualifiedName().isPresent()) {
-            index.addClass(
-                    enumDeclaration.getFullyQualifiedName().get(),
-                    fileUrl,
-                    enumDeclaration.getRange().get().begin.line
-            );
-        }
-        super.visit(enumDeclaration, arg);
-    }
-
-    @Override
-    public void visit(MethodDeclaration methodDeclaration, Void arg) {
-        String methodName = methodDeclaration.getName().asString();
-        if (methodDeclaration.getParentNode().isPresent()
-                && methodDeclaration.getParentNode().get() instanceof ClassOrInterfaceDeclaration
-        ) {
-            ClassOrInterfaceDeclaration classOrInterfaceDeclaration = (ClassOrInterfaceDeclaration) methodDeclaration.getParentNode().get();
-            if (classOrInterfaceDeclaration.getFullyQualifiedName().isPresent()) {
-                if (methodDeclaration.isPrivate()) {
-                    index.addPrivateMethod(
-                            classOrInterfaceDeclaration.getFullyQualifiedName().get(),
-                            methodName,
-                            fileUrl,
-                            methodDeclaration.getRange().get().begin.line
-                    );
-                } else {
-                    index.addMethod(
-                            classOrInterfaceDeclaration.getFullyQualifiedName().get(),
-                            methodName,
-                            fileUrl,
-                            methodDeclaration.getRange().get().begin.line
-                    );
-                }
-            }
-        }
-        super.visit(methodDeclaration, arg);
-    }
-
-    public void visit(FieldDeclaration fieldDeclaration, Void arg) {
-        if (fieldDeclaration.getParentNode().isPresent()
-                && fieldDeclaration.getParentNode().get() instanceof ClassOrInterfaceDeclaration
-        ) {
-            ClassOrInterfaceDeclaration classOrInterfaceDeclaration = (ClassOrInterfaceDeclaration) fieldDeclaration.getParentNode().get();
-            if (classOrInterfaceDeclaration.getFullyQualifiedName().isPresent()) {
-                if (!fieldDeclaration.isPrivate()) {
-                    for (VariableDeclarator vd : fieldDeclaration.getVariables()) {
-                        index.addVariable(
-                                classOrInterfaceDeclaration.getFullyQualifiedName().get(),
-                                vd.getNameAsString(),
-                                fileUrl,
-                                fieldDeclaration.getRange().get().begin.line
-                        );
-                    }
-                }
-            }
-        }
-        super.visit(fieldDeclaration, arg);
-    }
-}

@@ -12,7 +12,7 @@ import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 import indexing.Index;
 
-import java.util.Map;
+import java.util.*;
 
 /**
  * Applies the Index to the source code by recording the changes that are need
@@ -145,7 +145,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
         String className = simpleName.asString();
         if (imports.containsKey(className)) {
             String fullyQualifiedName = imports.get(className);
-            Index.FilePosition filePosition = index.get(fullyQualifiedName);
+            Index.FilePosition filePosition = index.getClass(fullyQualifiedName);
             addLink(simpleName, filePosition, "type");
         }
         super.visit(classOrInterfaceType, arg);
@@ -156,9 +156,9 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
         if (methodCallExpr.getScope().isPresent()) {
             Expression scope = methodCallExpr.getScope().get();
             if (scope instanceof StringLiteralExpr) {
-                handleClassName("java.lang.String", methodSimpleName, false);
+                handleClassMethod("java.lang.String", methodSimpleName, false);
             } else if (scope instanceof ClassExpr) {
-                handleClassName("java.lang.Class", methodSimpleName, false);
+                handleClassMethod("java.lang.Class", methodSimpleName, false);
             } else if (scope instanceof NameExpr) {
                 NameExpr nameExpr = (NameExpr) scope;
                 // example System.getProperty()
@@ -175,7 +175,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                     // trying Class index
                     fullyQualifiedClassName = imports.get(nameExpr.getName().asString());
                 }
-                handleClassName(fullyQualifiedClassName, methodSimpleName, false);
+                handleClassMethod(fullyQualifiedClassName, methodSimpleName, false);
             } else if (scope instanceof MethodCallExpr) {
                 // method call chaining
                 // example indexMap.entrySet().iterator()
@@ -187,7 +187,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                 methodCallExpr.getNameAsString();
             } else if (scope instanceof ThisExpr) {
                 // this.size()
-                handleClassName(currentClassName, methodSimpleName, true);
+                handleClassMethod(currentClassName, methodSimpleName, true);
             } else if (scope instanceof FieldAccessExpr) {
                 // this.data.clone()
                 methodCallExpr.getNameAsString();
@@ -205,12 +205,12 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
             }
         } else {
             // method call within the same class
-            handleClassName(currentClassName, methodSimpleName, true);
+            handleClassMethod(currentClassName, methodSimpleName, true);
         }
         super.visit(methodCallExpr, arg);
     }
 
-    private boolean handleClassName(
+    private boolean handleClassMethod(
             String fullyQualifiedClassName,
             SimpleName methodSimpleName,
             boolean includePrivates
@@ -224,18 +224,49 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                 );
             }
             addLink(methodSimpleName, filePosition, "type");
-
             if (filePosition != null) {
                 return true;
             }
-            filePosition = index.getMethod(
+
+            // try class and super classes
+            return searchForMethodInClassAndSuperClasses(
                     fullyQualifiedClassName,
+                    methodSimpleName
+            );
+        }
+        return false;
+    }
+
+    private boolean searchForMethodInClassAndSuperClasses(
+            String fullyQualifiedClassName,
+            SimpleName methodSimpleName
+    ) {
+        Set<String> visited = new HashSet<>();
+        Queue<String> bfsQueue = new ArrayDeque<>();
+        bfsQueue.add(fullyQualifiedClassName);
+
+        while (!bfsQueue.isEmpty()) {
+            String currentFullyQualifiedClassName = bfsQueue.poll();
+            visited.add(currentFullyQualifiedClassName);
+
+            Index.FilePosition filePosition = index.getMethod(
+                    currentFullyQualifiedClassName,
                     methodSimpleName.asString()
             );
             addLink(methodSimpleName, filePosition, "type");
+            if (filePosition != null) {
+                return true;
+            }
 
-            return filePosition != null;
+            // add super classes to search
+            for (String fullyQualifiedSuperClassName : index.getSuperClasses(currentFullyQualifiedClassName)) {
+                if (!visited.contains(fullyQualifiedSuperClassName)) {
+                    bfsQueue.add(fullyQualifiedSuperClassName);
+                }
+            }
         }
+
+        // exhausted all super classes
         return false;
     }
 

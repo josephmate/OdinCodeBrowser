@@ -1,24 +1,41 @@
 package rendering;
 
-import javax.annotation.Nonnull;
-import javax.annotation.Nullable;
+import options.OdinOptions;
+
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Collection;
 import java.util.Map;
 import java.util.SortedMap;
+import java.util.TreeMap;
 
 /**
  * Creates an html file listing out all the class files in the repository.
  */
 public class IndexHtmlRenderer {
 
+    private final OdinOptions odinOptions;
+
+    public IndexHtmlRenderer(
+            OdinOptions odinOptions
+    ) {
+        this.odinOptions = odinOptions;
+    }
+
     public void render(
-            @Nonnull String outputFile,
-            @Nonnull String webPathToCssFile,
-            @Nullable String multiRepoRoot,
-            @Nonnull SortedMap<String,String> javaFileToHtmlFile
+            Collection<Path> paths
     ) throws IOException {
+        SortedMap<String, String> javaFileToHtmlFile = new TreeMap<>();
+        for (Path path : paths) {
+            javaFileToHtmlFile.put(
+                    path.toString().replace(odinOptions.inputSourceDirectory, ""),
+                    getFileUrl(path)
+            );
+        }
+        final String outputFile = odinOptions.outputDirectory + "/index.html";
+
         StringBuilder sb = new StringBuilder();
         sb.append(
                 String.format(
@@ -30,18 +47,18 @@ public class IndexHtmlRenderer {
                             </head>
                         <body>
                         """,
-                        webPathToCssFile
+                        odinOptions.webPathToCssFile
                 )
         );
 
-        if (multiRepoRoot != null) {
+        if (odinOptions.multiRepoRoot != null) {
             sb.append(String.format(
                     """
                     <div>
                         <a class="index-link" href="%s">Back to list of repositories...</a>
                     </div>
                     """,
-                    multiRepoRoot
+                    odinOptions.multiRepoRoot
             ));
         }
 
@@ -64,4 +81,13 @@ public class IndexHtmlRenderer {
         Files.writeString(Paths.get(outputFile), sb.toString());
     }
 
+    private String getFileUrl(Path javaSourceFile) {
+        return odinOptions.webPathToSourceHtmlFiles
+                + (
+                javaSourceFile.toString()
+                        .substring(0, javaSourceFile.toString().length()-5)
+                        .replace(odinOptions.inputSourceDirectory, "")
+                        + ".html"
+        );
+    }
 }
