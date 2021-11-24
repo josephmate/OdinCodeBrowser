@@ -20,11 +20,12 @@ and the resulting static webpages are decentralized.
 # How Do I Use This
 
 ## As a code browser
-1. Find a project you like from [this list of supported repos](https://josephmate.github.io/OdinCodeBrowser/)
+1. Find a project you want to browse from [this list of supported repos](https://josephmate.github.io/OdinCodeBrowser/)
 1. Go to the list of all classes [(ex: Apache Commons Text)](https://josephmate.github.io/OdinCodeBrowser/jdk8/)
 2. Find your class (ex: A class Odin uses 
    [StringEscapeUtils](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html))
-3. Start reading code and navigating by clicking on the links
+3. Start reading code and navigating by clicking on the links, which are
+   underlined.
 
 ## As a code owner
 ```
@@ -35,7 +36,7 @@ args="$args --outputDirectory <output_directory>"
 args="$args --webPathToCssFile https://josephmate.github.io/OdinCodeBrowser/css/styles.css"
 args="$args --webPathToSourceHtmlFiles <directory_on_webserver>"
 args="$args --languageLevel JAVA_16"
-args="$args --urlToDependantIndexJson <url_of_dependencies_index_file>"
+args="$args --urlToDependantIndexJson <url_of_dependencies_index_json_file>"
 mvn install exec:java \
   -Dexec.mainClass=Main \
   -Dexec.args="$args"
