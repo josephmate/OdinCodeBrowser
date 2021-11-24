@@ -54,17 +54,23 @@ public record SourceHtmlRenderer(
         );
     }
 
-    public void proccessFiles(Collection<Path> files) throws IOException {
+    public void proccessFiles(
+            String inputDirectory,
+            Collection<Path> files
+    ) throws IOException {
         for (Path path : files) {
-            processFile(path);
+            processFile(inputDirectory, path);
         }
     }
 
-    private void processFile(Path path) throws IOException {
+    private void processFile(
+            String inputDirectory,
+            Path path
+    ) throws IOException {
         System.out.println("Rendering " + path);
         final String destinationStr = path.toString()
                 .substring(0, path.toString().length()-5)
-                .replace(odinOptions.inputSourceDirectory, odinOptions.outputDirectory)
+                .replace(inputDirectory, odinOptions.outputDirectory)
                 + ".html";
         renderFile(path, destinationStr);
     }

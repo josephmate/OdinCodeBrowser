@@ -14,9 +14,16 @@ public class OdinOptions {
         usage= """
                The directory contain the source code. For instance,
                if you had a maven project, it would probably be
-               <project_root>/src/main/java
+               <project_root>/src/main/java. You can specifiy multiple
+               directories typing multiple --inputSourceDirectory parameters.
+               You should specify the all the dependant directories before
+               specifying the directory. For instance in jdk17 you type something
+               like
+               --inputSourceDirectory src/java.base/share/classes
+               --inputSourceDirectory src/java.sql/share/classses
+               --inputSourceDirectory src/java.sql.rowset/share/classses
                """)
-    public String inputSourceDirectory;
+    public List<String> inputSourceDirectories;
 
     @Option(name="--outputDirectory",
             required = true,

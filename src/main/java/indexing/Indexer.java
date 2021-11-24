@@ -20,31 +20,39 @@ public class Indexer {
     }
 
     public void indexFiles(
+            String inputDirectory,
             Collection<Path> paths,
             Index index
     ) {
         for (Path path: paths) {
             try {
-                indexFile(index, path);
+                indexFile(inputDirectory, index, path);
             } catch (Exception e) {
                 throw new RuntimeException("Error processing " + path, e);
             }
         }
     }
 
-    private String getFileUrl(Path javaSourceFile) {
+    private String getFileUrl(
+            String inputSourceDirectory,
+            Path javaSourceFile
+    ) {
         return odinOptions.webPathToSourceHtmlFiles
                 + (
                 javaSourceFile.toString()
                         .substring(0, javaSourceFile.toString().length()-5)
-                        .replace(odinOptions.inputSourceDirectory, "")
+                        .replace(inputSourceDirectory, "")
                         + ".html"
         );
     }
 
-    private void indexFile(Index index, Path path) throws IOException {
+    private void indexFile(
+            String inputDirectory,
+            Index index,
+            Path path
+    ) throws IOException {
         System.out.println("Indexing " + path);
-        final String fileUrl = getFileUrl(path);
+        final String fileUrl = getFileUrl(inputDirectory, path);
         indexFile(
                 index,
                 path,
