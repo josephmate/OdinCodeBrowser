@@ -180,6 +180,7 @@ Below is a checklist of features odin needs.
     3. [x] [Functions on this (ex: this.getCanonName())](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/net/SocketPermission.html#linenum621)
     1. [x] [Object instance and only one function with the name and not in super class (ex: x.getClass())](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum348)
     1. [x] [Object instance and only one function with the name but in some super class](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/concurrent/locks/ReentrantLock.html#linenum131)
+    1. [x] [super.method() (super.clone() in HashMap)](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum1318)
     1. [ ] Chained method calls
     2. [ ] Functions are overloaded (different parameters)
     3. [ ] import static functions
@@ -195,7 +196,8 @@ Below is a checklist of features odin needs.
     1. [x] [static field var](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum384)
     1. [ ] Enum value
     1. [ ] this.field
-    1. [ ] Class then variable (ex: System.out)
+    1. [ ] record.value
+    1. [ ] static variable (ex: System.out)
     1. [ ] variable chaining (ex: a.b.c.d)
 6. [ ] Click on method to get a list of implementations
 7. [ ] Click on Override takes you to nearest super class's method that was overridden
