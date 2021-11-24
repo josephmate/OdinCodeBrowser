@@ -185,6 +185,8 @@ Below is a checklist of features odin needs.
     2. [ ] Functions are overloaded (different parameters)
     3. [ ] import static functions
     3. [ ] Record getter functions
+    2. [ ] Super constructors
+    2. [ ] Overloaded constructors
     3. [ ] Scoping rules (if names are duplicated in mulitple scopes, need to use the closest scope)
     4. [x] [String literal method calls (ex: "true".equals(blah))](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/BeanInfoFinder.html)
     4. [x] [class literal method calls (ex: boolean.class.getName())](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/PrimitiveTypeMap.html#linenum54)
