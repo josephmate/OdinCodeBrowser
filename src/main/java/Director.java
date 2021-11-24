@@ -37,11 +37,12 @@ public record Director(
 
         List<Pair<String, List<Path>>> processOrder = new ArrayList<>();
         for (String inputSourceDirectory : odinOptions().inputSourceDirectories) {
-            try (Stream<Path> stream = Files.walk(Paths.get(inputSourceDirectory))){
+            try (Stream<Path> stream = Files.walk(Paths.get(inputSourceDirectory))) {
                 List<Path> files = stream.filter(Files::isRegularFile)
                         .filter(path -> path.toString().endsWith(".java"))
                         .collect(Collectors.toList());
-            processOrder.add(Pair.of(inputSourceDirectory, files));
+                processOrder.add(Pair.of(inputSourceDirectory, files));
+            }
         }
 
         Index localIndex = new Index();
@@ -75,7 +76,6 @@ public record Director(
                 // only export an index for the sources belonging to this project
                 localIndex
         );
-        }
     }
 
 }

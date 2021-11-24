@@ -20,6 +20,9 @@ public class OdinOptions {
                specifying the directory. For instance in jdk17 you type something
                like
                --inputSourceDirectory src/java.base/share/classes
+               --inputSourceDirectory src/java.logging/share/classses
+               --inputSourceDirectory src/java.xml/share/classses
+               --inputSourceDirectory src/java.transactions.xa/share/classses
                --inputSourceDirectory src/java.sql/share/classses
                --inputSourceDirectory src/java.sql.rowset/share/classses
                """)
