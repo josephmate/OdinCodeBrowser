@@ -1,15 +1,13 @@
 package rendering;
 
 import options.OdinOptions;
+import org.apache.commons.lang3.tuple.Pair;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.Collection;
-import java.util.Map;
-import java.util.SortedMap;
-import java.util.TreeMap;
+import java.util.*;
 
 /**
  * Creates an html file listing out all the class files in the repository.
@@ -25,14 +23,16 @@ public class IndexHtmlRenderer {
     }
 
     public void render(
-            Collection<Path> paths
+            Collection<Pair<String, List<Path>>> processingOrder
     ) throws IOException {
         SortedMap<String, String> javaFileToHtmlFile = new TreeMap<>();
-        for (Path path : paths) {
-            javaFileToHtmlFile.put(
-                    path.toString().replace(odinOptions.inputSourceDirectory, ""),
-                    getFileUrl(path)
-            );
+        for(Pair<String, List<Path>> currentlyProcessing : processingOrder) {
+            for (Path path : currentlyProcessing.getRight()) {
+                javaFileToHtmlFile.put(
+                        path.toString().replace(currentlyProcessing.getLeft(), ""),
+                        getFileUrl(currentlyProcessing.getLeft(), path)
+                );
+            }
         }
         final String outputFile = odinOptions.outputDirectory + "/index.html";
 
@@ -81,12 +81,15 @@ public class IndexHtmlRenderer {
         Files.writeString(Paths.get(outputFile), sb.toString());
     }
 
-    private String getFileUrl(Path javaSourceFile) {
+    private String getFileUrl(
+            String inputSourceDirectory,
+            Path javaSourceFile
+    ) {
         return odinOptions.webPathToSourceHtmlFiles
                 + (
                 javaSourceFile.toString()
                         .substring(0, javaSourceFile.toString().length()-5)
-                        .replace(odinOptions.inputSourceDirectory, "")
+                        .replace(inputSourceDirectory, "")
                         + ".html"
         );
     }

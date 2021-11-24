@@ -254,5 +254,7 @@ Below is a checklist of features odin needs.
 10. [ ] Render javadoc as text like in Intellij
 10. [ ] Link to native code
 10. [ ] navigation comparison between Odin, IDE, and GitHub
-
+10. [ ] Figure out how to support repos with multiple source directories
+10. [ ] Figure out a better release process other than having a developer clone the project and use the `mvn exec:java` goal.
+    1. [x] Tried fatJar but does not work well with java 16
 
