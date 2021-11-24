@@ -199,7 +199,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                 methodCallExpr.getNameAsString();
             } else if (scope instanceof SuperExpr) {
                 // super.detach()
-                methodCallExpr.getNameAsString();
+                searchForMethodInClassAndSuperClasses(currentClassName, methodSimpleName, true);
             } else {
                 System.out.println("Unrecognized expression: " + methodCallExpr);
             }
@@ -231,7 +231,8 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
             // try class and super classes
             return searchForMethodInClassAndSuperClasses(
                     fullyQualifiedClassName,
-                    methodSimpleName
+                    methodSimpleName,
+                    false
             );
         }
         return false;
@@ -239,11 +240,17 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
 
     private boolean searchForMethodInClassAndSuperClasses(
             String fullyQualifiedClassName,
-            SimpleName methodSimpleName
+            SimpleName methodSimpleName,
+            boolean skipCurrentClass
     ) {
         Set<String> visited = new HashSet<>();
         Queue<String> bfsQueue = new ArrayDeque<>();
-        bfsQueue.add(fullyQualifiedClassName);
+        if (skipCurrentClass) {
+            visited.add(fullyQualifiedClassName);
+            bfsQueue.addAll(index.getSuperClasses(fullyQualifiedClassName));
+        } else {
+            bfsQueue.add(fullyQualifiedClassName);
+        }
 
         while (!bfsQueue.isEmpty()) {
             String currentFullyQualifiedClassName = bfsQueue.poll();
