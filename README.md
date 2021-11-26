@@ -150,7 +150,7 @@ since it is really difficult for reader to change the styles.
 In order for someone to change the style, they will need to install a plugin for
 their brorwser and override odin's css styles.
 
-# Feature List
+# Future Work
 
 Below is a checklist of features odin needs.
 
