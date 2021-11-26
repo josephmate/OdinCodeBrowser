@@ -1,9 +1,9 @@
 # Odin Code Browser
 
 This project attempts to create a completely static website of your source code,
-implementing navigate using anchors and links. The goal is to be as good as
-navigating code as in Intellij.
-See a sample by starting navigation from
+that navigates all the down to the depth of the JDK.
+The goal is to navigate as well as Intellij.
+Try it youself by navigating from
 [Apache Commons Text's StringEscapeUtils](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html).
 
 # Motivation
@@ -108,7 +108,7 @@ The two features together that sets Odin apart from an IDE and GitHub:
 
 
 
-Explanation of each:
+Explanation of criteria:
 
 * **Shares links**: In Odin and GitHub you can share links to any line in the code.
   An IDE does not let you do that.
@@ -141,6 +141,19 @@ Explanation of each:
   as GitHub. Since Odin pages are static without javascript, it's impossible to
   have commenting.
 
+# How it Works
+
+1. I use [Github's JavaParser](https://github.com/javaparser/javaparser) to
+   visit nodes in the Java AST.
+2. Through visiting, I build indexes of classes, their methods, their fields,
+   and their super classes.
+3. Through more visited, I look if there's anything in the index I can create
+   navigation links to and place these into a map of Line number to character
+   index, to String to insert. I call this a 'Rendering Queue' even though it's
+   a map.
+4. I iterate over the code char by checking if I need to insert anything.
+5. All of these are saved as HTML files.
+
 # Color Scheme
 
 The colorscheme is based on [vim-dichromatic](https://github.com/romainl/vim-dichromatic)
@@ -149,6 +162,8 @@ I wanted a single color scheme that could be used by anyone,
 since it is really difficult for reader to change the styles.
 In order for someone to change the style, they will need to install a plugin for
 their brorwser and override odin's css styles.
+Maybe in the future there will be some javascript to select from a list of
+styles that writes to your browser's local storage.
 
 # Future Work
 
@@ -218,6 +233,10 @@ Below is a checklist of features odin needs.
 9. [ ] Click on variable definition to get all usages
 9. [ ] Click on class/interface definition to get all subtypes
 9. [ ] Click on method definition to get all overrides and impls
+9. [ ] List of functions and fields at the side of the page.
+    1. [ ] List of functions within this class, grouped by visibility
+    1. [ ] List of fields within this class
+    1. [ ] List of functions and fields from super classes
 9. [x] Multi repository support (ex: browsing guava but also linking to JDK8)
     1. [x] Repository exposes it's index file as json
     1. [x] Build loads index files, then builds it own index
