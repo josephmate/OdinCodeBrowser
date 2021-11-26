@@ -2,11 +2,14 @@
 
 This project attempts to create a completely static website of your source code,
 implementing navigate using anchors and links. The goal is to be as good as
-navigating code as in Intellij. See a sample
+navigating code as in Intellij.
+See a sample
 [here](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html).
 
 # Motivation
-I used grepcode at least once a week and I am sad to see it go.
+I used 
+[grepcode](https://web.archive.org/web/20150318024036/http://www.grepcode.com/)
+at least once a week and I am sad to see it go.
 It's navigation was almost as good as an IDE.
 You could navigate from apache commons all the way down to the JDK.
 I hope that I can create a spiritual successor by using this tool,
@@ -93,11 +96,11 @@ The two features together that sets Odin apart from an IDE and GitHub:
 | Shares links             | ✅   | ❌  | ✅     |
 | Minimal CPU Usage        | ✅   | ❌  | ✅     |
 | Minimal Memory Usage     | ✅   | ❌  | ✅     |
-| Minamal Storage Usage    | ✅   | ❌  | ✅     |
+| Minimal Storage Usage    | ✅   | ❌  | ✅     |
 | Realtime                 | ❌   | ✅  | ❌     |
 | Automatically Applied    | ❌   | ✅  | ✅     |
-| Static Pages             | ✅   |     | ❌     |
-| No javascript            | ✅   |     | ❌     |
+| Static Pages             | ✅   |     | ?      |
+| Works without javascript | ✅   |     | ❌     |
 | Navigate to dependencies | ✅   | ✅  | ❌     |
 | Comment on code          | ❌   | ✅  | ✅     |
 | Navigatation Complete    | ❌   | ✅  | ❌     |
@@ -111,7 +114,9 @@ Explanation of each:
 * **Minimal CPU/Memory/Storage Usage**: Since Odin and GitHub are not realtime, no cpu, memory or
   diskspace is needed by the client to efficiently calculate all the indexes.
 * **Realtime** As you make changes in an IDE, the indexes are update and
-  you can navigate to the new code changes or new dependencies.
+  you can navigate to the new code changes or new dependencies. For GitHub you
+  need to commit and push before the navigation updates. For Odin you need to
+  run this tool and publish the generated html files.
 * **Automatically Applied**: By rebuilding in the IDE, new code is recognized.
   By commiting and pushing your changes to GitHub, the navigation is updated.
   For Odin, you must manually build and publish the static webpages. You
@@ -126,8 +131,11 @@ Explanation of each:
   repository.
 * **Navigation Complete**: anything you could possibly want to navigate to or
   from in an IDE works. Odin is working on matching an IDE and might reach the
-  same level one day. GitHub navigation is also not as good.
-* **Comment on code**: GitHub is probably the best for comment and discussing
+  same level one day. GitHub navigation is okay. It gives you a list of options
+  as a pop. Odin tries to be like an IDE and take you directly to the
+  definition of the variable or method without asking you which one. For now,
+  Odin sometimes makes mistakes due to method overloading.
+* **Comment on code**: GitHub is probably the best for commenting and discussing
   code. You can also do this in an IDE with plugins, but it's not as convenient
   as GitHub. Since Odin pages are static without javascript, it's impossible to
   have commenting.
