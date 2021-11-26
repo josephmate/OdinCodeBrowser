@@ -3,8 +3,8 @@
 This project attempts to create a completely static website of your source code,
 implementing navigate using anchors and links. The goal is to be as good as
 navigating code as in Intellij.
-See a sample
-[here](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html).
+See a sample by starting navigation from
+[Apache Commons Text's StringEscapeUtils](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html).
 
 # Motivation
 I used 
@@ -12,6 +12,7 @@ I used
 at least once a week and I am sad to see it go.
 It's navigation was almost as good as an IDE.
 You could navigate from apache commons all the way down to the JDK.
+Occasionally, I would forget what I was originally doing and get lost in the depths of the JDK.
 I hope that I can create a spiritual successor by using this tool,
 that will live much longer since the source code is available,
 and the resulting static webpages are decentralized.
