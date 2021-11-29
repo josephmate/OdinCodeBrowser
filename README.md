@@ -141,6 +141,26 @@ Explanation of criteria:
   as GitHub. Since Odin pages are static without javascript, it's impossible to
   have commenting.
 
+
+## Other Alternatives
+
+These are alternatives that I do not use on a daily basis so I do not feel qualified in giving a thoughtful review.
+However, I'm going to help you find what you're looking for.
+
+**[woboq](https://code.woboq.org/)** : Looks exactly what I'm trying to achieve, but for C++ instead of Java.
+If you're working on on open source C/C++ , I recommend checking it out.
+
+**Opengrok**: Provides much better searching than what Odin can provide.
+However, as a result some components cannot be hosted as static files.
+If you can run Opengrok for your project, I recommended it.
+
+**[Sourcegraph](https://sourcegraph.com/searh)**:
+The search is really good.
+It reminds me of Github's search.
+However, [they aren't indexing OdinCodeBrowser yet.](https://sourcegraph.com/search?q=context:global+repo:%5Egithub%5C.com/josephmate/.*+&patternType=literal).
+I'm not sure what triggers the indexing because some of my old side projects are there.
+
+
 # How it Works
 
 1. I use [Github's JavaParser](https://github.com/javaparser/javaparser) to
@@ -153,6 +173,11 @@ Explanation of criteria:
    a map.
 4. I iterate over the code char by checking if I need to insert anything.
 5. All of these are saved as HTML files.
+6. The index is saved as a json file for other repos to use. That way they do
+   not have to checkout the source code and build the index of all the
+   dependencies. It also allows the repositories to independendtly host
+   their source code and allows dependers to navigate from their code host
+   on their servers to the code hosted on the dependency's servers.
 
 # Color Scheme
 
