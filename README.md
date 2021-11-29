@@ -3,7 +3,7 @@
 This project attempts to create a completely static website of your source code,
 that navigates all the down to the depth of the JDK.
 The goal is to navigate as well as Intellij.
-Try it youself by navigating from
+Try it yourself by navigating from
 [Apache Commons Text's StringEscapeUtils](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html).
 
 # Motivation
@@ -15,7 +15,7 @@ You could navigate from apache commons all the way down to the JDK.
 Occasionally, I would forget what I was originally doing and get lost in the depths of the JDK.
 I hope that I can create a spiritual successor by using this tool,
 that will live much longer since the source code is available,
-and the resulting static webpages are decentralized.
+and the resulting static web pages are decentralized.
 
 # Design Philosophy 
 1. Each page is static
@@ -78,16 +78,16 @@ For example I did
 However, sometimes you'll pick a class that does not have a path to HashMap :(.
 
 # Alternatives
-Your Java IDE can do a much better job. As I was write this project, I
-use Intellij to navigate from my projects code to the code of the projects I
-depend on. The experience is so much better in the IDE and you should use that.
+Your Java IDE can do a much better job.
+As I write this project, I use Intellij to navigate from my project's code to the code of the projects I depend on.
+The experience is so much better in the IDE and you should use that.
 If you are already using your IDE, keep using it!
 
 If you don't use an IDE then github provides some support for navigating code without any extra effort.
 Just commit your code as you normally do and github updates the navigation.
 
 The two features together that sets Odin apart from an IDE and GitHub:
-1. [x] sharing links to the code (can't do this in an IDE). Since it's webpage,
+1. [x] sharing links to the code (can't do this in an IDE). Since it's a web page,
    this means you can use it on low memory devices like your phone!
 2. [x] can link to the dependant sources as well (github can't do this)
 
@@ -104,7 +104,7 @@ The two features together that sets Odin apart from an IDE and GitHub:
 | Works without javascript | ✅   |     | ❌     |
 | Navigate to dependencies | ✅   | ✅  | ❌     |
 | Comment on code          | ❌   | ✅  | ✅     |
-| Navigatation Complete    | ❌   | ✅  | ❌     |
+| Navigation Complete      | ❌   | ✅  | ❌     |
 
 
 
@@ -113,20 +113,20 @@ Explanation of criteria:
 * **Shares links**: In Odin and GitHub you can share links to any line in the code.
   An IDE does not let you do that.
 * **Minimal CPU/Memory/Storage Usage**: Since Odin and GitHub are not realtime, no cpu, memory or
-  diskspace is needed by the client to efficiently calculate all the indexes.
-* **Realtime** As you make changes in an IDE, the indexes are update and
+  disk space is needed by the client to efficiently calculate all the indexes.
+* **Realtime** As you make changes in an IDE, the indexes are updated and
   you can navigate to the new code changes or new dependencies. For GitHub you
   need to commit and push before the navigation updates. For Odin you need to
   run this tool and publish the generated html files.
 * **Automatically Applied**: By rebuilding in the IDE, new code is recognized.
-  By commiting and pushing your changes to GitHub, the navigation is updated.
-  For Odin, you must manually build and publish the static webpages. You
-  unforutnately need to manage this. GitHub and and IDE manage this for you with
+  By committing and pushing your changes to GitHub, the navigation is updated.
+  For Odin, you must manually build and publish the static web pages. You
+  unfortunately need to manage this. GitHub and an IDE manage this for you with
   no effort on your part.
-* **Static Pages**: Odin's output is hosted as static webpage that can be
+* **Static Pages**: Odin's output is hosted as static web pages that can be
   efficiently distributed. This comparison doesn't make sense for an IDE.
 * **No javascript**: Odin doesn't use javascript while GitHub needs to.
-* **Navigate to dependencies**: IDE and seemlessly navigate to your
+* **Navigate to dependencies**: IDE and seamlessly navigate to your
   dependencies. Odin plans to navigate to dependencies when you build. It will
   not be as convenient as an IDE. GitHub only lets you navigate within the same
   repository.
@@ -148,18 +148,18 @@ These are alternatives that I do not use on a daily basis so I do not feel quali
 However, I'm going to help you find what you're looking for.
 
 **[woboq](https://code.woboq.org/)** : Looks exactly what I'm trying to achieve, but for C++ instead of Java.
-If you're working on on open source C/C++ , I recommend checking it out.
+If you're working on open source C/C++ , I recommend checking it out.
 
 **Opengrok**: Provides much better searching than what Odin can provide.
 However, as a result some components cannot be hosted as static files.
-If you can run Opengrok for your project, I recommended it.
+If you host Opengrok for your project, I recommend it.
 
 **[Sourcegraph](https://sourcegraph.com/searh)**:
 The search is really good.
-It reminds me of Github's search.
+It like a super powered Github search.
 However, [they aren't indexing OdinCodeBrowser yet.](https://sourcegraph.com/search?q=context:global+repo:%5Egithub%5C.com/josephmate/.*+&patternType=literal).
 I'm not sure what triggers the indexing because some of my old side projects are there.
-
+Also, it does not support cross repo navigation.
 
 # How it Works
 
@@ -167,38 +167,36 @@ I'm not sure what triggers the indexing because some of my old side projects are
    visit nodes in the Java AST.
 2. Through visiting, I build indexes of classes, their methods, their fields,
    and their super classes.
-3. Through more visited, I look if there's anything in the index I can create
-   navigation links to and place these into a map of Line number to character
-   index, to String to insert. I call this a 'Rendering Queue' even though it's
-   a map.
+3. Through one more visit, I look to see if there's anything in the index I can create
+   navigation links to and place these into a 'Rendering Queue'.
 4. I iterate over the code char by checking if I need to insert anything.
 5. All of these are saved as HTML files.
 6. The index is saved as a json file for other repos to use. That way they do
    not have to checkout the source code and build the index of all the
-   dependencies. It also allows the repositories to independendtly host
-   their source code and allows dependers to navigate from their code host
+   dependencies. It also allows the repositories to independently host
+   their source code and allows dependents to navigate from their code host
    on their servers to the code hosted on the dependency's servers.
 
 # Color Scheme
 
-The colorscheme is based on [vim-dichromatic](https://github.com/romainl/vim-dichromatic)
+The color scheme is based on [vim-dichromatic](https://github.com/romainl/vim-dichromatic)
 put together by [Romain Lafourcade](https://github.com/romainl).
-I wanted a single color scheme that could be used by anyone,
-since it is really difficult for reader to change the styles.
+I wanted a single color scheme that could be used by anyone, 
+since it is really difficult for readers to change the styles.
 In order for someone to change the style, they will need to install a plugin for
-their brorwser and override odin's css styles.
+their browser and override Odin's css styles.
 Maybe in the future there will be some javascript to select from a list of
 styles that writes to your browser's local storage.
 
 # Future Work
 
-Below is a checklist of features odin needs.
+Below is a checklist of features Odin needs.
 
 1. [x] Line numbers with links
 2. [ ] Code is easily copy and pastable
     1. [x] Code is copy and pastable 
     2. [ ] Copied code is exactly the same as pasted code
-3. [x] Click on a Type to navigate to the defintion of that type
+3. [x] Click on a Type to navigate to the definition of that type
     1. Type
         1. [x] Interface
         1. [x] Annotation
@@ -236,7 +234,7 @@ Below is a checklist of features odin needs.
     3. [ ] Record getter functions
     2. [ ] Super constructors
     2. [ ] Overloaded constructors
-    3. [ ] Scoping rules (if names are duplicated in mulitple scopes, need to use the closest scope)
+    3. [ ] Scoping rules (if names are duplicated in multiple scopes, need to use the closest scope)
     4. [x] [String literal method calls (ex: "true".equals(blah))](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/BeanInfoFinder.html)
     4. [x] [class literal method calls (ex: boolean.class.getName())](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/PrimitiveTypeMap.html#linenum54)
 5. [ ] Click on variable to the definition of that variable
