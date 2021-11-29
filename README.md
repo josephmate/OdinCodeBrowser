@@ -4,7 +4,8 @@ This project attempts to create a completely static website of your source code,
 that navigates all the down to the depth of the JDK.
 The goal is to navigate as well as Intellij.
 Try it yourself by navigating from
-[Apache Commons Text's StringEscapeUtils](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html).
+[Apache Commons Text's
+StringEscapeUtils](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html#linenum38).
 
 # Motivation
 I used 
