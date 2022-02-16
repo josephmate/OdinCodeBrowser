@@ -61,19 +61,25 @@ public class IndexVisitor extends VoidVisitorAdapter<Void> {
             ClassOrInterfaceDeclaration classOrInterfaceDeclaration = (ClassOrInterfaceDeclaration) methodDeclaration.getParentNode().get();
             if (classOrInterfaceDeclaration.getFullyQualifiedName().isPresent()) {
                 if (methodDeclaration.isPrivate()) {
+
+                        /* TODO: method_chaining
                     index.addPrivateMethod(
                             classOrInterfaceDeclaration.getFullyQualifiedName().get(),
                             methodName,
                             fileUrl,
                             methodDeclaration.getRange().get().begin.line
                     );
+                         */
                 } else {
+
+                        /* TODO: method_chaining
                     index.addMethod(
                             classOrInterfaceDeclaration.getFullyQualifiedName().get(),
                             methodName,
                             fileUrl,
                             methodDeclaration.getRange().get().begin.line
                     );
+                         */
                 }
             }
         }
@@ -88,12 +94,16 @@ public class IndexVisitor extends VoidVisitorAdapter<Void> {
             if (classOrInterfaceDeclaration.getFullyQualifiedName().isPresent()) {
                 if (!fieldDeclaration.isPrivate()) {
                     for (VariableDeclarator vd : fieldDeclaration.getVariables()) {
+                        /* TODO: method_chaining
+                        vd.getType().is
+
                         index.addVariable(
                                 classOrInterfaceDeclaration.getFullyQualifiedName().get(),
                                 vd.getNameAsString(),
                                 fileUrl,
                                 fieldDeclaration.getRange().get().begin.line
                         );
+                        */
                     }
                 }
             }
