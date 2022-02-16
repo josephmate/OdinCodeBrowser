@@ -29,6 +29,7 @@ public class UrlIndexLoader {
                 );
             }
 
+            /* TODO: method_chaining
             for (Map.Entry<String, Map<String, Index.FilePosition>> entry : externalIndex.variableIndex.entrySet()) {
                 String fullyQualifiedClassName = entry.getKey();
                 for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
@@ -56,6 +57,8 @@ public class UrlIndexLoader {
                     );
                 }
             }
+            */
+
             // purposely skip privateMethodIndex since I don't expect dependants to use
             // privates in the dependency
         }

@@ -218,10 +218,12 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
         if (fullyQualifiedClassName != null) {
             Index.FilePosition filePosition = null;
             if (includePrivates) {
+                /* TODO: method_chaining
                 filePosition = index.getPrivateMethod(
                         fullyQualifiedClassName,
                         methodSimpleName.asString()
                 );
+                 */
             }
             addLink(methodSimpleName, filePosition, "type");
             if (filePosition != null) {
@@ -256,6 +258,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
             String currentFullyQualifiedClassName = bfsQueue.poll();
             visited.add(currentFullyQualifiedClassName);
 
+                /* TODO: method_chaining
             Index.FilePosition filePosition = index.getMethod(
                     currentFullyQualifiedClassName,
                     methodSimpleName.asString()
@@ -264,6 +267,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
             if (filePosition != null) {
                 return true;
             }
+                 */
 
             // add super classes to search
             for (String fullyQualifiedSuperClassName : index.getSuperClasses(currentFullyQualifiedClassName)) {
