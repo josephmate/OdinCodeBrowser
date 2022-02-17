@@ -11,6 +11,7 @@ import com.github.javaparser.ast.stmt.WhileStmt;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 import indexing.Index;
+import indexing.MethodInfo;
 
 import java.util.*;
 
@@ -218,12 +219,14 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
         if (fullyQualifiedClassName != null) {
             Index.FilePosition filePosition = null;
             if (includePrivates) {
-                /* TODO: method_chaining
-                filePosition = index.getPrivateMethod(
+                List<MethodInfo> overloads = index.getPrivateMethodOverloads(
                         fullyQualifiedClassName,
                         methodSimpleName.asString()
                 );
-                 */
+                if (overloads != null) {
+                    MethodInfo lastMethodInfo = overloads.get(overloads.size() - 1);
+                    filePosition = lastMethodInfo.filePosition();
+                }
             }
             addLink(methodSimpleName, filePosition, "type");
             if (filePosition != null) {
@@ -258,16 +261,19 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
             String currentFullyQualifiedClassName = bfsQueue.poll();
             visited.add(currentFullyQualifiedClassName);
 
-                /* TODO: method_chaining
-            Index.FilePosition filePosition = index.getMethod(
+            List<MethodInfo> overloads = index.getMethodOverloads(
                     currentFullyQualifiedClassName,
                     methodSimpleName.asString()
             );
+            Index.FilePosition filePosition = null;
+            if (overloads != null) {
+                MethodInfo lastMethodInfo = overloads.get(overloads.size() - 1);
+                filePosition = lastMethodInfo.filePosition();
+            }
             addLink(methodSimpleName, filePosition, "type");
             if (filePosition != null) {
                 return true;
             }
-                 */
 
             // add super classes to search
             for (String fullyQualifiedSuperClassName : index.getSuperClasses(currentFullyQualifiedClassName)) {

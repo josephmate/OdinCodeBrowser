@@ -29,35 +29,46 @@ public class UrlIndexLoader {
                 );
             }
 
-            /* TODO: method_chaining
-            for (Map.Entry<String, Map<String, Index.FilePosition>> entry : externalIndex.variableIndex.entrySet()) {
+            for (Map.Entry<String, Map<String, VariableInfo>> entry : externalIndex.variableIndex.entrySet()) {
                 String fullyQualifiedClassName = entry.getKey();
-                for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
+                for (Map.Entry<String, VariableInfo> entry2: entry.getValue().entrySet()) {
                     String variableName = entry2.getKey();
-                    Index.FilePosition filePosition = entry2.getValue();
+                    VariableInfo variableInfo = entry2.getValue();
                     allExternalIndexes.addVariable(
-                            fullyQualifiedClassName,
-                            variableName,
-                            StringUtil.mergeStrings(prefixUrl, filePosition.fileName()),
-                            filePosition.lineNumber()
+                        fullyQualifiedClassName,
+                        variableName,
+                        new VariableInfo(
+                            variableInfo.type(),
+                            new Index.FilePosition(
+                                StringUtil.mergeStrings(prefixUrl, variableInfo.filePosition().fileName()),
+                                    variableInfo.filePosition().lineNumber()
+                            )
+                        )
                     );
                 }
             }
 
-            for (Map.Entry<String, Map<String, Index.FilePosition>> entry : externalIndex.methodIndex.entrySet()) {
+            for (Map.Entry<String, Map<String, List<MethodInfo>>> entry : externalIndex.methodIndex.entrySet()) {
                 String fullyQualifiedClassName = entry.getKey();
-                for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
+                for (Map.Entry<String, List<MethodInfo>> entry2: entry.getValue().entrySet()) {
                     String methodName = entry2.getKey();
-                    Index.FilePosition filePosition = entry2.getValue();
-                    allExternalIndexes.addMethod(
+                    List<MethodInfo> overloads = entry2.getValue();
+                    for(MethodInfo overload : overloads) {
+                        allExternalIndexes.addMethod(
                             fullyQualifiedClassName,
                             methodName,
-                            StringUtil.mergeStrings(prefixUrl, filePosition.fileName()),
-                            filePosition.lineNumber()
-                    );
+                            new MethodInfo(
+                                overload.argumentTypes(),
+                                overload.returnType(),
+                                new Index.FilePosition(
+                                    StringUtil.mergeStrings(prefixUrl, overload.filePosition().fileName()),
+                                    overload.filePosition().lineNumber()
+                                )
+                            )
+                        );
+                    }
                 }
             }
-            */
 
             // purposely skip privateMethodIndex since I don't expect dependants to use
             // privates in the dependency

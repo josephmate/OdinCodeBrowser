@@ -96,8 +96,10 @@ class Visitor extends VoidVisitorAdapter<Void> {
 
   @Override
   public void visit(MethodDeclaration n, Void arg) {
-    print("start method " + n.getName());
+    print("start MethodDeclaration " + n.getName());
     tabCount++;
+    print("MethodDeclaration.getTypeAsString() " + n.getTypeAsString());
+    n.getParameters().forEach(p -> print("param: " + p.getTypeAsString()));
 
     // don't call super since we copied super's code and changed the order to have the parameters first
     n.getParameters().forEach(p -> p.accept(this, arg));
@@ -112,7 +114,7 @@ class Visitor extends VoidVisitorAdapter<Void> {
     n.getComment().ifPresent(l -> l.accept(this, arg));
 
     tabCount--;
-    print("end method " + n.getName());
+    print("end MethodDeclaration " + n.getName());
   }
 
   @Override

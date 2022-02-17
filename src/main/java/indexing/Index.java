@@ -103,17 +103,23 @@ public class Index {
         return classIndex.get(fullyQualifiedName);
     }
 
-    public MethodInfo getMethod(
+    public List<MethodInfo> getMethodOverloads(
             String fullyQualifiedName,
-            String methodName,
-            List<String> argumentTypes
-    ) {
+            String methodName) {
         Map<String, List<MethodInfo>> methodSubMap = methodIndex.get(fullyQualifiedName);
         if (methodSubMap == null) {
             return null;
         }
 
-        List<MethodInfo> overloads = methodSubMap.get(methodName);
+        return methodSubMap.get(methodName);
+    }
+
+    public MethodInfo getMethod(
+            String fullyQualifiedName,
+            String methodName,
+            List<String> argumentTypes
+    ) {
+        List<MethodInfo> overloads = getMethodOverloads(fullyQualifiedName, methodName);
         if (overloads == null) {
             return null;
         }
@@ -127,17 +133,22 @@ public class Index {
         return null;
     }
 
-    public MethodInfo getPrivateMethod(
-            String fullyQualifiedName,
-            String methodName,
-            List<String> argumentTypes
-    ) {
+    public List<MethodInfo> getPrivateMethodOverloads(String fullyQualifiedName,
+                                                      String methodName) {
         Map<String, List<MethodInfo>> methodSubMap = privateMethodIndex.get(fullyQualifiedName);
         if (methodSubMap == null) {
             return null;
         }
 
-        List<MethodInfo> overloads = methodSubMap.get(methodName);
+        return methodSubMap.get(methodName);
+    }
+
+    public MethodInfo getPrivateMethod(
+            String fullyQualifiedName,
+            String methodName,
+            List<String> argumentTypes
+    ) {
+        List<MethodInfo> overloads = getPrivateMethodOverloads(fullyQualifiedName, methodName);
         if (overloads == null) {
             return null;
         }
