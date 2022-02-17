@@ -6,6 +6,6 @@ package indexing;
  */
 public record VariableInfo(
         String type,
-        String filePosition
+        Index.FilePosition filePosition
 ) {
 }
