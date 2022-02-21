@@ -14,18 +14,18 @@ public class Index {
     /**
      * Fully Qualified Class Name -> method name -> File Position
      */
-    public final Map<String, Map<String, FilePosition>> methodIndex = new HashMap<>();
+    public final Map<String, Map<String, List<MethodInfo>>> methodIndex = new HashMap<>();
 
     /**
      * Fully Qualified Class Name -> method name -> File Position
      */
     @JsonIgnore
-    public final Map<String, Map<String, FilePosition>> privateMethodIndex = new HashMap<>();
+    public final Map<String, Map<String, List<MethodInfo>>> privateMethodIndex = new HashMap<>();
 
     /**
      * Fully Qualified Class Name -> variable name -> File Position
      */
-    public final Map<String, Map<String, FilePosition>> variableIndex = new HashMap<>();
+    public final Map<String, Map<String, VariableInfo>> variableIndex = new HashMap<>();
 
     public final Map<String, List<String>> superClassMap = new HashMap<>();
 
@@ -39,46 +39,52 @@ public class Index {
     public void addMethod(
             String fullyQualifiedName,
             String methodName,
-            String fileUrl,
-            int lineNumber
+            MethodInfo methodInfo
     ) {
-        FilePosition filePosition = new FilePosition(fileUrl, lineNumber);
-        Map<String, FilePosition> methodSubMap = methodIndex.get(fullyQualifiedName);
+        Map<String, List<MethodInfo>> methodSubMap = methodIndex.get(fullyQualifiedName);
         if (methodSubMap == null) {
             methodSubMap = new HashMap<>();
             methodIndex.put(fullyQualifiedName, methodSubMap);
         }
-        methodSubMap.put(methodName, filePosition);
+
+        List<MethodInfo> overloads = methodSubMap.get(methodName);
+        if (overloads == null) {
+            overloads = new ArrayList<>();
+            methodSubMap.put(methodName, overloads);
+        }
+        overloads.add(methodInfo);
     }
 
     public void addPrivateMethod(
             String fullyQualifiedName,
             String methodName,
-            String fileUrl,
-            int lineNumber
+            MethodInfo methodInfo
     ) {
-        FilePosition filePosition = new FilePosition(fileUrl, lineNumber);
-        Map<String, FilePosition> methodSubMap = privateMethodIndex.get(fullyQualifiedName);
+        Map<String, List<MethodInfo>> methodSubMap = privateMethodIndex.get(fullyQualifiedName);
         if (methodSubMap == null) {
             methodSubMap = new HashMap<>();
             privateMethodIndex.put(fullyQualifiedName, methodSubMap);
         }
-        methodSubMap.put(methodName, filePosition);
+
+        List<MethodInfo> overloads = methodSubMap.get(methodName);
+        if (overloads == null) {
+            overloads = new ArrayList<>();
+            methodSubMap.put(methodName, overloads);
+        }
+        overloads.add(methodInfo);
     }
 
     public void addVariable(
             String fullyQualifiedName,
             String variableName,
-            String fileUrl,
-            int lineNumber
+            VariableInfo variableInfo
     ) {
-        FilePosition filePosition = new FilePosition(fileUrl, lineNumber);
-        Map<String, FilePosition> variableSubMap = variableIndex.get(fullyQualifiedName);
+        Map<String, VariableInfo> variableSubMap = variableIndex.get(fullyQualifiedName);
         if (variableSubMap == null) {
             variableSubMap = new HashMap<>();
             variableIndex.put(fullyQualifiedName, variableSubMap);
         }
-        variableSubMap.put(variableName, filePosition);
+        variableSubMap.put(variableName, variableInfo);
     }
 
     public void addSuperClass(
@@ -97,26 +103,63 @@ public class Index {
         return classIndex.get(fullyQualifiedName);
     }
 
-    public FilePosition getMethod(
+    public List<MethodInfo> getMethodOverloads(
             String fullyQualifiedName,
-            String methodName
-    ) {
-        Map<String, FilePosition> methodSubMap = methodIndex.get(fullyQualifiedName);
+            String methodName) {
+        Map<String, List<MethodInfo>> methodSubMap = methodIndex.get(fullyQualifiedName);
         if (methodSubMap == null) {
             return null;
         }
+
         return methodSubMap.get(methodName);
     }
 
-    public FilePosition getPrivateMethod(
+    public MethodInfo getMethod(
             String fullyQualifiedName,
-            String methodName
+            String methodName,
+            List<String> argumentTypes
     ) {
-        Map<String, FilePosition> methodSubMap = privateMethodIndex.get(fullyQualifiedName);
+        List<MethodInfo> overloads = getMethodOverloads(fullyQualifiedName, methodName);
+        if (overloads == null) {
+            return null;
+        }
+
+        for (MethodInfo methodInfo : overloads) {
+            if (methodInfo.argumentTypes().equals(argumentTypes)) {
+                return methodInfo;
+            }
+        }
+
+        return null;
+    }
+
+    public List<MethodInfo> getPrivateMethodOverloads(String fullyQualifiedName,
+                                                      String methodName) {
+        Map<String, List<MethodInfo>> methodSubMap = privateMethodIndex.get(fullyQualifiedName);
         if (methodSubMap == null) {
             return null;
         }
+
         return methodSubMap.get(methodName);
+    }
+
+    public MethodInfo getPrivateMethod(
+            String fullyQualifiedName,
+            String methodName,
+            List<String> argumentTypes
+    ) {
+        List<MethodInfo> overloads = getPrivateMethodOverloads(fullyQualifiedName, methodName);
+        if (overloads == null) {
+            return null;
+        }
+
+        for (MethodInfo methodInfo : overloads) {
+            if (methodInfo.argumentTypes().equals(argumentTypes)) {
+                return methodInfo;
+            }
+        }
+
+        return null;
     }
 
     public List<String> getSuperClasses(String fullyQualifiedClassName) {
@@ -131,11 +174,11 @@ public class Index {
         return classIndex;
     }
 
-    public Map<String, Map<String, FilePosition>> getMethodIndex() {
+    public Map<String, Map<String, List<MethodInfo>>> getMethodIndex() {
         return methodIndex;
     }
 
-    public Map<String, Map<String, FilePosition>> getVariableIndex() {
+    public Map<String, Map<String, VariableInfo>> getVariableIndex() {
         return variableIndex;
     }
 
@@ -153,43 +196,44 @@ public class Index {
                     filePosition.lineNumber()
             );
         }
-        for (Map.Entry<String, Map<String, Index.FilePosition>> entry : otherIndex.variableIndex.entrySet()) {
+        for (Map.Entry<String, Map<String, VariableInfo>> entry : otherIndex.variableIndex.entrySet()) {
             String fullyQualifiedClassName = entry.getKey();
-            for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
+            for (Map.Entry<String, VariableInfo> entry2: entry.getValue().entrySet()) {
                 String variableName = entry2.getKey();
-                Index.FilePosition filePosition = entry2.getValue();
+                VariableInfo variableInfo = entry2.getValue();
                 this.addVariable(
                         fullyQualifiedClassName,
                         variableName,
-                        filePosition.fileName(),
-                        filePosition.lineNumber()
+                        variableInfo
                 );
             }
         }
-        for (Map.Entry<String, Map<String, Index.FilePosition>> entry : otherIndex.methodIndex.entrySet()) {
+        for (Map.Entry<String, Map<String, List<MethodInfo>>> entry : otherIndex.methodIndex.entrySet()) {
             String fullyQualifiedClassName = entry.getKey();
-            for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
+            for (Map.Entry<String, List<MethodInfo>> entry2: entry.getValue().entrySet()) {
                 String methodName = entry2.getKey();
-                Index.FilePosition filePosition = entry2.getValue();
-                this.addMethod(
-                        fullyQualifiedClassName,
-                        methodName,
-                        filePosition.fileName(),
-                        filePosition.lineNumber()
-                );
+                List<MethodInfo> overloads = entry2.getValue();
+                for (MethodInfo overload : overloads) {
+                    this.addMethod(
+                            fullyQualifiedClassName,
+                            methodName,
+                            overload
+                    );
+                }
             }
         }
-        for (Map.Entry<String, Map<String, Index.FilePosition>> entry : otherIndex.privateMethodIndex.entrySet()) {
+        for (Map.Entry<String, Map<String, List<MethodInfo>>> entry : otherIndex.privateMethodIndex.entrySet()) {
             String fullyQualifiedClassName = entry.getKey();
-            for (Map.Entry<String, Index.FilePosition> entry2: entry.getValue().entrySet()) {
+            for (Map.Entry<String, List<MethodInfo>> entry2: entry.getValue().entrySet()) {
                 String methodName = entry2.getKey();
-                Index.FilePosition filePosition = entry2.getValue();
-                this.addPrivateMethod(
-                        fullyQualifiedClassName,
-                        methodName,
-                        filePosition.fileName(),
-                        filePosition.lineNumber()
-                );
+                List<MethodInfo> overloads = entry2.getValue();
+                for (MethodInfo overload : overloads) {
+                    this.addMethod(
+                            fullyQualifiedClassName,
+                            methodName,
+                            overload
+                    );
+                }
             }
         }
         for (Map.Entry<String, List<String>> entry : otherIndex.superClassMap.entrySet()) {

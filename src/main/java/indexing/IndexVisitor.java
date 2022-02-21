@@ -3,6 +3,9 @@ package indexing;
 import com.github.javaparser.ast.body.*;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 
+import java.util.List;
+import java.util.stream.Collectors;
+
 public class IndexVisitor extends VoidVisitorAdapter<Void> {
 
     private final Index index;
@@ -58,21 +61,32 @@ public class IndexVisitor extends VoidVisitorAdapter<Void> {
         if (methodDeclaration.getParentNode().isPresent()
                 && methodDeclaration.getParentNode().get() instanceof ClassOrInterfaceDeclaration
         ) {
+            List<String> argTypes = methodDeclaration.getParameters().stream()
+                    .map(Parameter::getTypeAsString)
+                    .collect(Collectors.toList());
+            String returnType = methodDeclaration.getTypeAsString();
+            MethodInfo methodInfo = new MethodInfo(
+                argTypes,
+                returnType,
+                new Index.FilePosition(
+                    fileUrl,
+                    methodDeclaration.getRange().get().begin.line
+                )
+            );
+
             ClassOrInterfaceDeclaration classOrInterfaceDeclaration = (ClassOrInterfaceDeclaration) methodDeclaration.getParentNode().get();
             if (classOrInterfaceDeclaration.getFullyQualifiedName().isPresent()) {
                 if (methodDeclaration.isPrivate()) {
                     index.addPrivateMethod(
                             classOrInterfaceDeclaration.getFullyQualifiedName().get(),
                             methodName,
-                            fileUrl,
-                            methodDeclaration.getRange().get().begin.line
+                            methodInfo
                     );
                 } else {
                     index.addMethod(
                             classOrInterfaceDeclaration.getFullyQualifiedName().get(),
                             methodName,
-                            fileUrl,
-                            methodDeclaration.getRange().get().begin.line
+                            methodInfo
                     );
                 }
             }
@@ -89,10 +103,15 @@ public class IndexVisitor extends VoidVisitorAdapter<Void> {
                 if (!fieldDeclaration.isPrivate()) {
                     for (VariableDeclarator vd : fieldDeclaration.getVariables()) {
                         index.addVariable(
-                                classOrInterfaceDeclaration.getFullyQualifiedName().get(),
-                                vd.getNameAsString(),
-                                fileUrl,
-                                fieldDeclaration.getRange().get().begin.line
+                            classOrInterfaceDeclaration.getFullyQualifiedName().get(),
+                            vd.getNameAsString(),
+                            new VariableInfo(
+                                vd.getTypeAsString(),
+                                new Index.FilePosition(
+                                        fileUrl,
+                                        fieldDeclaration.getRange().get().begin.line
+                                )
+                            )
                         );
                     }
                 }
