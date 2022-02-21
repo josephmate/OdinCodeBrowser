@@ -24,9 +24,6 @@ and the resulting static web pages are decentralized.
 
 # How Do I Use This
 
-               css
-index.html              
-
 ## As a code browser
 1. Find a project you want to browse from:
    [jdk8](https://josephmate.github.io/OdinCodeBrowserJdk8/),
