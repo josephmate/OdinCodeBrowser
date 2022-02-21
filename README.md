@@ -273,7 +273,7 @@ Below is a checklist of features Odin needs.
     1. [x] Repository exposes it's index file as json
     1. [x] Build loads index files, then builds it own index
     1. [x] Create a demo using current project OdinCodeBrowser -> apache text -> apache commons -> JDK8
-        1. Take a look at [SourceHtmlRenderer](https://josephmate.github.io/OdinCodeBrowser/odin.code.browser/SourceHtmlRenderer.html)
+        1. Take a look at [SourceHtmlRenderer](https://josephmate.github.io/OdinCodeBrowser/odin.code.browser/rendering/source/SourceHtmlRenderer.html)
         2. In there [I use apache commons text to handle the html escaping for me](https://josephmate.github.io/OdinCodeBrowser/odin.code.browser/SourceHtmlRenderer.html#linenum145)
         3. From SourceHtmlRenderer can navigate to the [StringEscapeUtils.escapeHtml4 implementation](https://josephmate.github.io/OdinCodeBrowserRepos/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html#linenum660)
         4. escapeHtml4 uses
