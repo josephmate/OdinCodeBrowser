@@ -35,7 +35,7 @@ and the resulting static web pages are decentralized.
    [Github Java Parser](https://josephmate.github.io/OdinCodeBrowserRepos/javaparser-core_3.23.1)
    [OdinCodeBrowser](https://josephmate.github.io/OdinCodeBrowser/odin.code.browser)
 2. Find your class (ex: A class Odin uses 
-   [StringEscapeUtils](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html))
+   [StringEscapeUtils](https://josephmate.github.io/OdinCodeBrowserRepos/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html))
 3. Start reading code and navigating by clicking on the links, which are
    underlined.
 
