@@ -36,7 +36,7 @@ index.html
    [Apache Collections](https://josephmate.github.io/OdinCodeBrowserRepos/commons-collections_4.4/),
    [Apache Text](https://josephmate.github.io/OdinCodeBrowserRepos/commons-text_1.9),
    [Github Java Parser](https://josephmate.github.io/OdinCodeBrowserRepos/javaparser-core_3.23.1)
-   [OdinCodeBrowser](https://josephmate.github.io/OdinCodeBrowser/odin-code-browser)
+   [OdinCodeBrowser](https://josephmate.github.io/OdinCodeBrowser/odin.code.browser)
 2. Find your class (ex: A class Odin uses 
    [StringEscapeUtils](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html))
 3. Start reading code and navigating by clicking on the links, which are
@@ -62,9 +62,9 @@ github javaparser, apache commons, apache commons text, and JDK8 that I host on
 https://josephmate.github.io/OdinCodeBrowser/ .
 ```
 args="--inputSourceDirectory src/main/java"
-args="$args --outputDirectory docs/odin-code-browser"
+args="$args --outputDirectory docs/odin.code.browser"
 args="$args --webPathToCssFile /OdinCodeBrowser/css/styles.css"
-args="$args --webPathToSourceHtmlFiles /OdinCodeBrowser/odin-code-browser"
+args="$args --webPathToSourceHtmlFiles /OdinCodeBrowser/odin.code.browser"
 args="$args --languageLevel JAVA_16"
 args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowserJdk8/index.json"
 args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowserRepos/javaparser-core_3.23.1/index.json"
@@ -276,8 +276,8 @@ Below is a checklist of features Odin needs.
     1. [x] Repository exposes it's index file as json
     1. [x] Build loads index files, then builds it own index
     1. [x] Create a demo using current project OdinCodeBrowser -> apache text -> apache commons -> JDK8
-        1. Take a look at [SourceHtmlRenderer](https://josephmate.github.io/OdinCodeBrowser/odin-code-browser/SourceHtmlRenderer.html)
-        2. In there [I use apache commons text to handle the html escaping for me](https://josephmate.github.io/OdinCodeBrowser/odin-code-browser/SourceHtmlRenderer.html#linenum145)
+        1. Take a look at [SourceHtmlRenderer](https://josephmate.github.io/OdinCodeBrowser/odin.code.browser/SourceHtmlRenderer.html)
+        2. In there [I use apache commons text to handle the html escaping for me](https://josephmate.github.io/OdinCodeBrowser/odin.code.browser/SourceHtmlRenderer.html#linenum145)
         3. From SourceHtmlRenderer can navigate to the [StringEscapeUtils.escapeHtml4 implementation](https://josephmate.github.io/OdinCodeBrowserRepos/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html#linenum660)
         4. escapeHtml4 uses
            [CharSequenceTranslator.translate](https://josephmate.github.io/OdinCodeBrowserRepos/commons-text_1.9/org/apache/commons/text/translate/CharSequenceTranslator.html#linenum84)

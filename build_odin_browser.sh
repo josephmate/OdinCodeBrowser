@@ -1,5 +1,5 @@
 args="--inputSourceDirectory src/main/java"
-args="$args --outputDirectory docs/odin-code-browser"
+args="$args --outputDirectory docs/odin.code.browser"
 args="$args --webPathToCssFile /OdinCodeBrowser/css/styles.css"
 args="$args --webPathToSourceHtmlFiles /OdinCodeBrowser"
 args="$args --languageLevel JAVA_16"
