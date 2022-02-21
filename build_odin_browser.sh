@@ -1,7 +1,7 @@
 args="--inputSourceDirectory src/main/java"
 args="$args --outputDirectory docs/odin.code.browser"
 args="$args --webPathToCssFile /OdinCodeBrowser/css/styles.css"
-args="$args --webPathToSourceHtmlFiles /OdinCodeBrowser"
+args="$args --webPathToSourceHtmlFiles /OdinCodeBrowser/odin.code.browser"
 args="$args --languageLevel JAVA_16"
 args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowserJdk8/index.json"
 args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowserRepos/javaparser-core_3.23.1/index.json"
