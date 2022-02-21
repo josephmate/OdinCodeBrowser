@@ -5,7 +5,7 @@ that navigates all the down to the depth of the JDK.
 The goal is to navigate as well as Intellij.
 Try it yourself by navigating from
 [Apache Commons Text's
-StringEscapeUtils](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html#linenum38).
+StringEscapeUtils](https://josephmate.github.io/OdinCodeBrowserRepos/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html#linenum38).
 
 # Motivation
 I used 
@@ -24,9 +24,19 @@ and the resulting static web pages are decentralized.
 
 # How Do I Use This
 
+               css
+index.html              
+
 ## As a code browser
-1. Find a project you want to browse from [this list of supported repos](https://josephmate.github.io/OdinCodeBrowser/)
-1. Go to the list of all classes [(ex: Apache Commons Text)](https://josephmate.github.io/OdinCodeBrowser/jdk8/)
+1. Find a project you want to browse from:
+   [jdk8](https://josephmate.github.io/OdinCodeBrowserJdk8/),
+   [jdk11](https://josephmate.github.io/OdinCodeBrowserJdk11/),
+   [jdk17](https://josephmate.github.io/OdinCodeBrowserJdk17/),
+   [Apache Lang3](https://josephmate.github.io/OdinCodeBrowserRepos/commons-lang3_3.11/),
+   [Apache Collections](https://josephmate.github.io/OdinCodeBrowserRepos/commons-collections_4.4/),
+   [Apache Text](https://josephmate.github.io/OdinCodeBrowserRepos/commons-text_1.9),
+   [Github Java Parser](https://josephmate.github.io/OdinCodeBrowserRepos/javaparser-core_3.23.1)
+   [OdinCodeBrowser](https://josephmate.github.io/OdinCodeBrowser/odin-code-browser)
 2. Find your class (ex: A class Odin uses 
    [StringEscapeUtils](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html))
 3. Start reading code and navigating by clicking on the links, which are
@@ -52,29 +62,30 @@ github javaparser, apache commons, apache commons text, and JDK8 that I host on
 https://josephmate.github.io/OdinCodeBrowser/ .
 ```
 args="--inputSourceDirectory src/main/java"
-args="$args --outputDirectory docs/odin.code.browser"
+args="$args --outputDirectory docs/odin-code-browser"
 args="$args --webPathToCssFile /OdinCodeBrowser/css/styles.css"
-args="$args --webPathToSourceHtmlFiles /OdinCodeBrowser/odin.code.browser"
+args="$args --webPathToSourceHtmlFiles /OdinCodeBrowser/odin-code-browser"
 args="$args --languageLevel JAVA_16"
-args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowser/jdk8/index.json"
-args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowser/javaparser-core_3.23.1/index.json"
-args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowser/commons-lang3_3.11/index.json"
-args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/index.json"
+args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowserJdk8/index.json"
+args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowserRepos/javaparser-core_3.23.1/index.json"
+args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowserRepos/commons-lang3_3.11/index.json"
+args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowserRepos/commons-text_1.9/index.json"
+args="$args --urlToDependantIndexJson https://josephmate.github.io/OdinCodeBrowserRepos/commons-collections_4.4/index.json"
 mvn install exec:java \
   -Dexec.mainClass=Main \
   -Dexec.args="$args"
 ```
 
 ## Fun and games
-1. Start at a random class in [jdk8](https://josephmate.github.io/OdinCodeBrowser/jdk8/)
+1. Start at a random class in [jdk8](https://josephmate.github.io/OdinCodeBrowserJdk8/)
 2. Using links only, how fast can you get my favourite class: HashMap?
 
 For example I did
-[I18NImpl](https://josephmate.github.io/OdinCodeBrowser/jdk8//com/sun/imageio/plugins/common/I18NImpl.html)
+[I18NImpl](https://josephmate.github.io/OdinCodeBrowserJdk8/com/sun/imageio/plugins/common/I18NImpl.html)
 ->
-[PropertyResourceBundle](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/PropertyResourceBundle.html#linenum122)
+[PropertyResourceBundle](https://josephmate.github.io/OdinCodeBrowserJdk8/java/util/PropertyResourceBundle.html#linenum122)
 ->
-[HashMap](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html#linenum137)
+[HashMap](https://josephmate.github.io/OdinCodeBrowserJdk8/java/util/HashMap.html#linenum137)
 
 However, sometimes you'll pick a class that does not have a path to HashMap :(.
 
@@ -209,26 +220,26 @@ Below is a checklist of features Odin needs.
         3. [ ] Class inside function
         4. [ ] Anonymous class
     1. Type Usage
-        1. [x] [Variable type](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/oracle/net/Sdp.html#linenum56)
-        2. [x] [Method return type](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/oracle/net/Sdp.html#linenum104)
-        3. [x] [Extends type](http://josephmate.github.io/OdinCodeBrowser/jdk8/com/oracle/net/Sdp.html#linenum95)
+        1. [x] [Variable type](https://josephmate.github.io/OdinCodeBrowserJdk8/com/oracle/net/Sdp.html#linenum56)
+        2. [x] [Method return type](https://josephmate.github.io/OdinCodeBrowserJdk8/com/oracle/net/Sdp.html#linenum104)
+        3. [x] [Extends type](http://josephmate.github.io/OdinCodeBrowserJdk8/com/oracle/net/Sdp.html#linenum95)
         4. [x] Implement type
         4. [x] Record
         4. [x] Enum
         3. [ ] Generics
         5. [ ] Annotation (the implementation of the annotation)
         6. [ ] Import
-        7. [x] [Types through wildcard imports (ex: List from java.util.*)](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/concurrent/ScheduledThreadPoolExecutor.html#linenum785)
-        8. [x] [Types within same package (ex: ThreadPoolExecutor when in package java.util.concurrent)](https://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/concurrent/ScheduledThreadPoolExecutor.html#linenum122)
-        8. [x] [Types from java.lang (ex: IllegalArgumentException)](http://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html#linenum448)
+        7. [x] [Types through wildcard imports (ex: List from java.util.*)](https://josephmate.github.io/OdinCodeBrowserJdk8/java/util/concurrent/ScheduledThreadPoolExecutor.html#linenum785)
+        8. [x] [Types within same package (ex: ThreadPoolExecutor when in package java.util.concurrent)](https://josephmate.github.io/OdinCodeBrowserJdk8/java/util/concurrent/ScheduledThreadPoolExecutor.html#linenum122)
+        8. [x] [Types from java.lang (ex: IllegalArgumentException)](http://josephmate.github.io/OdinCodeBrowserJdk8/java/util/HashMap.html#linenum448)
         8. [ ] Types within same file
 4. [ ] Click on method to go the definition of that method
-    1. [x] [Static and only one function with the name (ex: Objects.hashCode(key))](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum296)
-    3. [x] [Functions within the same file (ex: putMapEntries(m, true)](http://josephmate.github.io/OdinCodeBrowser/jdk8//java/util/HashMap.html#linenum784)
-    3. [x] [Functions on this (ex: this.getCanonName())](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/net/SocketPermission.html#linenum621)
-    1. [x] [Object instance and only one function with the name and not in super class (ex: x.getClass())](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum348)
-    1. [x] [Object instance and only one function with the name but in some super class](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/concurrent/locks/ReentrantLock.html#linenum131)
-    1. [x] [super.method() (super.clone() in HashMap)](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum1318)
+    1. [x] [Static and only one function with the name (ex: Objects.hashCode(key))](http://josephmate.github.io/OdinCodeBrowserJdk8/java/util/HashMap.html#linenum296)
+    3. [x] [Functions within the same file (ex: putMapEntries(m, true)](http://josephmate.github.io/OdinCodeBrowserJdk8/java/util/HashMap.html#linenum784)
+    3. [x] [Functions on this (ex: this.getCanonName())](http://josephmate.github.io/OdinCodeBrowserJdk8/java/net/SocketPermission.html#linenum621)
+    1. [x] [Object instance and only one function with the name and not in super class (ex: x.getClass())](http://josephmate.github.io/OdinCodeBrowserJdk8/java/util/HashMap.html#linenum348)
+    1. [x] [Object instance and only one function with the name but in some super class](http://josephmate.github.io/OdinCodeBrowserJdk8/java/util/concurrent/locks/ReentrantLock.html#linenum131)
+    1. [x] [super.method() (super.clone() in HashMap)](http://josephmate.github.io/OdinCodeBrowserJdk8/java/util/HashMap.html#linenum1318)
     1. [ ] Chained method calls
     2. [ ] Functions are overloaded (different parameters)
     3. [ ] import static functions
@@ -236,14 +247,14 @@ Below is a checklist of features Odin needs.
     2. [ ] Super constructors
     2. [ ] Overloaded constructors
     3. [ ] Scoping rules (if names are duplicated in multiple scopes, need to use the closest scope)
-    4. [x] [String literal method calls (ex: "true".equals(blah))](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/BeanInfoFinder.html)
-    4. [x] [class literal method calls (ex: boolean.class.getName())](https://josephmate.github.io/OdinCodeBrowser/jdk8/com/sun/beans/finder/PrimitiveTypeMap.html#linenum54)
+    4. [x] [String literal method calls (ex: "true".equals(blah))](https://josephmate.github.io/OdinCodeBrowserJdk8/com/sun/beans/finder/BeanInfoFinder.html)
+    4. [x] [class literal method calls (ex: boolean.class.getName())](https://josephmate.github.io/OdinCodeBrowserJdk8/com/sun/beans/finder/PrimitiveTypeMap.html#linenum54)
 5. [ ] Click on variable to the definition of that variable
-    1. [x] [from function param](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum345)
-    1. [x] [local var](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum568)
-    1. [x] [from scope (for/while/if)](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum352)
-    1. [x] [field var](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum291)
-    1. [x] [static field var](http://josephmate.github.io/OdinCodeBrowser/jdk8/java/util/HashMap.html#linenum384)
+    1. [x] [from function param](http://josephmate.github.io/OdinCodeBrowserJdk8/java/util/HashMap.html#linenum345)
+    1. [x] [local var](http://josephmate.github.io/OdinCodeBrowserJdk8/java/util/HashMap.html#linenum568)
+    1. [x] [from scope (for/while/if)](http://josephmate.github.io/OdinCodeBrowserJdk8/java/util/HashMap.html#linenum352)
+    1. [x] [field var](http://josephmate.github.io/OdinCodeBrowserJdk8/java/util/HashMap.html#linenum291)
+    1. [x] [static field var](http://josephmate.github.io/OdinCodeBrowserJdk8/java/util/HashMap.html#linenum384)
     1. [ ] Enum value
     1. [ ] this.field
     1. [ ] record.value
@@ -251,7 +262,7 @@ Below is a checklist of features Odin needs.
     1. [ ] variable chaining (ex: a.b.c.d)
 6. [ ] Click on method to get a list of implementations
 7. [ ] Click on Override takes you to nearest super class's method that was overridden
-8. [x] [File list in root directory /OdinCodeBrowser/jdk8](https://josephmate.github.io/OdinCodeBrowser/jdk8/)
+8. [x] [File list in root directory /OdinCodeBrowserJdk8](https://josephmate.github.io/OdinCodeBrowserJdk8/)
 9. [ ] Click on class definition to get all usages
 9. [ ] Click on method definition to get all usages
 9. [ ] Click on variable definition to get all usages
@@ -265,11 +276,11 @@ Below is a checklist of features Odin needs.
     1. [x] Repository exposes it's index file as json
     1. [x] Build loads index files, then builds it own index
     1. [x] Create a demo using current project OdinCodeBrowser -> apache text -> apache commons -> JDK8
-        1. Take a look at [SourceHtmlRenderer](https://josephmate.github.io/OdinCodeBrowser/odin.code.browser/SourceHtmlRenderer.html)
-        2. In there [I use apache commons text to handle the html escaping for me](https://josephmate.github.io/OdinCodeBrowser/odin.code.browser/SourceHtmlRenderer.html#linenum145)
-        3. From SourceHtmlRenderer can navigate to the [StringEscapeUtils.escapeHtml4 implementation](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html#linenum660)
+        1. Take a look at [SourceHtmlRenderer](https://josephmate.github.io/OdinCodeBrowser/odin-code-browser/SourceHtmlRenderer.html)
+        2. In there [I use apache commons text to handle the html escaping for me](https://josephmate.github.io/OdinCodeBrowser/odin-code-browser/SourceHtmlRenderer.html#linenum145)
+        3. From SourceHtmlRenderer can navigate to the [StringEscapeUtils.escapeHtml4 implementation](https://josephmate.github.io/OdinCodeBrowserRepos/commons-text_1.9/org/apache/commons/text/StringEscapeUtils.html#linenum660)
         4. escapeHtml4 uses
-           [CharSequenceTranslator.translate](https://josephmate.github.io/OdinCodeBrowser/commons-text_1.9/org/apache/commons/text/translate/CharSequenceTranslator.html#linenum84)
+           [CharSequenceTranslator.translate](https://josephmate.github.io/OdinCodeBrowserRepos/commons-text_1.9/org/apache/commons/text/translate/CharSequenceTranslator.html#linenum84)
         5. Ignore not being able to navigate to the overloaded method. Odin doesn't support that yet.
         6. Validate.isTrue which is in apache commons lang3
         7. Again ignore that it went to the wrong overload of Validate.isTrue
