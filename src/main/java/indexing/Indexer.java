@@ -4,12 +4,16 @@ import com.github.javaparser.JavaParser;
 import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
 import options.OdinOptions;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Collection;
 
 public class Indexer {
+
+    private static final Logger LOGGER = LogManager.getLogger();
 
     private final OdinOptions odinOptions;
 
@@ -51,7 +55,7 @@ public class Indexer {
             Index index,
             Path path
     ) throws IOException {
-        System.out.println("Indexing " + path);
+        LOGGER.info("Indexing {}", path);
         final String fileUrl = getFileUrl(inputDirectory, path);
         indexFile(
                 index,

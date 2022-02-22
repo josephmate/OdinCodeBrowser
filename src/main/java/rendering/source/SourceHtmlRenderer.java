@@ -7,6 +7,8 @@ import indexing.ImportVisitor;
 import indexing.Index;
 import options.OdinOptions;
 import org.apache.commons.text.StringEscapeUtils;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import javax.annotation.Nonnull;
 import java.io.IOException;
@@ -22,6 +24,8 @@ public record SourceHtmlRenderer(
     String header,
     String footer
 ){
+
+    private static final Logger LOGGER = LogManager.getLogger();
 
     public SourceHtmlRenderer(Index index,
                               OdinOptions odinOptions) {
@@ -67,7 +71,7 @@ public record SourceHtmlRenderer(
             String inputDirectory,
             Path path
     ) throws IOException {
-        System.out.println("Rendering " + path);
+        LOGGER.info("Rendering {}", path);
         final String destinationStr = path.toString()
                 .substring(0, path.toString().length()-5)
                 .replace(inputDirectory, odinOptions.outputDirectory)

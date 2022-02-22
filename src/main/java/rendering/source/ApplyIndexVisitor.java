@@ -12,6 +12,10 @@ import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 import indexing.Index;
 import indexing.MethodInfo;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.util.MessageSupplier;
+import org.apache.logging.log4j.util.Supplier;
 
 import java.util.*;
 
@@ -21,10 +25,12 @@ import java.util.*;
  */
 public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
 
+    private static final Logger LOGGER = LogManager.getLogger();
     private final RenderingQueue renderingQueue;
     private final Index index;
     private final Map<String, String> imports;
     private final ScopeTracker scopeTracker = new ScopeTracker();
+    private int tabbing = 0;
 
     public ApplyIndexVisitor(
             Index index,
@@ -65,6 +71,8 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
     private String currentClassName = null;
 
     public void visit(ClassOrInterfaceDeclaration classOrInterfaceDeclaration, Void arg) {
+        debug(() -> "START ClassOrInterfaceDeclaration" + classOrInterfaceDeclaration);
+        tabbing++;
         scopeTracker.startScope();
         // need to set the class name before visiting all the nodes
         String previousClassName = currentClassName;
@@ -74,74 +82,101 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
         super.visit(classOrInterfaceDeclaration, arg);
         currentClassName = previousClassName;
         scopeTracker.endScope();
+        tabbing--;
+        debug(() -> "END   ClassOrInterfaceDeclaration" + classOrInterfaceDeclaration);
     }
 
     @Override
-    public void visit(MethodDeclaration n, Void arg) {
+    public void visit(MethodDeclaration methodDeclaration, Void arg) {
+        debug(() -> "START MethodDeclaration" + methodDeclaration);
+        tabbing++;
         scopeTracker.startScope();
         // don't call super since we copied super's code and changed the order to have the parameters first
-        n.getParameters().forEach(p -> p.accept(this, arg));
-        n.getBody().ifPresent(l -> l.accept(this, arg));
-        n.getType().accept(this, arg);
-        n.getModifiers().forEach(p -> p.accept(this, arg));
-        n.getName().accept(this, arg);
-        n.getReceiverParameter().ifPresent(l -> l.accept(this, arg));
-        n.getThrownExceptions().forEach(p -> p.accept(this, arg));
-        n.getTypeParameters().forEach(p -> p.accept(this, arg));
-        n.getAnnotations().forEach(p -> p.accept(this, arg));
-        n.getComment().ifPresent(l -> l.accept(this, arg));
+        methodDeclaration.getParameters().forEach(p -> p.accept(this, arg));
+        methodDeclaration.getBody().ifPresent(l -> l.accept(this, arg));
+        methodDeclaration.getType().accept(this, arg);
+        methodDeclaration.getModifiers().forEach(p -> p.accept(this, arg));
+        methodDeclaration.getName().accept(this, arg);
+        methodDeclaration.getReceiverParameter().ifPresent(l -> l.accept(this, arg));
+        methodDeclaration.getThrownExceptions().forEach(p -> p.accept(this, arg));
+        methodDeclaration.getTypeParameters().forEach(p -> p.accept(this, arg));
+        methodDeclaration.getAnnotations().forEach(p -> p.accept(this, arg));
+        methodDeclaration.getComment().ifPresent(l -> l.accept(this, arg));
         scopeTracker.endScope();
-
+        tabbing--;
+        debug(() -> "END   MethodDeclaration" + methodDeclaration);
     }
 
     @Override
-    public void visit(WhileStmt d, Void arg) {
+    public void visit(WhileStmt whileStmt, Void arg) {
+        debug(() -> "START WhileStmt" + whileStmt);
+        tabbing++;
         scopeTracker.startScope();
-        super.visit(d, arg);
+        super.visit(whileStmt, arg);
         scopeTracker.endScope();
+        tabbing--;
+        debug(() -> "END   WhileStmt" + whileStmt);
     }
 
     @Override
-    public void visit(ForStmt n, Void arg) {
+    public void visit(ForStmt forStmt, Void arg) {
+        debug(() -> "START ForStmt" + forStmt);
+        tabbing++;
         scopeTracker.startScope();
         // don't call super since we copied super's code and changed the order to have the parameters first
-        n.getInitialization().forEach(p -> p.accept(this, arg));
-        n.getBody().accept(this, arg);
-        n.getCompare().ifPresent(l -> l.accept(this, arg));
-        n.getUpdate().forEach(p -> p.accept(this, arg));
-        n.getComment().ifPresent(l -> l.accept(this, arg));
+        forStmt.getInitialization().forEach(p -> p.accept(this, arg));
+        forStmt.getBody().accept(this, arg);
+        forStmt.getCompare().ifPresent(l -> l.accept(this, arg));
+        forStmt.getUpdate().forEach(p -> p.accept(this, arg));
+        forStmt.getComment().ifPresent(l -> l.accept(this, arg));
         scopeTracker.endScope();
+        tabbing--;
+        debug(() -> "END   ForStmt" + forStmt);
     }
 
     @Override
-    public void visit(IfStmt d, Void arg) {
+    public void visit(IfStmt ifStmt, Void arg) {
+        debug(() -> "START IfStmt" + ifStmt);
+        tabbing++;
         scopeTracker.startScope();
-        super.visit(d, arg);
+        super.visit(ifStmt, arg);
         scopeTracker.endScope();
+        tabbing--;
+        debug(() -> "END   IfStmt" + ifStmt);
     }
 
     @Override
-    public void visit(Parameter d, Void arg) {
+    public void visit(Parameter parameter, Void arg) {
+        debug(() -> "START Parameter" + parameter);
+        tabbing++;
         scopeTracker.addVariable(
-                d.getNameAsString(),
-                d.getType().asString(),
-                d.getRange().get().begin.line
+                parameter.getNameAsString(),
+                parameter.getType().asString(),
+                parameter.getRange().get().begin.line
         );
-        super.visit(d, arg);
+        super.visit(parameter, arg);
+        tabbing--;
+        debug(() -> "END   Parameter" + parameter);
     }
 
     @Override
-    public void visit(VariableDeclarator d, Void arg) {
+    public void visit(VariableDeclarator variableDeclarator, Void arg) {
+        debug(() -> "START VariableDeclarator" + variableDeclarator);
+        tabbing++;
         scopeTracker.addVariable(
-                d.getNameAsString(),
-                d.getType().asString(),
-                d.getRange().get().begin.line
+                variableDeclarator.getNameAsString(),
+                variableDeclarator.getType().asString(),
+                variableDeclarator.getRange().get().begin.line
         );
-        super.visit(d, arg);
+        super.visit(variableDeclarator, arg);
+        tabbing--;
+        debug(() -> "END   VariableDeclarator" + variableDeclarator);
     }
 
     @Override
     public void visit(ClassOrInterfaceType classOrInterfaceType, Void arg) {
+        debug(() -> "START ClassOrInterfaceType" + classOrInterfaceType);
+        tabbing++;
         SimpleName simpleName = classOrInterfaceType.getName();
         String className = simpleName.asString();
         if (imports.containsKey(className)) {
@@ -150,9 +185,13 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
             addLink(simpleName, filePosition, "type");
         }
         super.visit(classOrInterfaceType, arg);
+        tabbing--;
+        debug(() -> "END   ClassOrInterfaceType" + classOrInterfaceType);
     }
 
     public void visit(MethodCallExpr methodCallExpr, Void arg) {
+        debug(() -> "START MethodCallExpr" + methodCallExpr);
+        tabbing++;
         SimpleName methodSimpleName = methodCallExpr.getName();
         if (methodCallExpr.getScope().isPresent()) {
             Expression scope = methodCallExpr.getScope().get();
@@ -202,13 +241,15 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                 // super.detach()
                 searchForMethodInClassAndSuperClasses(currentClassName, methodSimpleName, true);
             } else {
-                System.out.println("Unrecognized expression: " + methodCallExpr);
+                LOGGER.warn("Unrecognized expression: {}", methodCallExpr);
             }
         } else {
             // method call within the same class
             handleClassMethod(currentClassName, methodSimpleName, true);
         }
         super.visit(methodCallExpr, arg);
+        tabbing--;
+        debug(() -> "END   MethodCallExpr" + methodCallExpr);
     }
 
     private boolean handleClassMethod(
@@ -288,6 +329,8 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
     }
 
     public void visit(NameExpr nameExpr, Void arg) {
+        debug(() -> "START NameExpr" + nameExpr);
+        tabbing++;
         // trying variable index
         final Integer localVariableLineNum = scopeTracker.getVariableLine(nameExpr.getNameAsString());
         if (localVariableLineNum != null) {
@@ -298,6 +341,21 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
         "variable"
             );
         }
+        tabbing--;
+        debug(() -> "END   NameExpr" + nameExpr);
     }
 
+    private String generateTabs() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < tabbing; i++) {
+            sb.append("  ");
+        }
+        return sb.toString();
+    }
+
+    private void debug(Supplier<?> msg) {
+        LOGGER.debug("{}{}",
+                () -> generateTabs(),
+                msg);
+    }
 }
