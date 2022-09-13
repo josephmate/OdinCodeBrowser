@@ -81,22 +81,36 @@ public record SourceHtmlRenderer(
     ) throws IOException {
         JavaParser javaParser = new JavaParser(new ParserConfiguration().setLanguageLevel(
                 odinOptions.languageLevel));
+        // Get the parse tree from GitHub Java Parser, so we can navigate the parse tree
+        // with visitors.
         CompilationUnit compilationUnit = javaParser.parse(inputFile).getResult().get();
+
+        // Use a visitor to collect all the imports. The imports are used to detemine what
+        // methods, classes, and static fields are in scope.
         ImportVisitor importVisitor = new ImportVisitor(index);
         importVisitor.visit(compilationUnit, null);
 
+        // Accumulate the changes from source code to html in a rendering queue that we apply at the end.
+        // This allows us to apply successive operations like a link, then a css style.
         RenderingQueue renderingQueue = new RenderingQueue();
+
+        // Use the index with the parse tree to figure out what links need to be added to the source code.
         ApplyIndexVisitor applyIndexVisitor = new ApplyIndexVisitor(
                 index,
                 importVisitor.imports,
                 renderingQueue
         );
         applyIndexVisitor.visit(compilationUnit, null);
+
+        // Use the parse tree to figure out what css styles need to be applied. This is separates
+        // linking from styling since methods, classes, variables, other linkables will have
+        // different colours.
         ApplySyntaxHighlightingVisitor syntaxHighlightingVisitor = new ApplySyntaxHighlightingVisitor(
                 renderingQueue
         );
         syntaxHighlightingVisitor.visit(compilationUnit, null);
 
+        // Apply the rendering queue to the code.
         Path destinationPath = Paths.get(outputFile);
         destinationPath.toFile().getParentFile().mkdirs();
         String code = Files.readString(inputFile);

@@ -157,9 +157,11 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
         if (methodCallExpr.getScope().isPresent()) {
             Expression scope = methodCallExpr.getScope().get();
             if (scope instanceof StringLiteralExpr) {
-                handleClassMethod("java.lang.String", methodSimpleName, false);
+                // TODO: FIX!
+                handleClassMethod("java.lang.String", methodSimpleName, null,false);
             } else if (scope instanceof ClassExpr) {
-                handleClassMethod("java.lang.Class", methodSimpleName, false);
+              // TODO: FIX!
+                handleClassMethod("java.lang.Class", methodSimpleName, null,false);
             } else if (scope instanceof NameExpr) {
                 NameExpr nameExpr = (NameExpr) scope;
                 // example System.getProperty()
@@ -176,7 +178,9 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                     // trying Class index
                     fullyQualifiedClassName = imports.get(nameExpr.getName().asString());
                 }
-                handleClassMethod(fullyQualifiedClassName, methodSimpleName, false);
+
+                // TODO: FIX!
+                handleClassMethod(fullyQualifiedClassName, methodSimpleName, null, false);
             } else if (scope instanceof MethodCallExpr) {
                 // method call chaining
                 // example indexMap.entrySet().iterator()
@@ -188,7 +192,8 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                 methodCallExpr.getNameAsString();
             } else if (scope instanceof ThisExpr) {
                 // this.size()
-                handleClassMethod(currentClassName, methodSimpleName, true);
+                // TODO: FIX!
+                handleClassMethod(currentClassName, methodSimpleName, null, true);
             } else if (scope instanceof FieldAccessExpr) {
                 // this.data.clone()
                 methodCallExpr.getNameAsString();
@@ -200,13 +205,15 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                 methodCallExpr.getNameAsString();
             } else if (scope instanceof SuperExpr) {
                 // super.detach()
-                searchForMethodInClassAndSuperClasses(currentClassName, methodSimpleName, true);
+                // TODO: FIX!
+                searchForMethodInClassAndSuperClasses(currentClassName, methodSimpleName, null,true);
             } else {
                 System.out.println("Unrecognized expression: " + methodCallExpr);
             }
         } else {
             // method call within the same class
-            handleClassMethod(currentClassName, methodSimpleName, true);
+            // TODO: FIX!
+            handleClassMethod(currentClassName, methodSimpleName, null, true);
         }
         super.visit(methodCallExpr, arg);
     }
@@ -214,6 +221,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
     private boolean handleClassMethod(
             String fullyQualifiedClassName,
             SimpleName methodSimpleName,
+            List<String> parameterTypes,
             boolean includePrivates
     ) {
         if (fullyQualifiedClassName != null) {
@@ -224,8 +232,8 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                         methodSimpleName.asString()
                 );
                 if (overloads != null) {
-                    MethodInfo lastMethodInfo = overloads.get(overloads.size() - 1);
-                    filePosition = lastMethodInfo.filePosition();
+                    MethodInfo bestMethodInfo = findBestOverload(overloads, parameterTypes);
+                    filePosition = bestMethodInfo.filePosition();
                 }
             }
             addLink(methodSimpleName, filePosition, "type");
@@ -237,15 +245,24 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
             return searchForMethodInClassAndSuperClasses(
                     fullyQualifiedClassName,
                     methodSimpleName,
+                    parameterTypes,
                     false
             );
         }
         return false;
     }
 
+    private MethodInfo findBestOverload(
+        List<MethodInfo> overloads,
+        List<String> parameterTypes
+    ) {
+      return null;
+    }
+
     private boolean searchForMethodInClassAndSuperClasses(
             String fullyQualifiedClassName,
             SimpleName methodSimpleName,
+            List<String> parameterTypes,
             boolean skipCurrentClass
     ) {
         Set<String> visited = new HashSet<>();
@@ -267,8 +284,8 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
             );
             Index.FilePosition filePosition = null;
             if (overloads != null) {
-                MethodInfo lastMethodInfo = overloads.get(overloads.size() - 1);
-                filePosition = lastMethodInfo.filePosition();
+                MethodInfo bestMethodInfo = findBestOverload(overloads, parameterTypes);
+                filePosition = bestMethodInfo.filePosition();
             }
             addLink(methodSimpleName, filePosition, "type");
             if (filePosition != null) {
