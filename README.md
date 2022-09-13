@@ -1,7 +1,7 @@
 # Odin Code Browser
 
 This project attempts to create a completely static website of your source code,
-that navigates all the down to the depth of the JDK.
+that navigates all the way down to the depths of the JDK.
 The goal is to navigate as well as Intellij.
 Try it yourself by navigating from
 [Apache Commons Text's
