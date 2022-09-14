@@ -233,7 +233,9 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                 );
                 if (overloads != null) {
                     MethodInfo bestMethodInfo = findBestOverload(overloads, parameterTypes);
-                    filePosition = bestMethodInfo.filePosition();
+                    if (bestMethodInfo != null) {
+                        filePosition = bestMethodInfo.filePosition();
+                    }
                 }
             }
             addLink(methodSimpleName, filePosition, "type");
@@ -256,7 +258,44 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
         List<MethodInfo> overloads,
         List<String> parameterTypes
     ) {
-      return null;
+      if (overloads == null || overloads.isEmpty()) {
+          return null;
+      }
+      if (parameterTypes == null) {
+        return overloads.get(overloads.size() - 1);
+      }
+
+      return overloads.stream()
+          .filter(overload -> match(overload.argumentTypes(), parameterTypes))
+          .findAny()
+          .orElse(null);
+    }
+
+  /**
+   * Matches parameter types one by one. If either or null, that's treated as a wildcard.
+   *
+   * @param parameterTypes1
+   * @param parameterTypes2
+   * @return
+   */
+    private boolean match(List<String> parameterTypes1, List<String> parameterTypes2) {
+      if (parameterTypes1.size() != parameterTypes2.size()) {
+        return false;
+      }
+      for (int i = 0; i < parameterTypes1.size(); i++) {
+        if (parameterTypes1.get(i) == null) {
+          continue;
+        }
+        if (parameterTypes2.get(i) == null) {
+          continue;
+        }
+
+        if (!parameterTypes1.get(i).equals(parameterTypes2.get(i))) {
+          return false;
+        }
+      }
+
+      return true;
     }
 
     private boolean searchForMethodInClassAndSuperClasses(
@@ -285,7 +324,9 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
             Index.FilePosition filePosition = null;
             if (overloads != null) {
                 MethodInfo bestMethodInfo = findBestOverload(overloads, parameterTypes);
-                filePosition = bestMethodInfo.filePosition();
+                if (bestMethodInfo != null) {
+                  filePosition = bestMethodInfo.filePosition();
+                }
             }
             addLink(methodSimpleName, filePosition, "type");
             if (filePosition != null) {
