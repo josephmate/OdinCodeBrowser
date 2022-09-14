@@ -239,6 +239,9 @@ Below is a checklist of features Odin needs.
     1. [x] [super.method() (super.clone() in HashMap)](http://josephmate.github.io/OdinCodeBrowserJdk8/java/util/HashMap.html#linenum1318)
     1. [ ] Chained method calls
     2. [ ] Functions are overloaded (different parameters)
+        1. [ ] all arguments are variables (ex: add(a,b))
+        2. [ ] all args are variables or literals (ex add(a, 1))
+        3. [ ] where any of the arguments are expressions (ex: add(add(1,2), add(a,b))) 
     3. [ ] import static functions
     3. [ ] Record getter functions
     2. [ ] Super constructors
