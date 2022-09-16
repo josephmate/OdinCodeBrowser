@@ -1,5 +1,6 @@
 package rendering.source;
 
+import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
@@ -14,6 +15,7 @@ import indexing.Index;
 import indexing.MethodInfo;
 
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * Applies the Index to the source code by recording the changes that are need
@@ -23,6 +25,10 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
 
     private final RenderingQueue renderingQueue;
     private final Index index;
+
+    /**
+     * ShortTypes can be used to look up the full class name (fully qualified name).
+     */
     private final Map<String, String> imports;
     private final ScopeTracker scopeTracker = new ScopeTracker();
 
@@ -152,16 +158,40 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
         super.visit(classOrInterfaceType, arg);
     }
 
+    private String getArgumentType(Expression expression) {
+        if (expression.getChildNodes().size() != 1) {
+          return null;
+        }
+        Node onlyChild = expression.getChildNodes().get(0);
+        if (!(onlyChild instanceof SimpleName)) {
+          return null;
+        }
+
+        String argument = onlyChild.toString();
+        String shortType = scopeTracker.getVariableShortType(argument);
+        if (shortType == null) {
+          return null;
+        }
+
+        return imports.get(shortType);
+    }
+
+    private List<String> calcParameterTypes(MethodCallExpr methodCallExpr) {
+      return methodCallExpr.getArguments()
+          .stream()
+          .map(this::getArgumentType)
+          .collect(Collectors.toList());
+    }
+
     public void visit(MethodCallExpr methodCallExpr, Void arg) {
         SimpleName methodSimpleName = methodCallExpr.getName();
+        List<String> parameterTypes = calcParameterTypes(methodCallExpr);
         if (methodCallExpr.getScope().isPresent()) {
             Expression scope = methodCallExpr.getScope().get();
             if (scope instanceof StringLiteralExpr) {
-                // TODO: FIX!
-                handleClassMethod("java.lang.String", methodSimpleName, null,false);
+                handleClassMethod("java.lang.String", methodSimpleName, parameterTypes,false);
             } else if (scope instanceof ClassExpr) {
-              // TODO: FIX!
-                handleClassMethod("java.lang.Class", methodSimpleName, null,false);
+                handleClassMethod("java.lang.Class", methodSimpleName, parameterTypes,false);
             } else if (scope instanceof NameExpr) {
                 NameExpr nameExpr = (NameExpr) scope;
                 // example System.getProperty()
@@ -170,7 +200,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                 // How about try variable index first, then Class index.
 
                 // trying variable index
-                final String typeFromVariable = scopeTracker.getVariableType(nameExpr.getNameAsString());
+                final String typeFromVariable = scopeTracker.getVariableShortType(nameExpr.getNameAsString());
                 final String fullyQualifiedClassName;
                 if (typeFromVariable != null) {
                     fullyQualifiedClassName = imports.get(typeFromVariable);
@@ -179,8 +209,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                     fullyQualifiedClassName = imports.get(nameExpr.getName().asString());
                 }
 
-                // TODO: FIX!
-                handleClassMethod(fullyQualifiedClassName, methodSimpleName, null, false);
+                handleClassMethod(fullyQualifiedClassName, methodSimpleName, parameterTypes, false);
             } else if (scope instanceof MethodCallExpr) {
                 // method call chaining
                 // example indexMap.entrySet().iterator()
@@ -192,8 +221,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                 methodCallExpr.getNameAsString();
             } else if (scope instanceof ThisExpr) {
                 // this.size()
-                // TODO: FIX!
-                handleClassMethod(currentClassName, methodSimpleName, null, true);
+                handleClassMethod(currentClassName, methodSimpleName, parameterTypes, true);
             } else if (scope instanceof FieldAccessExpr) {
                 // this.data.clone()
                 methodCallExpr.getNameAsString();
@@ -205,15 +233,13 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                 methodCallExpr.getNameAsString();
             } else if (scope instanceof SuperExpr) {
                 // super.detach()
-                // TODO: FIX!
-                searchForMethodInClassAndSuperClasses(currentClassName, methodSimpleName, null,true);
+                searchForMethodInClassAndSuperClasses(currentClassName, methodSimpleName, parameterTypes,true);
             } else {
                 System.out.println("Unrecognized expression: " + methodCallExpr);
             }
         } else {
             // method call within the same class
-            // TODO: FIX!
-            handleClassMethod(currentClassName, methodSimpleName, null, true);
+            handleClassMethod(currentClassName, methodSimpleName, parameterTypes, true);
         }
         super.visit(methodCallExpr, arg);
     }
