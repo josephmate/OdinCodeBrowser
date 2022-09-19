@@ -69,6 +69,7 @@ public record SourceHtmlRenderer(
     ) throws IOException {
         System.out.println("Rendering " + path);
         final String destinationStr = path.toString()
+                .replace('\\', '/')
                 .substring(0, path.toString().length()-5)
                 .replace(inputDirectory, odinOptions.outputDirectory)
                 + ".html";

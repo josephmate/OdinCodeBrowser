@@ -88,6 +88,7 @@ public class IndexHtmlRenderer {
         return odinOptions.webPathToSourceHtmlFiles
                 + (
                 javaSourceFile.toString()
+                        .replace('\\', '/')
                         .substring(0, javaSourceFile.toString().length()-5)
                         .replace(inputSourceDirectory, "")
                         + ".html"
