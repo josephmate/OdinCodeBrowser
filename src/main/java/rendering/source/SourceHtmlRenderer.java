@@ -97,6 +97,7 @@ public record SourceHtmlRenderer(
 
         // Use the index with the parse tree to figure out what links need to be added to the source code.
         ApplyIndexVisitor applyIndexVisitor = new ApplyIndexVisitor(
+                outputFile,
                 index,
                 importVisitor.imports,
                 renderingQueue

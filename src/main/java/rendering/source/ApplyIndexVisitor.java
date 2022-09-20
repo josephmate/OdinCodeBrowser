@@ -32,11 +32,15 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
     private final Map<String, String> imports;
     private final ScopeTracker scopeTracker = new ScopeTracker();
 
+    private final String outputFile;
+
     public ApplyIndexVisitor(
+            String outputFile,
             Index index,
             Map<String, String> imports,
             RenderingQueue renderingQueue
     ) {
+        this.outputFile = outputFile;
         this.index = index;
         this.imports = imports;
         this.renderingQueue = renderingQueue;
@@ -291,10 +295,11 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
         return overloads.get(overloads.size() - 1);
       }
 
+
       return overloads.stream()
           .filter(overload -> match(overload.argumentTypes(), parameterTypes))
           .findAny()
-          .orElse(null);
+          .orElse(overloads.get(overloads.size() - 1));
     }
 
   /**
