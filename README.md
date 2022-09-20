@@ -239,6 +239,11 @@ Below is a checklist of features Odin needs.
     1. [x] [super.method() (super.clone() in HashMap)](http://josephmate.github.io/OdinCodeBrowserJdk8/java/util/HashMap.html#linenum1318)
     1. [ ] Chained method calls
     2. [ ] Functions are overloaded (different parameters)
+        1. [ ] [all arguments are variables (ex: String.lastIndexOf(char vs String))](https://josephmate.github.io/OdinCodeBrowser/odin.code.browser/indexing/ImportVisitor.html#linenum42)
+        1. [ ] [length heuristic for generics (ex: Pair.of(A,B) vs Pair.of(Map.Entry<A,B>))](https://josephmate.github.io/OdinCodeBrowser/odin.code.browser/Director.html#linenum44)
+        2. [ ] all args are variables or literals (ex add(a, 1))
+        3. [ ] where any of the arguments are expressions (ex: add(add(1,2), add(a,b)))
+        4. [ ] variable arguments (ex: int add(int... vals)) 
     3. [ ] import static functions
     3. [ ] Record getter functions
     2. [ ] Super constructors

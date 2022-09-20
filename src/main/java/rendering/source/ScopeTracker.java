@@ -4,7 +4,7 @@ import java.util.*;
 
 public class ScopeTracker {
 
-    private final Map<String, Stack<String>> variableToTypes = new HashMap<>();
+    private final Map<String, Stack<String>> variableToShortTypes = new HashMap<>();
     private final Map<String, Stack<Integer>> variableToLines = new HashMap<>();
     private final Stack<List<String>> scopeToVariableNames = new Stack<>();
 
@@ -22,10 +22,10 @@ public class ScopeTracker {
         List<String> variableNames = scopeToVariableNames.peek();
         variableNames.add(variableName);
 
-        Stack<String> types = variableToTypes.get(variableName);
+        Stack<String> types = variableToShortTypes.get(variableName);
         if (types == null) {
             types = new Stack<>();
-            variableToTypes.put(variableName, types);
+            variableToShortTypes.put(variableName, types);
         }
         types.add(variableType);
 
@@ -37,16 +37,21 @@ public class ScopeTracker {
         lines.add(lineNumber);
     }
 
-    public String getVariableType(String variableName) {
-        Stack<String> types = variableToTypes.get(variableName);
-        if (types == null) {
-            return null;
-        }
-        if (types.isEmpty()) {
-            return null;
-        }
-        return types.peek();
-    }
+    /**
+     * @param variableName the name of the variable to search in the scope for.
+     * @return the short type that still needs to joined against the imports to figure out the full
+     *         class name (fully qualified name).
+     */
+    public String getVariableShortType(String variableName) {
+          Stack<String> types = variableToShortTypes.get(variableName);
+          if (types == null) {
+              return null;
+          }
+          if (types.isEmpty()) {
+              return null;
+          }
+          return types.peek();
+      }
 
     public Integer getVariableLine(String variableName) {
         Stack<Integer> lines = variableToLines.get(variableName);
@@ -66,7 +71,7 @@ public class ScopeTracker {
 
         List<String> variableNamesToRemove = scopeToVariableNames.pop();
         for (String variableNameToRemove : variableNamesToRemove) {
-            Stack<String> types = variableToTypes.get(variableNameToRemove);
+            Stack<String> types = variableToShortTypes.get(variableNameToRemove);
             if (types != null && !types.isEmpty()) {
                 types.pop();
             }

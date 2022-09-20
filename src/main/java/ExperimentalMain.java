@@ -193,6 +193,17 @@ class Visitor extends VoidVisitorAdapter<Void> {
   public void visit(MethodCallExpr n, Void arg) {
     print("start MethodCallExpr " + n);
     tabCount++;
+    print("# args: " + n.getArguments().size());
+    for (int i = 0; i < n.getArguments().size(); i++) {
+      Expression expression =  n.getArguments().get(i);
+      print("arg[" + i + "]= (# nodes=" + expression.getChildNodes().size() + ")" + expression);
+      tabCount++;
+      if (expression.getChildNodes().size() == 1) {
+        print("type: " + expression.getChildNodes().get(0).getClass().getSimpleName());
+      }
+      tabCount--;
+    }
+    print("===========================");
     super.visit(n, arg);
     tabCount--;
     print("end MethodCallExpr " + n);

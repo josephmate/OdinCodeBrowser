@@ -29,7 +29,9 @@ public class IndexHtmlRenderer {
         for(Pair<String, List<Path>> currentlyProcessing : processingOrder) {
             for (Path path : currentlyProcessing.getRight()) {
                 javaFileToHtmlFile.put(
-                        path.toString().replace(currentlyProcessing.getLeft(), ""),
+                        path.toString()
+                            .replace('\\', '/')
+                            .replace(currentlyProcessing.getLeft(), ""),
                         getFileUrl(currentlyProcessing.getLeft(), path)
                 );
             }
@@ -88,6 +90,7 @@ public class IndexHtmlRenderer {
         return odinOptions.webPathToSourceHtmlFiles
                 + (
                 javaSourceFile.toString()
+                        .replace('\\', '/')
                         .substring(0, javaSourceFile.toString().length()-5)
                         .replace(inputSourceDirectory, "")
                         + ".html"

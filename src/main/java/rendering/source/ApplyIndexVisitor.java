@@ -1,5 +1,6 @@
 package rendering.source;
 
+import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
@@ -14,6 +15,7 @@ import indexing.Index;
 import indexing.MethodInfo;
 
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * Applies the Index to the source code by recording the changes that are need
@@ -23,14 +25,22 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
 
     private final RenderingQueue renderingQueue;
     private final Index index;
+
+    /**
+     * ShortTypes can be used to look up the full class name (fully qualified name).
+     */
     private final Map<String, String> imports;
     private final ScopeTracker scopeTracker = new ScopeTracker();
 
+    private final String outputFile;
+
     public ApplyIndexVisitor(
+            String outputFile,
             Index index,
             Map<String, String> imports,
             RenderingQueue renderingQueue
     ) {
+        this.outputFile = outputFile;
         this.index = index;
         this.imports = imports;
         this.renderingQueue = renderingQueue;
@@ -152,14 +162,40 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
         super.visit(classOrInterfaceType, arg);
     }
 
+    private String getArgumentType(Expression expression) {
+        if (expression.getChildNodes().size() != 1) {
+          return null;
+        }
+        Node onlyChild = expression.getChildNodes().get(0);
+        if (!(onlyChild instanceof SimpleName)) {
+          return null;
+        }
+
+        String argument = onlyChild.toString();
+        String shortType = scopeTracker.getVariableShortType(argument);
+        if (shortType == null) {
+          return null;
+        }
+
+        return imports.get(shortType);
+    }
+
+    private List<String> calcParameterTypes(MethodCallExpr methodCallExpr) {
+      return methodCallExpr.getArguments()
+          .stream()
+          .map(this::getArgumentType)
+          .collect(Collectors.toList());
+    }
+
     public void visit(MethodCallExpr methodCallExpr, Void arg) {
         SimpleName methodSimpleName = methodCallExpr.getName();
+        List<String> parameterTypes = calcParameterTypes(methodCallExpr);
         if (methodCallExpr.getScope().isPresent()) {
             Expression scope = methodCallExpr.getScope().get();
             if (scope instanceof StringLiteralExpr) {
-                handleClassMethod("java.lang.String", methodSimpleName, false);
+                handleClassMethod("java.lang.String", methodSimpleName, parameterTypes,false);
             } else if (scope instanceof ClassExpr) {
-                handleClassMethod("java.lang.Class", methodSimpleName, false);
+                handleClassMethod("java.lang.Class", methodSimpleName, parameterTypes,false);
             } else if (scope instanceof NameExpr) {
                 NameExpr nameExpr = (NameExpr) scope;
                 // example System.getProperty()
@@ -168,7 +204,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                 // How about try variable index first, then Class index.
 
                 // trying variable index
-                final String typeFromVariable = scopeTracker.getVariableType(nameExpr.getNameAsString());
+                final String typeFromVariable = scopeTracker.getVariableShortType(nameExpr.getNameAsString());
                 final String fullyQualifiedClassName;
                 if (typeFromVariable != null) {
                     fullyQualifiedClassName = imports.get(typeFromVariable);
@@ -176,7 +212,8 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                     // trying Class index
                     fullyQualifiedClassName = imports.get(nameExpr.getName().asString());
                 }
-                handleClassMethod(fullyQualifiedClassName, methodSimpleName, false);
+
+                handleClassMethod(fullyQualifiedClassName, methodSimpleName, parameterTypes, false);
             } else if (scope instanceof MethodCallExpr) {
                 // method call chaining
                 // example indexMap.entrySet().iterator()
@@ -188,7 +225,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                 methodCallExpr.getNameAsString();
             } else if (scope instanceof ThisExpr) {
                 // this.size()
-                handleClassMethod(currentClassName, methodSimpleName, true);
+                handleClassMethod(currentClassName, methodSimpleName, parameterTypes, true);
             } else if (scope instanceof FieldAccessExpr) {
                 // this.data.clone()
                 methodCallExpr.getNameAsString();
@@ -200,13 +237,13 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                 methodCallExpr.getNameAsString();
             } else if (scope instanceof SuperExpr) {
                 // super.detach()
-                searchForMethodInClassAndSuperClasses(currentClassName, methodSimpleName, true);
+                searchForMethodInClassAndSuperClasses(currentClassName, methodSimpleName, parameterTypes,true);
             } else {
                 System.out.println("Unrecognized expression: " + methodCallExpr);
             }
         } else {
             // method call within the same class
-            handleClassMethod(currentClassName, methodSimpleName, true);
+            handleClassMethod(currentClassName, methodSimpleName, parameterTypes, true);
         }
         super.visit(methodCallExpr, arg);
     }
@@ -214,6 +251,7 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
     private boolean handleClassMethod(
             String fullyQualifiedClassName,
             SimpleName methodSimpleName,
+            List<String> parameterTypes,
             boolean includePrivates
     ) {
         if (fullyQualifiedClassName != null) {
@@ -224,8 +262,10 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
                         methodSimpleName.asString()
                 );
                 if (overloads != null) {
-                    MethodInfo lastMethodInfo = overloads.get(overloads.size() - 1);
-                    filePosition = lastMethodInfo.filePosition();
+                    MethodInfo bestMethodInfo = findBestOverload(overloads, parameterTypes);
+                    if (bestMethodInfo != null) {
+                        filePosition = bestMethodInfo.filePosition();
+                    }
                 }
             }
             addLink(methodSimpleName, filePosition, "type");
@@ -237,15 +277,62 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
             return searchForMethodInClassAndSuperClasses(
                     fullyQualifiedClassName,
                     methodSimpleName,
+                    parameterTypes,
                     false
             );
         }
         return false;
     }
 
+    private MethodInfo findBestOverload(
+        List<MethodInfo> overloads,
+        List<String> parameterTypes
+    ) {
+      if (overloads == null || overloads.isEmpty()) {
+          return null;
+      }
+      if (parameterTypes == null) {
+        return overloads.get(overloads.size() - 1);
+      }
+
+
+      return overloads.stream()
+          .filter(overload -> match(overload.argumentTypes(), parameterTypes))
+          .findAny()
+          .orElse(overloads.get(overloads.size() - 1));
+    }
+
+  /**
+   * Matches parameter types one by one. If either or null, that's treated as a wildcard.
+   *
+   * @param parameterTypes1
+   * @param parameterTypes2
+   * @return
+   */
+    private boolean match(List<String> parameterTypes1, List<String> parameterTypes2) {
+      if (parameterTypes1.size() != parameterTypes2.size()) {
+        return false;
+      }
+      for (int i = 0; i < parameterTypes1.size(); i++) {
+        if (parameterTypes1.get(i) == null) {
+          continue;
+        }
+        if (parameterTypes2.get(i) == null) {
+          continue;
+        }
+
+        if (!parameterTypes1.get(i).equals(parameterTypes2.get(i))) {
+          return false;
+        }
+      }
+
+      return true;
+    }
+
     private boolean searchForMethodInClassAndSuperClasses(
             String fullyQualifiedClassName,
             SimpleName methodSimpleName,
+            List<String> parameterTypes,
             boolean skipCurrentClass
     ) {
         Set<String> visited = new HashSet<>();
@@ -267,8 +354,10 @@ public class ApplyIndexVisitor extends VoidVisitorAdapter<Void> {
             );
             Index.FilePosition filePosition = null;
             if (overloads != null) {
-                MethodInfo lastMethodInfo = overloads.get(overloads.size() - 1);
-                filePosition = lastMethodInfo.filePosition();
+                MethodInfo bestMethodInfo = findBestOverload(overloads, parameterTypes);
+                if (bestMethodInfo != null) {
+                  filePosition = bestMethodInfo.filePosition();
+                }
             }
             addLink(methodSimpleName, filePosition, "type");
             if (filePosition != null) {
